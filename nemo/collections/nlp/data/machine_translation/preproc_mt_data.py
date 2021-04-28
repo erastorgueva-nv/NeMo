@@ -64,7 +64,7 @@ class MTDataPreproc:
             self.world_size = trainer.num_nodes * trainer.num_gpus
 
         if hasattr(cfg, 'train_ds'):
-            supported_tokenizers = ['yttm', 'huggingface', 'sentencepiece']
+            supported_tokenizers = ['yttm', 'huggingface', 'sentencepiece', 'megatron']
             supported_train_tokenizers = ['yttm', 'sentencepiece']
 
             if (
@@ -295,9 +295,6 @@ class MTDataPreproc:
         decoder_bpe_dropout=0.0,
         decoder_model_name=None,
     ):
-
-        # if encoder_tokenizer_name != 'yttm' or decoder_tokenizer_name != 'yttm':
-        #     raise NotImplementedError(f"Currently we only support yttm tokenizer.")
 
         encoder_tokenizer = get_nmt_tokenizer(
             library=encoder_tokenizer_name,
