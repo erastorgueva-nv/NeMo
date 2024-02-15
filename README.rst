@@ -95,7 +95,7 @@ Key Features
         * parakeet-rnnt-1.1b (`model <https://huggingface.co/nvidia/parakeet-rnnt-1.1b>`_) (`HF space <https://huggingface.co/spaces/nvidia/parakeet-rnnt-1.1b>`_)
         * parakeet-ctc-1.1b (`model <https://huggingface.co/nvidia/parakeet-ctc-1.1b>`_)
     * `Pretrained models <https://ngc.nvidia.com/catalog/collections/nvidia:nemo_asr>`_ available in 14+ languages - try them out in the `HuggingFace Space for Audio Transcription (File, Microphone and YouTube) <https://huggingface.co/spaces/smajumdar/nemo_multilingual_language_id>`_
-    * Real-time streaming tutorial notebooks: `Cache-Aware<https://github.com/NVIDIA/NeMo/blob/main/tutorials/asr/Online_ASR_Microphone_Demo_Cache_Aware_Streaming.ipynb>`_ and `Buffered<https://github.com/NVIDIA/NeMo/blob/main/tutorials/asr/Online_ASR_Microphone_Demo_Buffered_Streaming.ipynb>`_ streaming.
+    * Real-time streaming tutorial notebooks: `Cache-Aware <https://github.com/NVIDIA/NeMo/blob/main/tutorials/asr/Online_ASR_Microphone_Demo_Cache_Aware_Streaming.ipynb>`_ and `Buffered <https://github.com/NVIDIA/NeMo/blob/main/tutorials/asr/Online_ASR_Microphone_Demo_Buffered_Streaming.ipynb>`_ streaming.
     * Beam Search decoding
     * `Language Modelling for ASR (CTC and RNNT) <https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/main/asr/asr_language_modeling.html>`_: N-gram LM in fusion with Beam Search decoding, Neural Rescoring with Transformer
 * `Speech Classification, Speech Command Recognition and Language Identification <https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/main/asr/speech_classification/intro.html>`_: MatchboxNet (Command Recognition), AmberNet (LangID)
