@@ -86,8 +86,7 @@ which can be used to find the optimal model parallel configuration for training 
 Key Features
 ------------
 
-Speech Processing
-^^^^^^^^^^^^^^^^^
+**Speech Processing**
 
 * `Automatic Speech Recognition (ASR) <https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/main/asr/intro.html>`_
     * Latest ASR models
@@ -108,8 +107,8 @@ Speech Processing
     * Neural Diarizer: MSDD (Multi-scale Diarization Decoder)
 * `Speech Intent Detection and Slot Filling <https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/main/asr/speech_intent_slot/intro.html>`_: Conformer-Transformer
 
-Natural Language Processing
-^^^^^^^^^^^^^^^^^^^^^^^^^^^
+**Natural Language Processing**
+
 * `NeMo Megatron pre-training of Large Language Models <https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/nlp/nemo_megatron/intro.html>`_
 * `Neural Machine Translation (NMT) <https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/main/nlp/machine_translation/machine_translation.html>`_
 * `Punctuation and Capitalization <https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/main/nlp/punctuation_and_capitalization.html>`_
@@ -125,16 +124,16 @@ Natural Language Processing
 * `NGC collection of pre-trained NLP models. <https://ngc.nvidia.com/catalog/collections/nvidia:nemo_nlp>`_
 * `Synthetic Tabular Data Generation <https://developer.nvidia.com/blog/generating-synthetic-data-with-transformers-a-solution-for-enterprise-data-challenges/>`_
 
-Text-to-Speech Synthesis (TTS)
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+**Text-to-Speech Synthesis (TTS)**
+
 * `Documentation <https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/main/tts/intro.html#>`_
 * Mel-Spectrogram generators: FastPitch, SSL FastPitch, Mixer-TTS/Mixer-TTS-X, RAD-TTS, Tacotron2
 * Vocoders: HiFiGAN, UnivNet, WaveGlow
 * End-to-End Models: VITS
 * `Pre-trained Model Checkpoints in NVIDIA GPU Cloud (NGC) <https://ngc.nvidia.com/catalog/collections/nvidia:nemo_tts>`_
 
-Tools
-^^^^^
+**Tools**
+
 * `Documentation <https://github.com/NVIDIA/NeMo/tree/stable/tools>`_
 * `Text Processing (text normalization and inverse text normalization) <https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/main/nlp/text_normalization/intro.html>`_
 * `NeMo Forced Aligner <https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/main/tools/nemo_forced_aligner.html>`_
