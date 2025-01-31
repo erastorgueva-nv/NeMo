@@ -727,11 +727,20 @@ def s2s_sample_sequence_batch(
 
     tokenizer = model.tokenizer
     # initialize the batch
+
+    # We want to simulate a situation with audio coming in chunk-by-chunk
+    # => keep audio_signal as the full audio that we know we will have,
+    # and use audio_signal_so_far to keep track of audio chunks received "so far" (it will be same size as audio_signal, just rest will be zeros)
+    INPUT_AUDIO_CHUNK_SIZE_SEC = 0.08
+    input_audio_chunk_size_samples = int(INPUT_AUDIO_CHUNK_SIZE_SEC * 16000) # hard-coding sample rate to 16kHz TODO: dont hardcode
+    audio_signal_so_far = torch.zeros_like(audio_signal)
+    audio_signal_so_far[:, :input_audio_chunk_size_samples*2] = audio_signal[:, :input_audio_chunk_size_samples*2]
+
     with torch.no_grad():
         context_tokens, input_embeddings, audio_feat_lens = inference_strategy.init_batch(
             context_tokens,
             context_lengths,
-            audio_signal,
+            audio_signal_so_far, # was "audio_signal" before
             audio_signal_length,
             compute_attention_mask,
             num_audios,
@@ -756,7 +765,31 @@ def s2s_sample_sequence_batch(
             maxlen = context_tokens.shape[1]
         maxlen = inference_strategy.clip_max_len(maxlen)
         lengths = torch.ones([batch_size]).long().cuda() * maxlen
-        while context_length < maxlen:
+
+        import time # for basic profiling
+        while context_length < maxlen: # for debugging can replace maxlen with some int, e.g. 100
+            logging.info(f'{context_length = }')
+            start_iteration_time = time.time()
+
+            # do 1 chunk size lookahead, except for case when there is no more lookahead possible
+            if context_length < maxlen - 1:
+                sample_copy_till = input_audio_chunk_size_samples * (counter + 2) # +1 as counter is zero-indexed, and +1 for 1 chunk lookahead
+            else:
+                sample_copy_till = input_audio_chunk_size_samples * (counter + 1) # just +1 as counter is zero-indexed
+            audio_signal_so_far[:, :sample_copy_till] = audio_signal[:, :sample_copy_till]
+
+            _, input_embeddings, _ = inference_strategy.init_batch(
+                context_tokens,
+                context_lengths,
+                audio_signal_so_far,
+                audio_signal_length,
+                compute_attention_mask,
+                num_audios,
+                context_start_idx,
+            )
+            logging.info(f'init_batch time: {time.time() - start_iteration_time}')
+
+
             batch, tensor_shape = inference_strategy.prepare_batch_at_step(
                 tokens,
                 input_embeddings,
@@ -892,6 +925,7 @@ def s2s_sample_sequence_batch(
                 group = parallel_state.get_pipeline_model_parallel_group()
                 torch.distributed.broadcast(done, src, group)
 
+            logging.info(f'iteration time: {time.time() - start_iteration_time}')
             context_length += 1
             counter += 1
             if done:
