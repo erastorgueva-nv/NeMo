@@ -768,7 +768,7 @@ def s2s_sample_sequence_batch(
         INPUT_AUDIO_CHUNK_SIZE_SEC = 0.08
         input_audio_chunk_size_samples = int(INPUT_AUDIO_CHUNK_SIZE_SEC * 16000) # hard-coding sample rate to 16kHz TODO: dont hardcode
 
-        padded_len_samples = int(maxlen * input_audio_chunk_size_samples) # TODO: remove sample rate hardcoding
+        padded_len_samples = int(maxlen * input_audio_chunk_size_samples)
 
         audio_signal_padded = torch.zeros((batch_size, padded_len_samples), dtype=audio_signal.dtype, device=audio_signal.device)
         audio_signal_padded[:, :audio_signal.shape[1]] = audio_signal
@@ -790,24 +790,25 @@ def s2s_sample_sequence_batch(
             #import ipdb; ipdb.set_trace()
 
             encoded, encoded_len = model.perception(
-                input_signal=audio_signal_so_far_padded,
+                #input_signal=audio_signal_so_far_padded,
+                #input_signal_length=torch.ones([batch_size]).long().cuda() * padded_len_samples, # TODO: maybe change to not include padding afterwards 
+                input_signal=audio_signal_padded,
                 input_signal_length=torch.ones([batch_size]).long().cuda() * padded_len_samples, # TODO: maybe change to not include padding afterwards 
                 processed_signal=None,
                 processed_signal_length=None,
             )
 
             if counter == 0:
-                last_tokens2use = tokens[:, :context_length] #  think this is also just equal to tokens and context_tokens
-                tokens2use = last_tokens2use # TODO: fix this
+                tokens2use = tokens[:, :context_length] #  think this is also just equal to tokens and context_tokens
                 set_inference_key_value_memory = True
+                embeddings2use = input_embeddings[:context_length]
             else:
-                last_tokens2use = tokens[:, context_length - 1].view(micro_batch_size, 1, -1) # TODO: double-check
-                tokens2use = last_tokens2use # TODO: fix this
+                tokens2use = tokens[:, context_length - 1].view(micro_batch_size, 1, -1) # TODO: double-check
                 set_inference_key_value_memory = False
 
-            embeddings2use = model._get_text_embeddings(last_tokens2use, None)
-            last_encoded = encoded[:, counter-1].view(micro_batch_size, 1, -1)
-            embeddings2use = embeddings2use + last_encoded.transpose(0, 1).contiguous()
+                embeddings2use = model._get_text_embeddings(tokens2use, None)
+                last_encoded = encoded[:, context_length-1].view(micro_batch_size, 1, -1)
+                embeddings2use = embeddings2use + last_encoded.transpose(0, 1).contiguous()
 
 
 
@@ -820,20 +821,20 @@ def s2s_sample_sequence_batch(
             batch = [tokens2use, embeddings2use, None, None, setkey_value_array, len_array]
             tensor_shape = [tokens2use.shape[1], micro_batch_size, model.cfg.hidden_size]            
 
-            logging.info(f"{encoded.shape}")
-            logging.info(f"{tokens.shape = }")
-            logging.info(f"{last_tokens2use.shape = }")
-            logging.info(f"{tokens2use.shape = }")
-            logging.info("---")
-            logging.info(f"setkey_value_array: {setkey_value_array}")
-            logging.info(f"len_array: {len_array}")
+            #logging.info(f"{encoded.shape}")
+            #logging.info(f"{tokens.shape = }")
+            #logging.info(f"{last_tokens2use.shape = }")
+            #logging.info(f"{tokens2use.shape = }")
+            #logging.info("---")
+            #logging.info(f"setkey_value_array: {setkey_value_array}")
+            #logging.info(f"len_array: {len_array}")
 
-            logging.info(f"tokens2use.shape: {tokens2use.shape}")
-            logging.info(f"embeddings2use.shape: {embeddings2use.shape}")
-            logging.info(f"micro_batch_size: {micro_batch_size}")
-            logging.info(f"model.cfg.hidden_size: {model.cfg.hidden_size}")
+            #logging.info(f"tokens2use.shape: {tokens2use.shape}")
+            #logging.info(f"embeddings2use.shape: {embeddings2use.shape}")
+            #logging.info(f"micro_batch_size: {micro_batch_size}")
+            #logging.info(f"model.cfg.hidden_size: {model.cfg.hidden_size}")
 
-            logging.info(f"{tensor_shape = }")
+            #logging.info(f"{tensor_shape = }")
 
 
             
