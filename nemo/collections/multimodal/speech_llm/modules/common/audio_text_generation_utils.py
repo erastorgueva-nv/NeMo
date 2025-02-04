@@ -780,30 +780,29 @@ def s2s_sample_sequence_batch(
             logging.info(f'{context_length = }')
             start_iteration_time = time.time()
 
-            # do 1 chunk size lookahead, except for case when there is no more lookahead possible
-            if context_length < maxlen - 1:
-                sample_copy_till = input_audio_chunk_size_samples * (counter + 2) # +1 as counter is zero-indexed, and +1 for 1 chunk lookahead
-            else:
-                sample_copy_till = input_audio_chunk_size_samples * (counter + 1) # just +1 as counter is zero-indexed
+            # adding CHUNKS_FUTURE_AUDIO to control how much "future audio" passed to encoder
+            CHUNKS_FUTURE_AUDIO = 2 # if set to 1 or 2 -> empty pred_text. if set to 5 -> pred_text is not very logical
+            sample_copy_till = input_audio_chunk_size_samples * (counter + CHUNKS_FUTURE_AUDIO)
+            sample_copy_till = min(sample_copy_till, audio_signal_padded.shape[1]) # dont exceed audio length
             audio_signal_so_far_padded[:, :sample_copy_till] = audio_signal_padded[:, :sample_copy_till]
 
             #import ipdb; ipdb.set_trace()
+            logging.info(f"{sample_copy_till = }")
 
-            encoded, encoded_len = model.perception(
-                #input_signal=audio_signal_so_far_padded,
-                #input_signal_length=torch.ones([batch_size]).long().cuda() * padded_len_samples, # TODO: maybe change to not include padding afterwards 
-                input_signal=audio_signal_padded,
-                input_signal_length=torch.ones([batch_size]).long().cuda() * padded_len_samples, # TODO: maybe change to not include padding afterwards 
-                processed_signal=None,
-                processed_signal_length=None,
-            )
+            with torch.no_grad(): # added torch.no_grad in case it helped, but don't observe any difference
+                encoded, encoded_len = model.perception(
+                    input_signal=audio_signal_padded, # not using audio_signal_so_far_padded because it will be trimmed to "sample_copy_till" anyway
+                    input_signal_length=torch.ones([batch_size]).long().cuda() * sample_copy_till,
+                    processed_signal=None,
+                    processed_signal_length=None,
+                )
 
             if counter == 0:
                 tokens2use = tokens[:, :context_length] #  think this is also just equal to tokens and context_tokens
                 set_inference_key_value_memory = True
                 embeddings2use = input_embeddings[:context_length]
             else:
-                tokens2use = tokens[:, context_length - 1].view(micro_batch_size, 1, -1) # TODO: double-check
+                tokens2use = tokens[:, context_length - 1].view(micro_batch_size, 1, -1)
                 set_inference_key_value_memory = False
 
                 embeddings2use = model._get_text_embeddings(tokens2use, None)
