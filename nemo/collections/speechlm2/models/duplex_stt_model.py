@@ -220,7 +220,6 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             seq_mask=None,
             target_text_tokens=None,
             modality_adapter_emb=None,
-            asr_emb=None,
             speaker_encoder_emb=None,
     ) -> dict[str, Tensor]:
         """
@@ -454,7 +453,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
         
 
-        source_encoded, source_encoded_lens, asr_emb = self.perception(
+        source_encoded, source_encoded_lens, _ = self.perception(
             input_signal=batch["source_audio"],
             input_signal_length=batch["source_audio_lens"],
             return_encoder_emb=True,
@@ -528,7 +527,6 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             batch=batch,
             target_tokens=target_tokens,
             source_encoded=source_encoded,
-            asr_emb=asr_emb,
             cfg=self.cfg,
             predict_user_text=self.predict_user_text,
             user_bos_id=self.user_bos_id,
@@ -1162,7 +1160,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             input_signal = torch.nn.functional.pad(input_signal, (0, input_pad_len), mode='constant', value=0)
             input_signal_lens = input_signal_lens + input_pad_len
 
-        source_encoded, lengths, asr_emb = self.perception(
+        source_encoded, lengths, _ = self.perception(
             input_signal=input_signal, input_signal_length=input_signal_lens, return_encoder_emb=True
         )
 
@@ -1202,9 +1200,6 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 last_frame_source = source_encoded[:, T_local - 1: T_local, :]
                 pad_source = last_frame_source.repeat(1, T - T_local, 1)
                 source_encoded = torch.cat([source_encoded, pad_source], dim=1)
-                last_frame_asr = asr_emb[:, T_local - 1: T_local, :]
-                pad_asr = last_frame_asr.repeat(1, T - T_local, 1)
-                asr_emb = torch.cat([asr_emb, pad_asr], dim=1)
         else:
             T = T_local
 
@@ -1255,7 +1250,6 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             "input_signal": input_signal,
             "input_signal_lens": input_signal_lens,
             "source_encoded": source_encoded,
-            "asr_emb": asr_emb,
             "lengths": lengths,
             "B": B,
             "T": T,
@@ -1278,7 +1272,6 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             seq_mask=None,
             target_text_tokens=None,
             modality_adapter_emb=inference_state["source_encoded"][:, :1],
-            asr_emb=inference_state["asr_emb"][:, :1],
             speaker_encoder_emb=None,
         )
 
@@ -1289,7 +1282,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             if self.predict_user_text:
                 inference_state["gen_asr"][:, 0] = ans["asr_logits"][:, -1].argmax(dim=-1)
 
-        return ans
+        return ans, inference_state
 
     def _step_inference(self, t, inference_state, ans, force_bos_positions):
         """Perform inference for one step t in the autoregressive loop."""
@@ -1316,7 +1309,6 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 seq_mask=None,
                 target_text_tokens=None,
                 modality_adapter_emb=inference_state["source_encoded"][:, t: t + 1],
-                asr_emb=inference_state["asr_emb"][:, t: t + 1],
                 speaker_encoder_emb=None,
             )
             if not is_prompt_position.all():
@@ -1330,7 +1322,6 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 seq_mask=None,
                 target_text_tokens=None,
                 modality_adapter_emb=inference_state["source_encoded"][:, :t + 1],
-                asr_emb=inference_state["asr_emb"][:, :t + 1],
                 speaker_encoder_emb=None,
             )
             if not is_prompt_position.all():
@@ -1421,7 +1412,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             force_bos_positions, prompt_tokens, prompt_token_lens
         )
 
-        ans = self._step_zero(inference_state)
+        ans, inference_state = self._step_zero(inference_state)
 
         for t in range(1, inference_state["T"]):
             ans = self._step_inference(t, inference_state, ans, force_bos_positions)
