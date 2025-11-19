@@ -21,10 +21,6 @@ from nemo.collections.vlm.gemma3vl.model.base import Gemma3VLConfig, Gemma3VLMod
 from nemo.collections.vlm.gemma3vl.model.gemma3vl import Gemma3VLConfig4B, Gemma3VLConfig12B, Gemma3VLConfig27B
 from nemo.collections.vlm.gemma3vl.model.vision import Gemma3VLMultimodalProjectorConfig, Gemma3VLVisionConfig
 
-# HF
-from nemo.collections.vlm.hf.data.hf_dataset import HFDatasetDataModule
-from nemo.collections.vlm.hf.model.hf_auto_model_for_image_text_to_text import HFAutoModelForImageTextToText
-
 # LLAMA4
 from nemo.collections.vlm.llama4.data import Llama4MockDataModule
 from nemo.collections.vlm.llama4.model.base import Llama4OmniConfig, Llama4OmniModel
@@ -68,8 +64,20 @@ from nemo.collections.vlm.neva.model.llava import Llava15Config7B, Llava15Config
 # PEFT
 from nemo.collections.vlm.peft import LoRA
 from nemo.collections.vlm.qwen2vl.data import Qwen2VLDataConfig, Qwen2VLMockDataModule, Qwen2VLPreloadedDataModule
-from nemo.collections.vlm.qwen2vl.model.base import Qwen2VLConfig, Qwen2VLModel, Qwen2VLVisionConfig
-from nemo.collections.vlm.qwen2vl.model.qwen2vl import Qwen2VLConfig2B, Qwen2VLConfig7B
+from nemo.collections.vlm.qwen2vl.model.base import (
+    Qwen2VLConfig,
+    Qwen2VLModel,
+    Qwen2VLVisionConfig,
+    Qwen25VLVisionConfig,
+)
+from nemo.collections.vlm.qwen2vl.model.qwen2vl import (
+    Qwen2VLConfig2B,
+    Qwen2VLConfig7B,
+    Qwen25VLConfig3B,
+    Qwen25VLConfig7B,
+    Qwen25VLConfig32B,
+    Qwen25VLConfig72B,
+)
 
 # RECIPES
 from nemo.collections.vlm.recipes import *
@@ -92,8 +100,6 @@ from nemo.collections.vlm.vision import (
 __all__ = [
     "CLIPViTModel",
     "BaseCLIPViTModel",
-    "HFDatasetDataModule",
-    "HFAutoModelForImageTextToText",
     "NevaMockDataModule",
     "NevaPreloadedDataModule",
     "MLlamaMockDataModule",
@@ -123,6 +129,11 @@ __all__ = [
     "Qwen2VLConfig7B",
     "Qwen2VLVisionConfig",
     "Qwen2VLModel",
+    "Qwen25VLConfig3B",
+    "Qwen25VLConfig7B",
+    "Qwen25VLConfig32B",
+    "Qwen25VLConfig72B",
+    "Qwen25VLVisionConfig",
     "Qwen2VLDataConfig",
     "Gemma3VLConfig",
     "Gemma3VLConfig4B",
@@ -164,3 +175,12 @@ __all__ = [
     "Llama4ScoutExperts16Config",
     "Llama4MaverickExperts128Config",
 ]
+
+try:
+    from nemo.collections.vlm.api import ptq  # noqa: F401
+
+    __all__.append("ptq")
+except ImportError as error:
+    from nemo.utils import logging
+
+    logging.warning(f"Failed to import nemo.collections.vlm.api: {error}")

@@ -17,19 +17,19 @@ from os.path import basename, splitext
 import nemo_run as run
 
 from nemo.collections.llm.recipes.llama4_e128 import pretrain_recipe
-from nemo.collections.llm.recipes.precision.mixed_precision import bf16_with_fp8_mixed
 from nemo.collections.nlp.modules.common.tokenizer_utils import get_nmt_tokenizer
-from nemo.lightning.run.plugins import MemoryProfilePlugin, NsysPlugin, PerfEnvPlugin
+from nemo.lightning.run.plugins import MemoryProfilePlugin, NsysPlugin
 
-from ..argument_parser import parse_cli_args
-from ..utils import (
+from ..argument_parser import parse_additional_slurm_params, parse_cli_args
+from ..executors import slurm_executor
+from ..helpers import (
     args_sanity_check,
+    build_perf_env_plugin,
     get_user_configs,
-    hf_tokenizer,
     set_exp_logging_configs,
     set_primary_perf_configs,
-    slurm_executor,
 )
+from ..utils import dump_config_diff_from_base_recipe, hf_tokenizer
 
 
 def override_recipe_configs(
@@ -67,9 +67,14 @@ def override_recipe_configs(
         ep_size,
         etp_size,
         enable_cuda_graphs=enable_cuda_graphs,
+        use_mcore_fsdp=args.use_mcore_fsdp,
+        use_fsdp_double_buffer=args.use_fsdp_double_buffer,
         use_user_buffer_registration=args.use_user_buffer_registration,
         use_sharp=args.use_sharp,
         compute_dtype=args.compute_dtype,
+        fp8_recipe=args.fp8_recipe,
+        use_te_act_func=args.use_te_act_func,
+        act_func_fp8_input_store=args.act_func_fp8_input_store,
     )
     recipe = set_exp_logging_configs(
         recipe, "pre_train", "llm", "llama4", args.tensorboard, args.wandb, args.wandb_prj_name, args.wandb_job_name
@@ -77,17 +82,12 @@ def override_recipe_configs(
 
     # data module configs
     if args.use_hf_tokenizer:
-        recipe.data.tokenizer = hf_tokenizer('meta-llama/Llama-4-Scout-17B-16E-Instruct')
+        recipe.data.tokenizer = hf_tokenizer('meta-llama/Llama-4-Maverick-17B-128E-Instruct')
     else:
         recipe.data.tokenizer = run.Config(
-            get_nmt_tokenizer, library="null", model_name="NullTokenizer", vocab_size=202048
+            get_nmt_tokenizer, library="null", model_name="NullTokenizer", vocab_size=200000
         )
         recipe.model.tokenizer = recipe.data.tokenizer
-
-    # compute dtype configs
-    if args.compute_dtype.lower() == "fp8":
-        recipe.trainer.plugins = bf16_with_fp8_mixed()
-        recipe.trainer.plugins.grad_reduce_in_fp32 = False
 
     recipe.model.config.cross_entropy_fusion_impl = "te"
     recipe.model.config.cross_entropy_loss_fusion = True
@@ -100,6 +100,10 @@ def override_recipe_configs(
 if __name__ == "__main__":
     args = parse_cli_args().parse_args()
     args_sanity_check(args)
+    # Parse additional SLURM parameters if provided
+    additional_slurm_params = None
+    if hasattr(args, 'additional_slurm_params') and args.additional_slurm_params:
+        additional_slurm_params = parse_additional_slurm_params(args.additional_slurm_params)
 
     kwargs = get_user_configs(args.gpu.lower(), "pre_train", "llama4", "e128", args)
     num_nodes, mbs, gbs, tp_size, pp_size, cp_size, vp_size, ep_size, etp_size, enable_cuda_graphs, _, _, _ = kwargs[
@@ -116,6 +120,7 @@ if __name__ == "__main__":
     exp_name = f"{splitext(basename(__file__))[0]}_{args.compute_dtype}_{exp_config}"
 
     executor = slurm_executor(
+        args.gpu.lower(),
         args.account,
         args.partition,
         args.log_dir,
@@ -129,15 +134,11 @@ if __name__ == "__main__":
         nemo_home=args.nemo_home,
         wandb_key=args.wandb_key,
         network='sharp' if args.use_sharp else None,
+        additional_slurm_params=additional_slurm_params,
     )
 
-    plugins = [
-        PerfEnvPlugin(
-            enable_vboost=True,
-            nccl_pp_comm_chunksize=2097152 if pp_size > 1 else None,
-            gpu_sm100_or_newer=(args.gpu.lower() in ['b200', 'gb200']),
-        ),
-    ]
+    plugins = [build_perf_env_plugin(args, pp_size=pp_size)]
+
     if args.enable_nsys:
         plugins.append(NsysPlugin(start_step=15, end_step=16, gen_shape=True))
     if args.enable_memory_profile:
@@ -153,6 +154,17 @@ if __name__ == "__main__":
         )
 
         if not args.dryrun:
-            exp.run(sequential=True, detach=True)
+            exp.run(sequential=True, detach=args.detach)
         else:
             exp.dryrun()
+
+    if args.dump_config_diff_from_base_recipe:
+        output_dir = exp.jobs[0].executor.job_dir
+        # dump difference from base recipe
+        base_recipe = pretrain_recipe(performance_mode=False)
+        file_name = f"diff_from_base_recipe_{args.compute_dtype}.diff"
+        dump_config_diff_from_base_recipe(base_recipe, recipe, output_dir, file_name=file_name)
+        # dump difference from default perf recipe
+        default_perf_recipe = pretrain_recipe(performance_mode=True)
+        file_name = f"diff_from_default_perf_recipe_{args.compute_dtype}.diff"
+        dump_config_diff_from_base_recipe(default_perf_recipe, recipe, output_dir, file_name=file_name)

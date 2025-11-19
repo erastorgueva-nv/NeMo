@@ -80,7 +80,7 @@ jobs:
 
   cicd-test-container-build:
     needs: [pre-flight]
-    uses: NVIDIA/NeMo-FW-CI-templates/.github/workflows/_build_container.yml@v0.27.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.27.0
     strategy:
       fail-fast: false
       matrix:
@@ -93,8 +93,6 @@ jobs:
             image-name: nemo_container_speech
           - dockerfile: docker/Dockerfile.ci
             image-name: nemo_container
-          - dockerfile: docker/Dockerfile.ci.export_deploy
-            image-name: nemo_container_export_deploy
     with:
       image-name: ${{ matrix.image-name }}
       dockerfile: ${{ matrix.dockerfile }}

@@ -98,7 +98,7 @@ def speech_to_text_llm_data_step(dataloader_iter) -> Dict[str, Any]:
         ]
     )
     # "context", "context_length", "answers", "max_length",
-    if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
+    if parallel_state.is_pipeline_first_stage():
         required_keys.update(
             (
                 "audio_signal",
@@ -114,7 +114,7 @@ def speech_to_text_llm_data_step(dataloader_iter) -> Dict[str, Any]:
                 "context_lengths",
             )
         )
-    if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
+    if parallel_state.is_pipeline_last_stage():
         required_keys.update(("labels", "loss_mask"))
 
     _batch = {
@@ -195,7 +195,7 @@ class SpeechToTextLLMConfig(TransformerConfig, io.IOMixin):
         for param in module.parameters():
             param.requires_grad = False
 
-    def _maybe_load_pretrained_llm(self, model: MCoreGPTModel) -> MCoreGPTModel:
+    def _maybe_load_pretrained_llm(self, model: MCoreGPTModel, strict: bool = False) -> MCoreGPTModel:
         if not self.language_model_from_pretrained:
             return model
 
@@ -218,12 +218,17 @@ class SpeechToTextLLMConfig(TransformerConfig, io.IOMixin):
             llm_model_cls(self.language_model_config), f"{self.language_model_hub}{ckpt_path}", on_import_ckpt=False
         )
 
-        sharded_state_dict = dict(state_dict=model.sharded_state_dict(prefix="module."))
+        load_path = ckpt_to_weights_subdir(ckpt_path, is_saving=False)
+        sharded_sd_metadata = dist_checkpointing.load_content_metadata(load_path)
+        if sharded_sd_metadata is None:
+            sharded_sd_metadata = {}  # backward-compatibility
+        sharded_state_dict = dict(state_dict=model.sharded_state_dict(prefix="module.", metadata=sharded_sd_metadata))
 
         loaded_state_dict = dist_checkpointing.load(
             sharded_state_dict=sharded_state_dict,
-            checkpoint_dir=ckpt_to_weights_subdir(ckpt_path, is_saving=False),
+            checkpoint_dir=load_path,
             validate_access_integrity=False,
+            **({"strict": "log_all"} if not strict else {}),
         )
         loaded_state_dict = {k.removeprefix("module."): v for k, v in loaded_state_dict["state_dict"].items()}
         model.load_state_dict(loaded_state_dict)
@@ -1050,7 +1055,11 @@ class SpeechToTextLLM(SpeechLanguageModel):
                 continue
             # Expand on_validation_epoch_end from parent class MegatronGPTModel as on_validation_epoch_end doesnt take outputs arg
             loss_vals = [x['loss'].view(-1, 1) for x in output]  # each loss is [1, B]
-            if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
+
+            assert (
+                getattr(self.config, "virtual_pipeline_model_parallel_size", None) is None
+            ), "vpp is not supported yet in SpeechToTextLLMModel"
+            if parallel_state.is_pipeline_last_stage():
                 # only the last pipeline parallel stages return loss with their batch size
                 loss = torch.vstack(loss_vals).mean().type(torch.float32).cuda()
             else:
@@ -1250,7 +1259,27 @@ class SpeechToTextLLM(SpeechLanguageModel):
                 )
 
     def set_inference_config(self, inference_config: Optional[Dict] = None):
-        self._inference_config = dict(inference_config) if inference_config is not None else None
+        ALLOWED_KEYS = [
+            'tokens_to_generate',
+            'temperature',
+            'top_k',
+            'top_p',
+            'greedy',
+            'repetition_penalty',
+            'min_tokens_to_generate',
+        ]
+        if inference_config is None:
+            return
+        if not isinstance(inference_config, dict):
+            inference_config = dict(inference_config)
+        for key in inference_config.keys():
+            if key not in ALLOWED_KEYS:
+                logging.warning(
+                    f"inference_config key `{key}` is not in allowed keys ({ALLOWED_KEYS}), ignoring it..."
+                )
+                inference_config.pop(key)
+        self._inference_config = inference_config
+        logging.info(f"Setting inference config: {self._inference_config}")
 
     def get_inference_config(self):
         return dict(self._inference_config) if self._inference_config is not None else None

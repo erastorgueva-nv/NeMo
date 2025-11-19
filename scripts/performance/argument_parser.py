@@ -64,6 +64,16 @@ def parse_cli_args():
         required=False,
         default="00:30:00",
     )
+
+    parser.add_argument(
+        "--additional_slurm_params",
+        type=str,
+        help="Additional SLURM parameters as key=value pairs. "
+        "Use semicolons (;) to separate parameters when values contain commas. "
+        "Examples: 'nodelist=node001,node002;constraint=gpu' or 'reservation=my_res;exclusive'",
+        required=False,
+        default=None,
+    )
     container_img_msg = [
         "NeMo container to use for experiment. Defaults to latest dev container- 'nvcr.io/nvidia/nemo:dev'",
         "Make sure your NGC credentials are accessible in your environment.",
@@ -86,13 +96,14 @@ def parse_cli_args():
         default="bf16",
     )
     fp8_recipe_msg = (
-        "FP8 recipe. Options- ds (per-tensor delayed scaling), cs (per-tensor current scaling), mxfp8. Defaults to ds"
+        "FP8 recipe. Options- ds (per-tensor delayed scaling), cs (per-tensor current scaling), "
+        "mxfp8, ss (subchannel scaling). Defaults to ds"
     )
     parser.add_argument(
         "-fr",
         "--fp8_recipe",
         type=str,
-        choices=["ds", "cs", "mxfp8"],
+        choices=["ds", "cs", "mxfp8", "ss"],
         help=fp8_recipe_msg,
         required=False,
         default="ds",
@@ -169,7 +180,7 @@ def parse_cli_args():
     )
     nemo_home_msg = [
         "Sets env var `NEMO_HOME` (on compute node using sbatch script)- directory where NeMo searches",
-        "for models and checkpoints. This saves a lot of time (especially for bigger models) if checkpoints already",
+        "for models and datasets. This saves a lot of time (especially for bigger models) if checkpoints already",
         f"exist here. Missing files will be downloaded here from HuggingFace. Defaults to {DEFAULT_NEMO_HOME}",
     ]
     parser.add_argument(
@@ -301,6 +312,14 @@ def parse_cli_args():
         default=None,
     )
     parser.add_argument(
+        "-fsdp_db",
+        "--use_fsdp_double_buffer",
+        help="Enable FSDP double buffer. Disabled by default",
+        type=bool_arg,
+        required=False,
+        default=None,
+    )
+    parser.add_argument(
         "-ubr",
         "--use_user_buffer_registration",
         help="Enable user buffer registration. Disabled by default",
@@ -350,7 +369,8 @@ def parse_cli_args():
         nargs="*",
         const=None,
         type=str,
-        help="List of modules to perform selective activation recompute. Users can provide 0 or any number of arguments. Defaults to None",
+        help="List of modules to perform selective activation recompute. "
+        "Users can provide 0 or any number of arguments. Defaults to None",
         required=False,
         default=None,
     )
@@ -368,5 +388,111 @@ def parse_cli_args():
         action="store_true",
         required=False,
     )
+    parser.add_argument(
+        "-dcdfr",
+        "--dump_config_diff_from_base_recipe",
+        help="Dump the config diff from the base recipe. Defaults to False",
+        action="store_true",
+        required=False,
+        default=False,
+    )
+    parser.add_argument(
+        "--keep_fsdp_fp8_transpose_cache",
+        help="Keep FSDP FP8 transpose cache. Disabled by default",
+        type=bool_arg,
+        required=False,
+        default=None,
+    )
+    parser.add_argument(
+        "-vb",
+        "--enable_vboost",
+        help="Enable VBoost which steers more power towards tensor cores. Disabled by default",
+        type=bool_arg,
+        required=False,
+        default=None,
+    )
+    parser.add_argument(
+        "--use_te_op_fuser",
+        help="Enable Transformer Engine's operation fuser. This feature is experimental and disabled by default",
+        type=bool_arg,
+        required=False,
+        default=None,
+    )
+    parser.add_argument(
+        "--use_te_act_func",
+        help="Use TE activation function for the MLP part.",
+        type=bool_arg,
+        required=False,
+        default=None,
+    )
+    parser.add_argument(
+        "--act_func_fp8_input_store",
+        help="Store input of activation function in FP8 (tensorwise recipe). Disabled by default",
+        type=bool_arg,
+        required=False,
+        default=False,
+    )
+    parser.add_argument(
+        "--detach",
+        help="Detach from experiment. Default is True. Unset to keep the process running.",
+        type=bool_arg,
+        required=False,
+        default=True,
+    )
 
     return parser
+
+
+def parse_additional_slurm_params(params_str):
+    """
+    Parse additional SLURM parameters from a string of key=value pairs.
+
+    This function handles different separator formats:
+    1. Semicolon-separated: "key1=value1;key2=value2" (recommended for multiple parameters)
+    2. Space-separated: "key1=value1 key2=value2"
+    3. Single parameter: "key1=value1,value2" (no separators = single parameter)
+
+    Args:
+        params_str (str): String with parameters
+
+    Returns:
+        dict: Dictionary of parameters, or None if params_str is None/empty
+
+    Example:
+        parse_additional_slurm_params("nodelist=node001,node002")
+        returns {"nodelist": "node001,node002"}
+
+        parse_additional_slurm_params("nodelist=node001,node002;constraint=gpu")
+        returns {"nodelist": "node001,node002", "constraint": "gpu"}
+
+        parse_additional_slurm_params("reservation=my_res;constraint=gpu")
+        returns {"reservation": "my_res", "constraint": "gpu"}
+    """
+    if not params_str:
+        return None
+
+    params = {}
+
+    # Try semicolon separation first (most reliable for complex values)
+    if ';' in params_str:
+        parts = params_str.split(';')
+    # Try space separation next
+    elif ' ' in params_str:
+        parts = params_str.split()
+    # No separators found - treat as single parameter
+    else:
+        parts = [params_str]
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        if '=' in part:
+            key, value = part.split('=', 1)
+            params[key.strip()] = value.strip()
+        else:
+            # Boolean flag (no value)
+            params[part] = True
+
+    return params if params else None

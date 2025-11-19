@@ -127,6 +127,7 @@ class LazyNeMoIterator:
                     recording_id=cut.recording_id,
                     start=0,
                     duration=cut.duration,
+                    channel=cut.channel,
                     text=data.get(self.text_field),
                     language=data.get(self.lang_field),
                 )
@@ -240,6 +241,11 @@ class LazyNeMoTarredIterator:
     Seed is resolved lazily so that every dataloading worker may sample a different one.
     Override with an integer value for deterministic behaviour and consult Lhotse documentation for details:
     https://lhotse.readthedocs.io/en/latest/datasets.html#handling-random-seeds
+
+    Set ``slice_length`` to enable random slicing mode: for each shard, we'll randomly select an offset K
+    and skip the first K examples (but will actually read them first). Then, we'll yield only ``slice_length``
+    examples. This setting can improve the sampling randomness when there are many datasets with many shards
+    but only a limited run time.
 
     Example of CutSet with inter-shard shuffling enabled::
 
@@ -422,7 +428,11 @@ class LazyNeMoTarredIterator:
             tar_path = self.shard_id_to_tar_path[sid]
             try:
                 for data, raw_audio, tar_info in self._iter_sequential(tar_path, shard_manifest, manifest_path, rng):
-                    meta = soundfile.info(BytesIO(raw_audio))
+                    try:
+                        meta = soundfile.info(BytesIO(raw_audio))
+                    except Exception:
+                        logging.warning(f"Skipped corrupted file '{tar_info.path}' in {tar_path=}.")
+                        continue
                     recording = Recording(
                         id=tar_info.path,
                         sources=[AudioSource(type="memory", channels=list(range(meta.channels)), source=raw_audio)],

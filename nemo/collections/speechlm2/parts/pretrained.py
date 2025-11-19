@@ -83,7 +83,7 @@ def setup_audio_codec(model: torch.nn.Module):
     del model.audio_codec.discriminator  # free up some memory
 
 
-def setup_speech_encoder(model: torch.nn.Module):
+def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True):
     """
     Sets up an ``AudioPerceptionModule``, initializing its ``encoder`` and ``preprocessor``
     with a pretrained NeMo ``ASRModel``.
@@ -91,24 +91,27 @@ def setup_speech_encoder(model: torch.nn.Module):
     
     If user config specifies encoder parameters, they will override the pretrained model's config.
     """
-    # Save user-specified encoder config before loading pretrained model
-    user_encoder_config = {}
+    if pretrained_weights:
+        # Save user-specified encoder config before loading pretrained model
+        user_encoder_config = {}
 
-    if 'encoder' in model.cfg.perception:
-        user_encoder_config = OmegaConf.to_container(model.cfg.perception.encoder, resolve=True)
-    
-    asr = load_pretrained_nemo(ASRModel, model.cfg.pretrained_asr).eval()
-    with open_dict(model.cfg):
-        model.cfg.perception.preprocessor = asr.cfg.preprocessor
-        model.cfg.perception.encoder = asr.cfg.encoder
-        model.cfg.perception.output_dim = model.llm.config.hidden_size
-        # Override with user-specified encoder parameters
-        if user_encoder_config:
-            for key, value in user_encoder_config.items():
-                if value is not None:  # Only override if user explicitly set a value
-                    model.cfg.perception.encoder[key] = value
-    model.perception = AudioPerceptionModule(model.cfg.perception).train()
-    model.perception.load_state_dict(asr.state_dict(), strict=False)
+        if 'encoder' in model.cfg.perception:
+            user_encoder_config = OmegaConf.to_container(model.cfg.perception.encoder, resolve=True)
+        
+        asr = load_pretrained_nemo(ASRModel, model.cfg.pretrained_asr).eval()
+        with open_dict(model.cfg):
+            model.cfg.perception.preprocessor = asr.cfg.preprocessor
+            model.cfg.perception.encoder = asr.cfg.encoder
+            model.cfg.perception.output_dim = model.llm.config.hidden_size
+            # Override with user-specified encoder parameters
+            if user_encoder_config:
+                for key, value in user_encoder_config.items():
+                    if value is not None:  # Only override if user explicitly set a value
+                        model.cfg.perception.encoder[key] = value
+        model.perception = AudioPerceptionModule(model.cfg.perception).train()
+        model.perception.load_state_dict(asr.state_dict(), strict=False)
+    else:
+        model.perception = AudioPerceptionModule(model.cfg.perception).train()
 
 def set_model_dict_for_partial_init(pretrained_dict, model_dict):
     # 1. filter out different size layers

@@ -83,10 +83,14 @@ def restore_model_weights(model, checkpoint_path, strict=False):
         strict: Whether to restore weights even if they are not the same.
     """
     if checkpoint_path is not None:
-        sharded_state_dict = dict(state_dict=model.sharded_state_dict(prefix="module."))
+        weights_dir = ckpt_to_weights_subdir(checkpoint_path, is_saving=False)
+        sharded_sd_metadata = dist_checkpointing.load_content_metadata(weights_dir)
+        if sharded_sd_metadata is None:
+            sharded_sd_metadata = {}  # backward-compatibility
+        sharded_state_dict = dict(state_dict=model.sharded_state_dict(prefix="module.", metadata=sharded_sd_metadata))
         loaded_state_dict = dist_checkpointing.load(
             sharded_state_dict=sharded_state_dict,
-            checkpoint_dir=ckpt_to_weights_subdir(checkpoint_path, is_saving=False),
+            checkpoint_dir=weights_dir,
             validate_access_integrity=False,
             **({"strict": "log_all"} if not strict else {}),
         )
@@ -116,9 +120,9 @@ def neva_data_step(dataloader_iter) -> Dict[str, torch.Tensor]:
             "num_media_tiles",
         )
     )
-    if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
+    if parallel_state.is_pipeline_first_stage():
         required_keys.update(("position_ids",))
-    if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
+    if parallel_state.is_pipeline_last_stage():
         required_keys.update(
             (
                 "labels",
@@ -202,7 +206,7 @@ class NevaConfig(TransformerConfig, io.IOMixin):
             for attr in MODEL_CONFIG_ATTR:
                 setattr(self, attr, getattr(self.language_transformer_config, attr))
 
-    def configure_model(self, tokenizer) -> "MCoreNevaModel":
+    def configure_model(self, tokenizer, vp_stage: Optional[int] = None) -> "MCoreNevaModel":
         # pylint: disable=C0115,C0116
         self.language_transformer_config.scatter_embedding_sequence_parallel = False
         self.language_transformer_config.tensor_model_parallel_size = self.tensor_model_parallel_size
@@ -227,12 +231,13 @@ class NevaConfig(TransformerConfig, io.IOMixin):
         model = MCoreNevaModel(
             config=self,
             tokenizer=tokenizer,
-            pre_process=ps.is_pipeline_first_stage(ignore_virtual=False),
-            post_process=ps.is_pipeline_last_stage(ignore_virtual=False),
-            add_encoder=ps.is_pipeline_first_stage(ignore_virtual=False),
-            add_decoder=ps.is_pipeline_last_stage(ignore_virtual=False)
+            pre_process=ps.is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage),
+            post_process=ps.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage),
+            add_encoder=ps.is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage),
+            add_decoder=ps.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage)
             or ps.get_pipeline_model_parallel_rank() >= self.encoder_pipeline_model_parallel_size,
             drop_vision_class_token=self.drop_vision_class_token,
+            vp_stage=vp_stage,
         )
 
         return model
@@ -250,6 +255,7 @@ class MCoreNevaModel(MCoreLLaVAModel):
         add_encoder: bool = True,
         add_decoder: bool = True,
         drop_vision_class_token: bool = True,
+        vp_stage: Optional[int] = None,
     ) -> None:
         # pylint: disable=C0115,C0116
         super(MCoreLLaVAModel, self).__init__(config=config)
@@ -262,6 +268,7 @@ class MCoreNevaModel(MCoreLLaVAModel):
         self.post_process = post_process
         self.add_encoder = add_encoder
         self.add_decoder = add_decoder
+        self.vp_stage = vp_stage
 
         self.tokenizer = tokenizer
         self.encoder_hidden_state = None
@@ -279,7 +286,7 @@ class MCoreNevaModel(MCoreLLaVAModel):
         self.share_embeddings_and_output_weights = False
         if self.add_decoder:
             self.language_model = language_transformer_config.configure_model(
-                tokenizer=tokenizer, pre_process=pre_process, post_process=post_process
+                tokenizer=tokenizer, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage
             )
             self.share_embeddings_and_output_weights = self.language_model.share_embeddings_and_output_weights
             self._language_max_sequence_length = self.language_model.max_sequence_length
@@ -850,10 +857,10 @@ class NevaModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNMixin):
         self._training_loss_reduction = None
         self._validation_loss_reduction = None
 
-    def configure_model(self) -> None:
+    def configure_model(self, vp_stage: Optional[int] = None) -> None:
         # pylint: disable=C0115,C0116
         if not hasattr(self, "module"):
-            self.module = self.config.configure_model(self.tokenizer)
+            self.module = self.config.configure_model(self.tokenizer, vp_stage=vp_stage)
 
     def forward(
         self,

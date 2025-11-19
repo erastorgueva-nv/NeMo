@@ -32,6 +32,7 @@ from nemo.collections.asr.parts.utils.eval_utils import cal_write_wer
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.asr.parts.utils.transcribe_utils import (
     compute_output_filename,
+    get_inference_dtype,
     prepare_audio_data,
     restore_transcription_order,
     setup_model,
@@ -153,8 +154,10 @@ class TranscriptionConfig:
     allow_mps: bool = False  # allow to select MPS device (Apple Silicon M-series GPU)
     amp: bool = False
     amp_dtype: str = "float16"  # can be set to "float16" or "bfloat16" when using amp
-    compute_dtype: str = "float32"
-    matmul_precision: str = "highest"  # Literal["highest", "high", "medium"]
+    compute_dtype: Optional[str] = (
+        None  # "float32", "bfloat16" or "float16"; if None (default): bfloat16 if available else float32
+    )
+    matmul_precision: str = "high"  # Literal["highest", "high", "medium"]
     audio_type: str = "wav"
 
     # Recompute model transcription, even if the output folder exists with scores.
@@ -268,13 +271,19 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
     asr_model.set_trainer(trainer)
     asr_model = asr_model.eval()
 
-    if cfg.compute_dtype != "float32" and cfg.amp:
+    if (cfg.compute_dtype is not None and cfg.compute_dtype != "float32") and cfg.amp:
         raise ValueError("amp=true is mutually exclusive with a compute_dtype other than float32")
 
     amp_dtype = torch.float16 if cfg.amp_dtype == "float16" else torch.bfloat16
 
-    if cfg.compute_dtype != "float32":
-        asr_model.to(getattr(torch, cfg.compute_dtype))
+    compute_dtype: torch.dtype
+    if cfg.amp:
+        # with amp model weights required to be in float32
+        compute_dtype = torch.float32
+    else:
+        compute_dtype = get_inference_dtype(compute_dtype=cfg.compute_dtype, device=map_location)
+
+    asr_model.to(compute_dtype)
 
     # we will adjust this flag if the model does not support it
     compute_langs = cfg.compute_langs

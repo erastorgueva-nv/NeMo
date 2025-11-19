@@ -16,6 +16,8 @@ from .bleu import BLEU
 from .token_accuracy import TurnTakingMetrics
 from .results_logger import ResultsLogger
 from .perplexity import Perplexity, ValidationLoss
+from .wer import WER
+
 __all__ = [
     'ASRBLEU',
     'BLEU',
@@ -23,4 +25,5 @@ __all__ = [
     'ResultsLogger',
     'Perplexity',
     'ValidationLoss',
+    'WER',
 ]

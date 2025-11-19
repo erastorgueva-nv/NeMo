@@ -12,13 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 from typing import Callable, List, Optional
 
 import lightning.pytorch as pl
-from megatron.core.distributed import finalize_model_grads
-from megatron.core.optimizer import OptimizerConfig
-from megatron.core.utils import get_model_config
+
+try:
+    from megatron.core.distributed import finalize_model_grads
+    from megatron.core.optimizer import OptimizerConfig
+    from megatron.core.utils import get_model_config
+
+    HAVE_MEGATRON_CORE = True
+
+except (ImportError, ModuleNotFoundError):
+
+    OptimizerConfig = object
+    HAVE_MEGATRON_CORE = False
+
 from torch.optim import Optimizer
 
 from nemo.lightning._strategy_lib import setup_megatron_optimizer
@@ -109,4 +118,5 @@ class MegatronOptimizerModule(OptimizerModule):
         return [optimizer]
 
     def finalize_model_grads(self, *args, **kwargs):
+        """Return function to finalize the model gradients."""
         return finalize_model_grads(*args, **kwargs)

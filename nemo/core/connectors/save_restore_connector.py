@@ -22,6 +22,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from typing import Callable, Generator, Optional, Set, Union
+
 import torch
 from lightning.pytorch.trainer.trainer import Trainer
 from omegaconf import DictConfig, OmegaConf
@@ -30,19 +31,17 @@ from omegaconf.omegaconf import open_dict
 from nemo.core import classes as nemo_classes  # to avoid circular import do not import ModelPT directly
 from nemo.utils import logging, model_utils
 from nemo.utils.app_state import AppState
+from nemo.utils.file_utils import robust_copy
 from nemo.utils.get_rank import is_global_rank_zero
 from nemo.utils.model_utils import inject_model_parallel_rank
-
-try:
-    import multistorageclient
-    from multistorageclient.types import MSC_PROTOCOL as MULTISTORAGECLIENT_PROTOCOL
-
-    MULTISTORAGECLIENT_AVAILABLE = True
-except (ImportError, ModuleNotFoundError):
-    MULTISTORAGECLIENT_AVAILABLE = False
+from nemo.utils.msc_utils import import_multistorageclient, is_multistorageclient_url
 
 
 class SaveRestoreConnector:
+    """
+    Connector for saving and restoring models.
+    """
+
     def __init__(self) -> None:
         self._model_config_yaml = "model_config.yaml"
         self._model_weights_ckpt = "model_weights.ckpt"
@@ -55,7 +54,8 @@ class SaveRestoreConnector:
         You can use "restore_from" method to fully restore instance from .nemo file.
 
         .nemo file is an archive (tar.gz) with the following:
-            model_config.yaml - model configuration in .yaml format. You can deserialize this into cfg argument for model's constructor
+            model_config.yaml - model configuration in .yaml format.
+                You can deserialize this into cfg argument for model's constructor
             model_wights.ckpt - model checkpoint
 
         Args:
@@ -208,7 +208,8 @@ class SaveRestoreConnector:
             A potentially modified state dict.
         """
 
-        # NOTE and TODO (sandeepsub) This is duplicated across save_restore_connector and nlp_save_restore_connector. This shouldn't be here.
+        # NOTE and TODO (sandeepsub) This is duplicated across save_restore_connector and nlp_save_restore_connector.
+        # This shouldn't be here.
         if conf.get('megatron_amp_O2', False):
             new_state_dict = {}
             for key in state_dict.keys():
@@ -307,7 +308,9 @@ class SaveRestoreConnector:
 
             To convert the .nemo tarfile into multiple Module level PyTorch checkpoints
             ::
-            state_dict = nemo.collections.asr.models.EncDecCTCModel.extract_state_dict_from('asr.nemo', './asr_ckpts', split_by_module=True)
+            state_dict = nemo.collections.asr.models.EncDecCTCModel.extract_state_dict_from(
+                'asr.nemo', './asr_ckpts', split_by_module=True
+            )
 
 
             To restore a module from a Module level checkpoint
@@ -421,12 +424,14 @@ class SaveRestoreConnector:
         else:
             if verify_src_exists:
                 raise FileNotFoundError(
-                    f"src path does not exist or it is not a path in nemo file. src value I got was: {src}. Absolute: {os.path.abspath(src)}"
+                    f"src path does not exist or it is not a path in nemo file. "
+                    f"src value I got was: {src}. Absolute: {os.path.abspath(src)}"
                 )
             else:
                 # artifact is optional and we simply return None
                 logging.warning(
-                    f"src path does not exist or it is not a path in nemo file. src value I got was: {src}. Absolute: {os.path.abspath(src)}"
+                    f"src path does not exist or it is not a path in nemo file. "
+                    f"src value I got was: {src}. Absolute: {os.path.abspath(src)}"
                 )
                 return None
 
@@ -464,7 +469,7 @@ class SaveRestoreConnector:
                     # Note uuid.uuid4().hex is guaranteed to be 32 character long
                     artifact_base_name = os.path.basename(artiitem.path)
                     artifact_uniq_name = f"{uuid.uuid4().hex}_{artifact_base_name}"
-                    shutil.copy2(artiitem.path, os.path.join(nemo_file_folder, artifact_uniq_name))
+                    robust_copy(artiitem.path, os.path.join(nemo_file_folder, artifact_uniq_name))
 
                     # Update artifacts registry
                     artiitem.hashed_path = "nemo:" + artifact_uniq_name
@@ -477,7 +482,7 @@ class SaveRestoreConnector:
                         model.artifacts[conf_path] = artiitem
 
                 else:
-                    raise ValueError(f"Directly referencing artifacts from other nemo files isn't supported yet")
+                    raise ValueError("Directly referencing artifacts from other nemo files isn't supported yet")
 
         # Process current tarfile artifacts by unpacking the previous tarfile and extract the artifacts
         # that are currently required.
@@ -532,7 +537,7 @@ class SaveRestoreConnector:
                     for path in restoration_paths:
                         if self.model_extracted_dir:
                             for rel_path in artifact_rel_paths[path]:
-                                shutil.copy2(src=rel_path, dst=archive_dir)
+                                robust_copy(rel_path, archive_dir)
                         else:
                             self._unpack_nemo_file(
                                 path2file=path, out_folder=archive_dir, members=artifact_rel_paths[path]
@@ -546,7 +551,7 @@ class SaveRestoreConnector:
                             artifact_base_name = os.path.basename(artiitem.path)
                         # no need to hash here as we are in tarfile_artifacts which are already hashed
                         artifact_uniq_name = artifact_base_name
-                        shutil.copy2(artifact_base_name, os.path.join(nemo_file_folder, artifact_uniq_name))
+                        robust_copy(artifact_base_name, os.path.join(nemo_file_folder, artifact_base_name))
 
                         # Update artifacts registry
                         new_artiitem = model_utils.ArtifactItem()
@@ -594,9 +599,7 @@ class SaveRestoreConnector:
 
     @staticmethod
     def _make_nemo_file_from_folder(filename, source_dir):
-        is_multistorageclient_url = MULTISTORAGECLIENT_AVAILABLE and filename.startswith(MULTISTORAGECLIENT_PROTOCOL)
-
-        if is_multistorageclient_url:
+        if is_multistorageclient_url(filename):
             SaveRestoreConnector._make_nemo_file_from_folder_with_multistorageclient(filename, source_dir)
         else:
             dirname = os.path.dirname(filename)
@@ -606,15 +609,16 @@ class SaveRestoreConnector:
 
     @staticmethod
     def _make_nemo_file_from_folder_with_multistorageclient(filename, source_dir):
+        msc = import_multistorageclient()
         filename_with_extension = filename.split("/")[-1]  # get the filename and extension
         with tempfile.TemporaryDirectory() as tmpdir:
             tar_file = os.path.join(tmpdir, filename_with_extension)
             with tarfile.open(tar_file, "w:") as tar:
                 tar.add(source_dir, arcname=".")
                 start_time = time.time()
-                multistorageclient.upload_file(filename, tar_file)
+                msc.upload_file(filename, tar_file)
                 logging.debug(
-                    f"time spent for multistorageclient.upload from {tar_file} to {filename}: {time.time() - start_time:.4f}"
+                    f"Time spent for msc.upload_file from {tar_file} to {filename}: {time.time() - start_time:.4f}"
                 )
 
     @staticmethod
@@ -697,8 +701,10 @@ class SaveRestoreConnector:
 
     @staticmethod
     def _unpack_nemo_file(path2file: str, out_folder: str, members: Optional[list[str]] = None) -> str:
-        is_multistorageclient_url = MULTISTORAGECLIENT_AVAILABLE and path2file.startswith(MULTISTORAGECLIENT_PROTOCOL)
-        if is_multistorageclient_url:
+        """
+        Unpack a nemo file.
+        """
+        if is_multistorageclient_url(path2file):
             out_folder = SaveRestoreConnector._unpack_nemo_file_with_multistorageclient(path2file, out_folder, members)
         else:
             with SaveRestoreConnector._tar_open(path2file) as tar:
@@ -712,16 +718,20 @@ class SaveRestoreConnector:
     def _unpack_nemo_file_with_multistorageclient(
         path2file: str, out_folder: str, members: Optional[list[str]] = None
     ) -> str:
-        if not multistorageclient.os.path.exists(path2file):
+        """
+        Unpack a nemo file with multistorageclient.
+        """
+        msc = import_multistorageclient()
+        if not msc.os.path.exists(path2file):
             raise FileNotFoundError(f"{path2file} does not exist")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             filename_with_extension = path2file.split("/")[-1]  # get the filename with extension
             downloaded_file_path = os.path.join(tmpdir, filename_with_extension)
             start_time = time.time()
-            multistorageclient.download_file(path2file, downloaded_file_path)
+            msc.download_file(path2file, downloaded_file_path)
             logging.info(
-                f"time spent for multistorageclient.download_file from {downloaded_file_path}: {time.time() - start_time:.4f}"
+                f"Time spent for msc.download_file from {downloaded_file_path}: {time.time() - start_time:.4f}"
             )
 
             # we start with an assumption of uncompressed tar,
@@ -746,11 +756,29 @@ class SaveRestoreConnector:
         torch.save(state_dict, filepath)
 
     @staticmethod
-    def _load_state_dict_from_disk(model_weights, map_location=None):
-        return torch.load(model_weights, map_location='cpu', weights_only=False)
+    def _load_state_dict_from_disk(model_weights, map_location='cpu'):
+        """
+        Load model state dict from disk.
+
+        Args:
+            model_weights: Path to the checkpoint file
+            map_location: Device to map tensors to
+
+        Returns:
+            State dict loaded from checkpoint
+
+        """
+        try:
+            return torch.load(model_weights, map_location=map_location, weights_only=True)
+        except Exception as e:
+            logging.error(f"Failed to load checkpoint with weights_only=True: {e}")
+            raise e
 
     @property
     def model_config_yaml(self) -> str:
+        """
+        Get the path to the model config yaml file.
+        """
         return self._model_config_yaml
 
     @model_config_yaml.setter
@@ -759,6 +787,9 @@ class SaveRestoreConnector:
 
     @property
     def model_weights_ckpt(self) -> str:
+        """
+        Get the path to the model weights checkpoint file.
+        """
         return self._model_weights_ckpt
 
     @model_weights_ckpt.setter
@@ -767,6 +798,9 @@ class SaveRestoreConnector:
 
     @property
     def model_extracted_dir(self) -> Optional[str]:
+        """
+        Get the path to the model extracted directory.
+        """
         return self._model_extracted_dir
 
     @model_extracted_dir.setter
@@ -775,6 +809,9 @@ class SaveRestoreConnector:
 
     @property
     def pack_nemo_file(self) -> bool:
+        """
+        Get the flag for packing a nemo file.
+        """
         return self._pack_nemo_file
 
     @pack_nemo_file.setter

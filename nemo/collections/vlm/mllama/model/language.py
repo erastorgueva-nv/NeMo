@@ -94,6 +94,7 @@ class CrossAttentionTextModel(MCoreGPTModel):
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
         seq_len_interpolation_factor: Optional[float] = None,
+        vp_stage: Optional[int] = None,
     ):
         super().__init__(
             config,
@@ -109,6 +110,7 @@ class CrossAttentionTextModel(MCoreGPTModel):
             rotary_percent,
             rotary_base,
             seq_len_interpolation_factor,
+            vp_stage=vp_stage,
         )
 
         # Overwrite the self.decoder
@@ -361,7 +363,12 @@ class CrossAttentionTransformerBlock(TransformerBlock):
                             packed_seq_params=packed_seq_params,
                         )
                         # CUDA graph doesn't output context and is expected to be None
-                        assert (context is None) or (not self.config.enable_cuda_graph) or (not self.training)
+                        assert (
+                            (context is None)
+                            or (not self.config.enable_cuda_graph)
+                            or (self.config.cuda_graph_scope == "full_iteration")
+                            or (not self.training)
+                        )
 
                     if (
                         torch.is_grad_enabled()

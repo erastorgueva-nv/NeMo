@@ -14,12 +14,16 @@
 
 import copy
 import os
+import pprint
 import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
 
+import modelopt.torch.export as mte
+import modelopt.torch.opt as mto
+import modelopt.torch.quantization as mtq
 import torch
 from datasets import load_dataset
 from megatron.core.inference.common_inference_params import CommonInferenceParams
@@ -29,22 +33,21 @@ from transformers import PreTrainedTokenizerBase
 from nemo.collections import llm
 from nemo.collections.llm.inference import MCoreTokenizerWrappper, generate
 from nemo.collections.llm.modelopt.quantization.quant_cfg_choices import get_quant_cfg_choices
+from nemo.collections.llm.modelopt.quantization.utils import load_quant_cfg
 from nemo.collections.llm.utils import barrier, torch_dtype_from_precision
-from nemo.lightning import io
 from nemo.lightning.ckpt_utils import ckpt_to_context_subdir
+from nemo.lightning.io.api import load_connector_from_trainer_ckpt
 from nemo.lightning.io.pl import TrainerContext, ckpt_to_weights_subdir
 from nemo.utils import logging
 from nemo.utils.get_rank import is_global_rank_zero
-from nemo.utils.import_utils import safe_import
 from nemo.utils.model_utils import unwrap_model
 
 if TYPE_CHECKING:
+    import lightning.pytorch as pl
+
     from nemo.lightning import Trainer
     from nemo.lightning.megatron_parallel import MegatronParallel
 
-mtq, HAVE_MODELOPT_MTQ = safe_import("modelopt.torch.quantization")
-mte, HAVE_MODELOPT_MTE = safe_import("modelopt.torch.export")
-HAVE_MODELOPT = HAVE_MODELOPT_MTQ and HAVE_MODELOPT_MTE
 
 QUANT_CFG_CHOICES = get_quant_cfg_choices()
 SUPPORTED_DTYPE = [16, "16", "bf16"]  # Default precision for non-quantized layers
@@ -53,6 +56,8 @@ KV_QUANT_CFG_CHOICES = {
     "fp8": "FP8_KV_CFG",
     "nvfp4": "NVFP4_KV_CFG",
 }
+
+AnyPath = Union[Path, str]
 
 
 @dataclass
@@ -108,24 +113,20 @@ class Quantizer:
         3. Producing an output directory with a quantized checkpoint and a tokenizer
 
     By default, the output directory produced is intended to be consumed by TensorRT-LLM toolbox
-    for efficient inference. This can be achieved using nemo.export.tensorrt_llm module.
+    for efficient inference. This can be achieved using the Export-Deploy repository
+    (https://github.com/NVIDIA-NeMo/Export-Deploy).
     This can be changed to export a standard NeMo 2.0 checkpoint instead using `ExportConfig`.
     """
 
     def __init__(self, quantization_config: QuantizationConfig, export_config: ExportConfig):
         """Initialize Quantizer with quantization and export configurations."""
-        if not HAVE_MODELOPT:
-            raise RuntimeError("nvidia-modelopt is needed to use Quantizer")
         if not torch.cuda.is_available():
             raise EnvironmentError("GPU is required for the quantization.")
 
         self.quantization_config = quantization_config
         self.export_config = export_config
-
-        algorithm = quantization_config.algorithm
         dtype = export_config.dtype
         # Export and Quantization config sanity checks
-        assert algorithm is None or algorithm in QUANT_CFG_CHOICES, f"Unsupported quantization algorithm: {algorithm}"
         if quantization_config.enable_kv_cache:
             assert (
                 quantization_config.kv_cache_qformat in KV_QUANT_CFG_CHOICES
@@ -137,8 +138,6 @@ class Quantizer:
     @staticmethod
     def _setup(model) -> None:
         """Setup model for quantization."""
-        if isinstance(model, llm.HFAutoModelForCausalLM):
-            return
         # TODO: disable activation checkpointing
         model.config.vocab_size = model.tokenizer.vocab_size
         model.freeze()
@@ -160,7 +159,10 @@ class Quantizer:
             return self.export_config.decoder_type
 
         unwrapped_model = model
-        while not isinstance(unwrapped_model, (llm.GPTModel, llm.HFAutoModelForCausalLM)):
+        while not isinstance(unwrapped_model, llm.GPTModel):
+            # Check for Llama4OmniModel before unwrapping further
+            if hasattr(unwrapped_model, '__class__') and unwrapped_model.__class__.__name__ == 'Llama4OmniModel':
+                return "llama"
             unwrapped_model = unwrapped_model.module
 
         if decoder_type := get_modelopt_decoder_type(unwrapped_model):
@@ -179,28 +181,20 @@ class Quantizer:
         prompts = ["Born in north-east France, Soyer trained as a", "Born in California, Soyer trained as a"]
 
         outputs = []
-        if isinstance(model, llm.HFAutoModelForCausalLM):
-            for prompt in prompts:
-                input_ids = model.tokenizer.tokenizer(prompt, return_tensors="pt")
-                input_ids = {k: v.to(model.model.device) for k, v in input_ids.items()}
-                output = model.model.generate(**input_ids, max_new_tokens=30)
-                decoded = model.tokenizer.tokenizer.decode(output[0], skip_special_tokens=True)
-                outputs.append(decoded)
-        else:
-            mcore_tokenizer = MCoreTokenizerWrappper(model.tokenizer)
-            mcore_inference = model.get_inference_wrapper(
-                params_dtype=torch.bfloat16, inference_batch_times_seqlen_threshold=30
+        mcore_tokenizer = MCoreTokenizerWrappper(model.tokenizer)
+        mcore_inference = model.get_inference_wrapper(
+            params_dtype=torch.bfloat16, inference_batch_times_seqlen_threshold=30
+        )
+        generated = [
+            r.generated_text
+            for r in generate(
+                mcore_inference,
+                mcore_tokenizer,
+                prompts,
+                inference_params=CommonInferenceParams(top_k=1, num_tokens_to_generate=30),
             )
-            generated = [
-                r.generated_text
-                for r in generate(
-                    mcore_inference,
-                    mcore_tokenizer,
-                    prompts,
-                    inference_params=CommonInferenceParams(top_k=1, num_tokens_to_generate=30),
-                )
-            ]
-            outputs = [prompt + generation for prompt, generation in zip(prompts, generated)]
+        ]
+        outputs = [prompt + generation for prompt, generation in zip(prompts, generated)]
 
         logging.info(f"Sample generation after PTQ (with prompts): {outputs}")
 
@@ -216,16 +210,6 @@ class Quantizer:
             self.quantization_config.calibration_dataset_size // self.quantization_config.calibration_batch_size
         )
 
-        if isinstance(model, llm.HFAutoModelForCausalLM):
-            device = model.model.device
-
-            def huggingface_forward_loop(model):
-                dataloader = get_dataloader()
-                for batch in dataloader:
-                    model(batch.to(device))
-
-            return huggingface_forward_loop
-
         return self.create_megatron_forward_loop(
             get_dataloader,
             num_batches=number_of_batches,
@@ -235,12 +219,15 @@ class Quantizer:
 
     def _get_quant_cfg(self, model):
         decoder_type = self._get_decoder_type(model, optional=True)
-        assert (
-            self.quantization_config.algorithm in QUANT_CFG_CHOICES
-        ), f"Unsupported quantization format: {self.quantization_config.algorithm}"
+        algorithm = self.quantization_config.algorithm
 
-        quant_cfg = QUANT_CFG_CHOICES[self.quantization_config.algorithm]
-        if "awq" in self.quantization_config.algorithm:
+        if os.path.isfile(algorithm):
+            return load_quant_cfg(algorithm)
+
+        assert algorithm in QUANT_CFG_CHOICES, f"Unsupported quantization format: {algorithm}"
+
+        quant_cfg = QUANT_CFG_CHOICES[algorithm]
+        if "awq" in algorithm:
             quant_cfg = copy.deepcopy(quant_cfg)
             weight_quantizer = quant_cfg["quant_cfg"]["*weight_quantizer"]
             if isinstance(weight_quantizer, list):
@@ -250,11 +237,11 @@ class Quantizer:
                 weight_quantizer["block_sizes"][-1] = self.quantization_config.awq_block_size
 
             # Coarser optimal scale search seems to resolve the overflow in TRT-LLM for some models
-            if "w4a8_awq" == self.quantization_config.algorithm and decoder_type in ["gemma", "mpt"]:
+            if "w4a8_awq" == algorithm and decoder_type in ["gemma", "mpt"]:
                 quant_cfg["algorithm"] = {"method": "awq_lite", "alpha_step": 1}
 
         if self.quantization_config.enable_kv_cache is None:
-            enable_quant_kv_cache = "int8" not in self.quantization_config.algorithm and decoder_type != "gpt"
+            enable_quant_kv_cache = "int8" not in algorithm and decoder_type != "gpt"
         else:
             enable_quant_kv_cache = self.quantization_config.enable_kv_cache
         if self.quantization_config.enable_kv_cache is None and enable_quant_kv_cache:
@@ -276,9 +263,12 @@ class Quantizer:
                 quant_cfg["algorithm"] = "max"
 
         # Gemma 7B has accuracy regression using alpha 1. We set 0.5 instead.
-        if decoder_type == "gemma" and "int8_sq" in self.quantization_config.algorithm:
+        if decoder_type == "gemma" and "int8_sq" in algorithm:
             quant_cfg["algorithm"] = {"method": "smoothquant", "alpha": 0.5}
 
+        quant_cfg["quant_cfg"]["vision_projection.*"] = {
+            "enable": False
+        }  # disable vision projection quantization for Llama4
         return quant_cfg
 
     def quantize(self, model: "MegatronParallel", forward_loop=None):
@@ -286,9 +276,6 @@ class Quantizer:
 
         If forward_loop is not provided, a forward loop will be created using the calibration dataset.
         """
-        if forward_loop is None:
-            forward_loop = self._get_forward_loop(model)
-
         algorithm = self.quantization_config.algorithm
         if algorithm is None:
             logging.info("Quantization algorithm set to None, returning the non-quantized model")
@@ -299,6 +286,11 @@ class Quantizer:
         self._setup(model)
         decoder_type = self._get_decoder_type(model, optional=True)
         quant_cfg = self._get_quant_cfg(model)
+        logging.info(f"Using quant_cfg:\n{pprint.pformat(quant_cfg)}")
+
+        if forward_loop is None and mtq.config.need_calibration(quant_cfg):
+            forward_loop = self._get_forward_loop(model)
+
         unwrapped_model = mtq.quantize(unwrap_for_modelopt_operations(model), quant_cfg, forward_loop)
         if decoder_type == "gpt":
             # We found squared_relu may have an under-calibration problem.
@@ -376,25 +368,19 @@ class Quantizer:
             # For NeMo model format, the tokenizer is saved via trainer.save_checkpoint()
             return
 
-        is_automodel = isinstance(model, llm.HFAutoModelForCausalLM)
-        if is_automodel:
-            if export_fmt != "hf":
-                export_dir = export_dir / "huggingface_tokenizer"
-            model.tokenizer.save_pretrained(str(export_dir))
+        if (
+            export_fmt == "hf"
+            and hasattr(model, "tokenizer")
+            and hasattr(model.tokenizer, "tokenizer")
+            and isinstance(model.tokenizer.tokenizer, PreTrainedTokenizerBase)
+        ):
+            model.tokenizer.tokenizer.save_pretrained(str(export_dir))
         else:
-            if (
-                export_fmt == "hf"
-                and hasattr(model, "tokenizer")
-                and hasattr(model.tokenizer, "tokenizer")
-                and isinstance(model.tokenizer.tokenizer, PreTrainedTokenizerBase)
-            ):
-                model.tokenizer.tokenizer.save_pretrained(str(export_dir))
-            else:
-                # Save the model context in order to restore its tokenizer later. The destination
-                # path is "nemo_context" as this name is used in nemo.export to setup tokenizer.
-                shutil.copytree(
-                    ckpt_to_context_subdir(model_dir), os.path.join(export_dir, "nemo_context"), dirs_exist_ok=True
-                )
+            # Save the model context in order to restore its tokenizer later. The destination
+            # path is "nemo_context" as this name is used in nemo.export to setup tokenizer.
+            shutil.copytree(
+                ckpt_to_context_subdir(model_dir), os.path.join(export_dir, "nemo_context"), dirs_exist_ok=True
+            )
 
     def export(self, model, model_dir: str, trainer: Optional["Trainer"] = None) -> None:
         """Export model to a TensorRT-LLM or NeMo checkpoint."""
@@ -403,41 +389,26 @@ class Quantizer:
         export_dir = self.export_config.path
         export_fmt = self.export_config.export_format
         assert export_fmt in SUPPORTED_EXPORT_FMT, f"Unsupported export format: {export_fmt}"
-        is_automodel = isinstance(model, llm.HFAutoModelForCausalLM)
 
         # Standard NeMo 2.0 checkpoint format
         if self.export_config.export_format == "nemo":
-            assert (
-                not is_automodel
-            ), "NeMo export format can only be used with native NeMo checkpoints, not HuggingFace models"
             assert trainer is not None, "Trainer required for NeMo export."
+            trainer.strategy.connect(model)
+            trainer.strategy.setup_environment()
+            trainer.strategy.setup_megatron_parallel(trainer=trainer)
+            trainer.strategy.trainer = trainer
             trainer.save_checkpoint(export_dir)
             barrier()
             if is_global_rank_zero():
                 TrainerContext.from_trainer(trainer).io_dump(ckpt_to_context_subdir(export_dir), yaml_attrs=["model"])
                 assert (Path(ckpt_to_weights_subdir(export_dir, False)) / "modelopt_state").exists()
         elif self.export_config.export_format == "hf":
-            unwrapped_model = unwrap_for_modelopt_operations(model)
-            with torch.inference_mode():
-                if is_automodel:
-                    mte.export_hf_checkpoint(
-                        unwrapped_model,
-                        export_dir=export_dir,
-                    )
-                else:
-                    context = io.load_context(model_dir, subpath="model")
-                    exporter = context.exporter("hf", model_dir)
-                    config = exporter.config
-                    with tempfile.TemporaryDirectory() as tmp_dir:
-                        config.save_pretrained(tmp_dir)
-                        mte.export_mcore_gpt_to_hf(
-                            unwrapped_model, pretrained_model_name_or_path=tmp_dir, export_dir=str(export_dir)
-                        )
+            export_hf_checkpoint(model_dir, export_dir, model=model)
         # TRT-LLM
         else:
             inference_tp = self.export_config.inference_tp
             inference_pp = self.export_config.inference_pp
-            use_nfs_workspace = (not is_automodel) and (model.config.pipeline_model_parallel_size > 1)
+            use_nfs_workspace = model.config.pipeline_model_parallel_size > 1
 
             with torch.inference_mode():
                 remove_hook_from_module(model, recurse=True)
@@ -457,6 +428,35 @@ class Quantizer:
         if is_global_rank_zero():
             self._save_tokenizer(model, model_dir, export_dir, export_fmt)
             logging.info(f"Export succeeded, model has been exported to {export_dir}.")
+
+
+def export_hf_checkpoint(
+    model_dir: AnyPath, export_dir: AnyPath, model: Optional["pl.LightningModule"] = None, **kwargs
+) -> Path | None:
+    """Export a GPTModel or HFAutoModelForCausalLM to a HuggingFace checkpoint."""
+
+    exporter = load_connector_from_trainer_ckpt(model_dir, "hf")
+    if model is None:
+        model, _ = exporter.nemo_load(model_dir)
+    unwrapped_model = unwrap_for_modelopt_operations(model)
+    if not mto.ModeloptStateManager.is_converted(unwrapped_model):
+        return None  # Model was not converted by ModelOpt.
+
+    with torch.inference_mode():
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            exporter.config.save_pretrained(tmp_dir)
+            mte.export_mcore_gpt_to_hf(
+                unwrapped_model, pretrained_model_name_or_path=tmp_dir, export_dir=str(export_dir), **kwargs
+            )
+
+    return Path(export_dir)
+
+
+def unwrap_for_modelopt_operations(model):
+    """Unwraps the model to expose the underlying architecture that Model Optimizer can work with.
+    For HuggingFace models, returns the base model. For MCore models, returns the unwrapped version."""
+
+    return unwrap_model(model)
 
 
 def get_calib_data_iter(
@@ -505,42 +505,6 @@ def create_data_iterator_getter(model, dataset, seq_len, batch_size, calibration
     return _get_iterator
 
 
-huggingface_model_type_pattern_match = {
-    "GPT2": "gpt",
-    "Mllama": "mllama",
-    "Llama": "llama",
-    "Mistral": "llama",
-    "GPTJ": "gptj",
-    "FalconForCausalLM": "falcon",
-    "RWForCausalLM": "falcon",
-    "baichuan": "baichuan",
-    "MPT": "mpt",
-    "Bloom": "bloom",
-    "ChatGLM": "chatglm",
-    "QWen": "qwen",
-    "RecurrentGemma": "recurrentgemma",
-    "Gemma2": "gemma2",
-    "Gemma3": "gemma3",
-    "Gemma": "gemma",
-    "phi3small": "phi3small",
-    "phi3": "phi3",
-    "PhiMoEForCausalLM": "phi3",
-    "phi": "phi",
-    "TLGv4ForCausalLM": "phi",
-    "MixtralForCausalLM": "llama",
-    "ArcticForCausalLM": "llama",
-    "StarCoder": "gpt",
-    "Dbrx": "dbrx",
-    "T5": "t5",
-    "Bart": "bart",
-    "GLM": "glm",
-    "InternLM2ForCausalLM": "internlm",
-    "ExaoneForCausalLM": "exaone",
-    "Nemotron": "gpt",
-    "Deepseek": "deepseek",
-    "Whisper": "whisper",
-}
-
 gpt_model_type = [
     (llm.Baichuan2Model, "baichuan"),
     (llm.ChatGLMModel, "chatglm"),
@@ -558,30 +522,16 @@ gpt_model_type = [
 ]
 
 
-def unwrap_for_modelopt_operations(model):
-    """Unwraps the model to expose the underlying architecture that Model Optimizer can work with.
-    For HuggingFace models, returns the base model. For MCore models, returns the unwrapped version."""
-
-    if isinstance(model, llm.HFAutoModelForCausalLM):
-        return model.model
-    return unwrap_model(model)
-
-
-def get_modelopt_decoder_type(model: Union[llm.GPTModel, llm.HFAutoModelForCausalLM]) -> Optional[str]:
-    """Infers the modelopt decoder type from GPTModel or HFAutoModelForCausalLM.
+def get_modelopt_decoder_type(model: llm.GPTModel) -> Optional[str]:
+    """Infers the modelopt decoder type from GPTModel
 
     Args:
         model (GPTModel | HFAutoModelForCausalLM): The model to infer the decoder type from.
     Returns:
         Optional[str]: The inferred decoder type or None if no match is found.
     """
-    if isinstance(model, llm.HFAutoModelForCausalLM):
-        for k, v in huggingface_model_type_pattern_match.items():
-            if k.lower() in type(model.model).__name__.lower():
-                return v
-    else:
-        for config_class, decoder_type in gpt_model_type:
-            if isinstance(model, config_class):
-                return decoder_type
+    for config_class, decoder_type in gpt_model_type:
+        if isinstance(model, config_class):
+            return decoder_type
 
     return None

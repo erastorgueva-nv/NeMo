@@ -121,17 +121,19 @@ def chunkify(x, attention_chunk_size):
     return x
 
 
-def get_llama4_layer_spec(config) -> ModuleSpec:
+def get_llama4_layer_spec(config, vp_stage: Optional[int] = None, gpt_decoder_block_spec=None) -> ModuleSpec:
     """Get llama4 layer spec"""
 
     from megatron.core.transformer.enums import AttnMaskType
     from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
     # Use decoder_block_spec: set layer_specs as a list of individual layer specs
-    llama4_layer_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=True)
-
+    if gpt_decoder_block_spec is None:
+        llama4_layer_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=True, vp_stage=vp_stage)
+    else:
+        llama4_layer_spec = gpt_decoder_block_spec
     updated_layer_specs = []
-    offset = get_transformer_layer_offset(config)
+    offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
     for idx, layer_spec in enumerate(llama4_layer_spec.layer_specs):
         layer_no = idx + offset
         updated_layer_spec = deepcopy(layer_spec)
@@ -178,6 +180,7 @@ class Llama4SelfAttention(MCoreSelfAttention):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        **kwargs,
     ) -> Tuple[Tensor, Tensor]:
         """
         Perform a forward pass through the attention module.
@@ -331,11 +334,11 @@ class Llama4SelfAttention(MCoreSelfAttention):
                         q_pos_emb,
                         config=self.config,
                         cu_seqlens=cu_seqlens_q,
-                        cp_group=self.model_comm_pgs.cp,
+                        cp_group=self.pg_collection.cp,
                     )
                 else:
                     query = inference_context.apply_rotary_emb_query(
-                        query, q_pos_emb, self.config, cu_seqlens_q, self.model_comm_pgs.cp
+                        query, q_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp
                     )
             if k_pos_emb is not None:
                 key = apply_rotary_pos_emb(
@@ -343,7 +346,7 @@ class Llama4SelfAttention(MCoreSelfAttention):
                     k_pos_emb,
                     config=self.config,
                     cu_seqlens=cu_seqlens_kv,
-                    cp_group=self.model_comm_pgs.cp,
+                    cp_group=self.pg_collection.cp,
                 )
 
             # TODO, can apply positional embedding to value_layer so it has

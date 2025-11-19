@@ -12,11 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# flake8: noqa
+# pylint: skip-file
 
 """Transformer."""
 from contextlib import nullcontext
 from importlib.metadata import version
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 import packaging
 import torch
@@ -43,7 +46,6 @@ from nemo.collections.nlp.modules.common.megatron.layer_type import LayerType
 from nemo.collections.nlp.modules.common.megatron.mlp import ParallelMLP, SwitchMLP
 from nemo.collections.nlp.modules.common.megatron.module import MegatronModule
 from nemo.collections.nlp.modules.common.megatron.utils import ApexGuardDefaults
-from nemo.collections.nlp.parts import utils_funcs
 from nemo.core import adapter_mixins
 from nemo.utils import logging
 from nemo.utils.import_utils import safe_import_from
@@ -124,6 +126,21 @@ def remove_bias_from_layernorm(layer):
     for module in layer.modules():
         if hasattr(module, 'bias') and isinstance(module.bias, nn.Parameter):
             module.register_parameter('bias', None)
+
+
+def torch_dtype_from_precision(precision: Union[int, str], megatron_amp_O2: Optional[bool] = None) -> torch.dtype:
+    """Mapping from PTL precision types to corresponding PyTorch parameter datatype."""
+    if megatron_amp_O2 is not None and megatron_amp_O2 is False:
+        return torch.float32
+
+    if precision in ['bf16', 'bf16-mixed']:
+        return torch.bfloat16
+    elif precision in [16, '16', '16-mixed']:
+        return torch.float16
+    elif precision in [32, '32', '32-true']:
+        return torch.float32
+    else:
+        raise ValueError(f"Could not parse the precision of `{precision}` to a valid torch.dtype")
 
 
 class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixin):
@@ -745,7 +762,7 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
         )
 
         # Dtype for forward pass - ignore amp O2
-        self.dtype = utils_funcs.torch_dtype_from_precision(precision, megatron_amp_O2=None)
+        self.dtype = torch_dtype_from_precision(precision, megatron_amp_O2=None)
 
     def forward(
         self,
@@ -896,7 +913,7 @@ class AutocastTransformerLayer(TransformerLayer):
         super().__init__(**transformer_layer_args)
 
         # Dtype for forward pass - ignore amp O2
-        self.dtype = utils_funcs.torch_dtype_from_precision(autocast_dtype, megatron_amp_O2=None)
+        self.dtype = torch_dtype_from_precision(autocast_dtype, megatron_amp_O2=None)
 
     def forward(
         self,
@@ -1210,7 +1227,10 @@ class ParallelTransformer(MegatronModule):
                     use_flash_attention=use_flash_attention,
                 )
 
-        if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+        assert (
+            config.get('virtual_pipeline_model_parallel_size', None) is None
+        ), "Virtual pipeline model parallel size is no longer supported for nemo 1.0"
+        if config.virtual_pipeline_model_parallel_size is not None:
             assert num_layers % parallel_state.get_virtual_pipeline_model_parallel_world_size() == 0, (
                 'num_layers_per_stage must be divisible by ' 'virtual_pipeline_model_parallel_size'
             )
@@ -1234,7 +1254,7 @@ class ParallelTransformer(MegatronModule):
         else:
             # Each stage gets a contiguous set of layers.
             if (
-                self.model_type == ModelType.encoder_and_decoder
+                self.model_type == ModelType.encoder_or_decoder
                 and parallel_state.get_pipeline_model_parallel_world_size() > 1
             ):
                 pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
@@ -1301,7 +1321,7 @@ class ParallelTransformer(MegatronModule):
     def get_num_layers(self, num_layers):
         """Compute the number of transformer layers resident on the current rank."""
         if parallel_state.get_pipeline_model_parallel_world_size() > 1:
-            if self.model_type == ModelType.encoder_and_decoder:
+            if self.model_type == ModelType.encoder_or_decoder:
                 assert parallel_state.get_pipeline_model_parallel_split_rank() is not None
                 num_ranks_in_encoder = parallel_state.get_pipeline_model_parallel_split_rank()
                 num_ranks_in_decoder = parallel_state.get_pipeline_model_parallel_world_size() - num_ranks_in_encoder

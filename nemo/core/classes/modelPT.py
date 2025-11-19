@@ -26,15 +26,8 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 import hydra
 import torch
 
-try:
-    import multistorageclient
-    from multistorageclient.types import MSC_PROTOCOL as MULTISTORAGECLIENT_PROTOCOL
-
-    MULTISTORAGECLIENT_AVAILABLE = True
-except (ImportError, ModuleNotFoundError):
-    MULTISTORAGECLIENT_AVAILABLE = False
-
 from nemo.core.classes.module import NeuralModule
+from nemo.utils.msc_utils import import_multistorageclient, is_multistorageclient_url
 
 try:
     from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
@@ -55,6 +48,7 @@ from nemo.core import optim
 from nemo.core.classes.common import Model
 from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
 from nemo.core.optim import McoreDistributedOptimizer, prepare_lr_scheduler
+from nemo.lightning.callback_group import CallbackGroup
 from nemo.utils import logging, model_utils
 from nemo.utils.app_state import AppState
 from nemo.utils.debug_hook import register_debug_hooks
@@ -93,6 +87,10 @@ class ModelPT(LightningModule, Model):
                 f"trainer constructor argument must be either None or lightning.pytorch.Trainer. "
                 f"But got {type(trainer)} instead."
             )
+
+        # Track model init start
+        CallbackGroup.get_instance().on_model_init_start()
+
         super().__init__()
 
         """
@@ -159,6 +157,8 @@ class ModelPT(LightningModule, Model):
         if torch.cuda.is_available() and torch.cuda.current_device() is not None:
             app_state.device_id = torch.cuda.current_device()
 
+        CallbackGroup.get_instance().on_model_init_end()
+        CallbackGroup.get_instance().on_dataloader_init_start()
         if self._cfg is not None and not self._is_model_being_restored():
             # Setup data loaders now (default) or defer setup to `self.setup()`
             # if `defer_setup` is set in the config of the corresponding dataloader.
@@ -205,6 +205,8 @@ class ModelPT(LightningModule, Model):
                     f"Test config : \n{OmegaConf.to_yaml(self._cfg.test_ds)}"
                 )
 
+        CallbackGroup.get_instance().on_dataloader_init_end()
+
         # Create list of lists for val and test outputs to support multiple dataloaders
         # Initialize an empty list as sometimes self._validation_dl can be None at this stage
         self._validation_step_outputs = None
@@ -234,6 +236,9 @@ class ModelPT(LightningModule, Model):
         cls._save_restore_connector = SaveRestoreConnector()
 
     def on_fit_start(self) -> None:
+        """
+        Register debug hooks.
+        """
         if self.cfg.get("dump_debug_info", False):
             register_debug_hooks(self.model, self.trainer, self.log, self.cfg.get("dump_debug_info_to_file", False))
         return super().on_fit_start()
@@ -411,15 +416,11 @@ class ModelPT(LightningModule, Model):
         """
 
         def maybe_make_save_dir(path: Union[str, 'pathlib.Path']):
-            if MULTISTORAGECLIENT_AVAILABLE and str(path).startswith(MULTISTORAGECLIENT_PROTOCOL):
-                return
-            else:
+            if not is_multistorageclient_url(path):
                 if not path.parent.exists():
                     path.parent.mkdir(parents=True)
 
-        if MULTISTORAGECLIENT_AVAILABLE and str(save_path).startswith(MULTISTORAGECLIENT_PROTOCOL):
-            save_path = str(save_path)
-        else:
+        if not is_multistorageclient_url(save_path):
             save_path = Path(save_path).expanduser().resolve()
         app_state = AppState()
         if app_state.model_parallel_size is not None:
@@ -477,15 +478,13 @@ class ModelPT(LightningModule, Model):
         Returns:
             An instance of type cls or its underlying config (if return_config is set).
         """
-
         if save_restore_connector is None:
             save_restore_connector = SaveRestoreConnector()
 
-        is_multistorageclient_url = MULTISTORAGECLIENT_AVAILABLE and str(restore_path).startswith(
-            MULTISTORAGECLIENT_PROTOCOL
-        )
-        if is_multistorageclient_url:
-            restore_path = ModelPT.derive_restore_path_with_multistorageclient_url(str(restore_path))
+        if is_multistorageclient_url(restore_path):
+            msc = import_multistorageclient()
+            if not msc.os.path.exists(restore_path):
+                raise FileNotFoundError(f"Can't find {restore_path}")
         else:
             if save_restore_connector.model_extracted_dir is None:
                 restore_path = os.path.abspath(os.path.expanduser(restore_path))
@@ -511,14 +510,8 @@ class ModelPT(LightningModule, Model):
         )
         if isinstance(instance, ModelPT):
             instance._save_restore_connector = save_restore_connector
-        return instance
 
-    @staticmethod
-    def derive_restore_path_with_multistorageclient_url(multistorageclient_url: str) -> str:
-        file_exists = multistorageclient.os.path.exists(multistorageclient_url)
-        if not file_exists:
-            raise FileNotFoundError(f"Can't find {multistorageclient_url}")
-        return multistorageclient_url
+        return instance
 
     @classmethod
     def load_from_checkpoint(
@@ -534,6 +527,9 @@ class ModelPT(LightningModule, Model):
         Loads ModelPT from checkpoint, with some maintenance of restoration.
         For documentation, please refer to LightningModule.load_from_checkpoint() documentation.
         """
+        # Notify OneLogger of checkpoint loading start for telemetry tracking
+        CallbackGroup.get_instance().on_load_checkpoint_start()
+
         checkpoint = None
         try:
             cls._set_model_restore_state(is_being_restored=True)
@@ -549,6 +545,10 @@ class ModelPT(LightningModule, Model):
 
         finally:
             cls._set_model_restore_state(is_being_restored=False)
+
+        # Notify OneLogger of checkpoint loading completion for telemetry tracking
+        CallbackGroup.get_instance().on_load_checkpoint_end()
+
         return checkpoint
 
     @abstractmethod
@@ -745,7 +745,8 @@ class ModelPT(LightningModule, Model):
 
         if optimizer_cls is None:
             # Try to get optimizer name for dynamic resolution, defaulting to Adam
-            optimizer_name = optim_config.get('name', 'adam')
+            # Use or instead of default as None will also results in default value not used.
+            optimizer_name = optim_config.get('name') or 'adam'
         else:
             if inspect.isclass(optimizer_cls):
                 optimizer_name = optimizer_cls.__name__.lower()
@@ -903,7 +904,14 @@ class ModelPT(LightningModule, Model):
         self._optimizer_param_groups = param_groups
 
     def configure_optimizers(self):
+        """
+        Configure the optimizer and scheduler.
+        """
+        # Track optimizer init start
+        CallbackGroup.get_instance().on_optimizer_init_start()
         self.setup_optimization()
+
+        CallbackGroup.get_instance().on_optimizer_init_end()
 
         if self._scheduler is None:
             return self._optimizer
@@ -968,11 +976,20 @@ class ModelPT(LightningModule, Model):
             if no_test_dataloader and test_deferred_setup:
                 self.setup_multiple_test_data(test_data_config=self._cfg.test_ds)
 
+        if stage == 'fit':
+            CallbackGroup.get_instance().update_config(nemo_version='v1', trainer=self._trainer)
+
     def train_dataloader(self):
+        """
+        Get the training dataloader.
+        """
         if self._train_dl is not None:
             return self._train_dl
 
     def val_dataloader(self):
+        """
+        Get the validation dataloader.
+        """
         if self._validation_dl is None:
             # None dataloader no longer supported in PTL2.0
             self._validation_dl = []
@@ -980,6 +997,9 @@ class ModelPT(LightningModule, Model):
         return self._validation_dl
 
     def test_dataloader(self):
+        """
+        Get the test dataloader.
+        """
         if self._test_dl is None:
             # None dataloader no longer supported in PTL2.0
             self._test_dl = []
@@ -1248,7 +1268,9 @@ class ModelPT(LightningModule, Model):
         return self._test_names[dataloader_idx]
 
     def load_part_of_state_dict(self, state_dict, include, exclude, load_from_string=None):
-
+        """
+        Load a part of the state dict into the model.
+        """
         excluded_param_names = []
         # create dict
         dict_to_load = {}
@@ -1345,6 +1367,8 @@ class ModelPT(LightningModule, Model):
                 f"Cannot pass more than one model initialization arguments to config!\n"
                 f"Found : {[args[idx] for idx, arg_present in enumerate(arg_matches) if arg_present]}"
             )
+
+        CallbackGroup.get_instance().on_load_checkpoint_start()
 
         if 'init_from_nemo_model' in cfg and cfg.init_from_nemo_model is not None:
             with open_dict(cfg):
@@ -1461,6 +1485,9 @@ class ModelPT(LightningModule, Model):
                         del ckpt
                 else:
                     raise TypeError("Invalid type: init_from_ptl_ckpt is not a string or a dict!")
+
+        # Track load checkpoint end
+        CallbackGroup.get_instance().on_load_checkpoint_end()
 
     def teardown(self, stage: str):
         """
@@ -1677,6 +1704,9 @@ class ModelPT(LightningModule, Model):
 
     @LightningModule.trainer.getter
     def trainer(self):
+        """
+        Get the trainer object.
+        """
         return self._trainer
 
     @cfg.setter
@@ -1796,6 +1826,9 @@ class ModelPT(LightningModule, Model):
 
     @classmethod
     def update_save_restore_connector(cls, save_restore_connector):
+        """
+        Update the save_restore_connector for the model.
+        """
         if hasattr(cls, '_save_restore_connector'):
             cls._save_restore_connector = save_restore_connector
         else:

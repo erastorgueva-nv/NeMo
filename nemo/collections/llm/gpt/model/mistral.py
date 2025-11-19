@@ -102,6 +102,26 @@ class MistralNeMoConfig123B(MistralConfig7B):
     params_dtype: torch.dtype = torch.bfloat16
 
 
+@dataclass
+class MistralSmall3Config24B(MistralConfig7B):
+    """
+    https://mistral.ai/news/mistral-small-3/
+    """
+
+    num_layers: int = 40
+    hidden_size: int = 5120
+    ffn_hidden_size: int = 32768
+    num_attention_heads: int = 32
+    kv_channels: int = 128
+    seq_length: int = 32768
+
+    window_size: List[int] = None
+    cp_comm_type: str = None
+    rotary_percent: float = 1.0
+    rotary_base: float = 100000000.0
+    params_dtype: torch.dtype = torch.bfloat16
+
+
 class MistralModel(GPTModel):
     """ """
 
@@ -298,7 +318,7 @@ class HFMistralExporter(io.ModelConnector[MistralModel, "MistralForCausalLM"]):
     @property
     def config(self) -> "MistralConfig":
         """ """
-        source: MistralConfig7B = io.load_context(str(self)).model.config
+        source: MistralConfig7B = io.load_context(str(self), subpath="model.config")
 
         from transformers import MistralConfig as HfMistralConfig
 

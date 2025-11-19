@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import re
 import warnings
 from functools import partial
 from itertools import repeat
@@ -29,6 +30,7 @@ from lhotse import CutSet, Features, Recording, MonoCut, SupervisionSegment
 from lhotse.array import Array, TemporalArray
 from lhotse.cut import Cut, MixedCut, PaddingCut
 from lhotse.utils import fastcopy
+from lhotse.serialization import load_yaml
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from nemo.collections.common.data.lhotse.nemo_adapters import (
@@ -43,6 +45,7 @@ from nemo.collections.common.data.lhotse.text_adapters import (
     LhotseTextPairAdapter,
     NeMoMultimodalConversation,
     NeMoMultimodalConversationJsonlAdapter,
+    NeMoMultimodalConversationShareGPTJsonlAdapter,
     NeMoSFTJsonlAdapter,
     TextTurn,
 )
@@ -203,6 +206,7 @@ def read_dataset_config(config) -> tuple[CutSet, bool]:
         "metadata_only": config.get("metadata_only", False),
         "force_finite": config.get("force_finite", False),
         "max_open_streams": config.get("max_open_streams", None),
+        "audio_locator_tag": config.get("audio_locator_tag", None),
         "token_equivalent_duration": config.get("token_equivalent_duration", None),
         "skip_missing_manifest_entries": config.get("skip_missing_manifest_entries", False),
         "force_map_dataset": config.get("force_map_dataset", False),
@@ -250,7 +254,24 @@ def read_txt_paths(config: DictConfig) -> tuple[CutSet, bool]:
         )
     )
     if not config.get("force_finite", False):
-        cuts = cuts.repeat()
+        cuts = cuts.repeat(preserve_id=True)
+    return cuts, True
+
+
+@data_type_parser("txt_jsonl")
+def read_txt_jsonl_paths(config: DictConfig) -> tuple[CutSet, bool]:
+    """Read paths to text files in JSONL format and create a CutSet."""
+    cuts = CutSet(
+        LhotseTextJsonlAdapter(
+            paths=config.paths,
+            language=config.language,
+            text_field=config.text_field,
+            shuffle_shards=config.shuffle,
+            shard_seed=config.shard_seed,
+        )
+    )
+    if not config.get("force_finite", False):
+        cuts = cuts.repeat(preserve_id=True)
     return cuts, True
 
 
@@ -287,7 +308,7 @@ def read_txt_pair_paths(config: DictConfig) -> tuple[CutSet, bool]:
         )
     )
     if not config.get("force_finite", False):
-        cuts = cuts.repeat()
+        cuts = cuts.repeat(preserve_id=True)
     return cuts, True
 
 
@@ -303,7 +324,7 @@ def read_nemo_sft_jsonl(config: DictConfig) -> tuple[CutSet, bool]:
         )
     )
     if not config.get("force_finite", False):
-        cuts = cuts.repeat()
+        cuts = cuts.repeat(preserve_id=True)
     return cuts, True
 
 
@@ -318,11 +339,40 @@ def read_multimodal_conversation_jsonl(config: DictConfig) -> tuple[CutSet, bool
             token_equivalent_duration=config.get("token_equivalent_duration"),
             shuffle_shards=config.shuffle,
             shard_seed=config.shard_seed,
+            system_prompt=config.get("tags", {}).get("system_prompt"),
+            slice_length=config.get("slice_length"),
         )
     )
     if not config.get("force_finite", False):
-        cuts = cuts.repeat()
+        cuts = cuts.repeat(preserve_id=True)
     return cuts, True
+
+
+@data_type_parser(["share_gpt"])
+def read_share_gpt_as_conversation(config) -> tuple[CutSet, bool]:
+    """Read paths to ShareGPT JSONL files and create a CutSet of NeMoMultimodalConversation."""
+    cuts = CutSet(
+        NeMoMultimodalConversationShareGPTJsonlAdapter(
+            manifest_filepath=config.manifest_filepath,
+            tarred_audio_filepaths=config.get("tarred_audio_filepaths"),
+            audio_locator_tag=config.audio_locator_tag,
+            audio_placeholders=config.audio_placeholders,
+            token_equivalent_duration=config.get("token_equivalent_duration"),
+            shuffle_shards=config.shuffle,
+            shard_seed=config.shard_seed,
+            slice_length=config.get("slice_length"),
+        )
+    )
+    if not config.get("force_finite", False):
+        cuts = cuts.repeat(preserve_id=True)
+    return cuts, True
+
+
+def _resolve_shar_inputs(path: Union[str, Path], only_metadata: bool) -> dict:
+    if only_metadata:
+        return dict(fields={"cuts": sorted(Path(path).glob("cuts.*"))})
+    else:
+        return dict(in_dir=path)
 
 
 def attach_tags(cut, tags: dict):
@@ -340,10 +390,13 @@ def parse_and_combine_datasets(
     cuts = []
     weights = []
     tarred_status = []
+
+    if isinstance(config_list, (str, Path)):
+        # Resolve local filepath /path/to/input_cfg.yaml or remote url s3://bucket/path/to/input_cfg.yaml into config contents if needed.
+        config_list = OmegaConf.create(load_yaml(config_list))
     assert len(config_list) > 0, "Empty group in dataset config list."
 
     for item in config_list:
-
         # Check if we have any attributes that are propagated downwards to each item in the group.
         # If a key already exists in the item, it takes precedence (we will not overwrite);
         # otherwise we will assign it.
@@ -426,7 +479,7 @@ def read_lhotse_manifest(config) -> tuple[CutSet, bool]:
                 slice_length=config.get("slice_length", None),
             )
             if not metadata_only and not force_finite:
-                cuts = cuts.repeat()
+                cuts = cuts.repeat(preserve_id=True)
         elif isinstance(config.shar_path, Sequence):
             # Multiple datasets in Lhotse Shar format: we will dynamically multiplex them
             # with probability approximately proportional to their size
@@ -486,7 +539,7 @@ def read_lhotse_manifest(config) -> tuple[CutSet, bool]:
                 slice_length=config.get("slice_length", None),
             )
             if not metadata_only and not force_finite:
-                cuts = cuts.repeat()
+                cuts = cuts.repeat(preserve_id=True)
         else:
             raise RuntimeError(
                 f"Unexpected value for key 'shar_path'. We support string, list of strings, "
@@ -500,24 +553,136 @@ def read_lhotse_manifest(config) -> tuple[CutSet, bool]:
     return cuts, is_tarred
 
 
+def cut_to_conversation(
+    cut: Cut, audio_locator_tag: str, token_equivalent_duration: float
+) -> NeMoMultimodalConversation:
+    """
+    Converts a lhotse Cut into a two-turn NeMoMultimodalConversation, where the user turn contains cut's audio,
+    and assistant turn contains text response from ``cut.supervisions[0].text``.
+
+    If ``cut`` has a custom field ``context``, it's pre-pended as an extra user text turn before the user's audio turn.
+    """
+    if isinstance(cut, NeMoMultimodalConversation):
+        return cut
+    turns = [
+        AudioTurn(cut=cut, role="user", audio_locator_tag=audio_locator_tag, text=cut.supervisions[0].text),
+        TextTurn(value=cut.supervisions[0].text, role="assistant"),
+    ]
+    if hasattr(cut, "context"):
+        turns = [TextTurn(value=cut.context, role="user")] + turns
+    if hasattr(cut, "system_prompt"):
+        turns = [TextTurn(value=cut.system_prompt, role="system")] + turns
+    return NeMoMultimodalConversation(
+        id=cut.id,
+        turns=turns,
+        token_equivalent_duration=token_equivalent_duration,
+        custom=cut.custom,
+    )
+
+
 @data_type_parser(["lhotse_as_conversation"])
 def read_lhotse_as_conversation(config) -> tuple[CutSet, bool]:
-    def cut_to_conversation(cut: Cut) -> NeMoMultimodalConversation:
-        turns = [
-            AudioTurn(cut=cut, role="user", audio_locator_tag=config.audio_locator_tag),
-            TextTurn(value=cut.supervisions[0].text, role="assistant"),
-        ]
-        if hasattr(cut, "context"):
-            turns = [TextTurn(value=cut.context, role="user")] + turns
-        return NeMoMultimodalConversation(
-            id=cut.id,
-            turns=turns,
-            token_equivalent_duration=config.token_equivalent_duration,
-            custom=cut.custom,
-        )
-
     cuts, is_tarred = read_cutset_from_config(config)
-    cuts = cuts.map(cut_to_conversation)
+    # Attach extra tags to every utterance dynamically, if provided.
+    # We need to attach them before cuts are converted to conversations.
+    if (extra_tags := config.get("tags")) is not None:
+        cuts = cuts.map(partial(attach_tags, tags=extra_tags), apply_fn=None)
+    cuts = cuts.map(
+        partial(
+            cut_to_conversation,
+            audio_locator_tag=config.audio_locator_tag,
+            token_equivalent_duration=config.token_equivalent_duration,
+        )
+    )
+    return cuts, is_tarred
+
+
+def _strip_timestamps(
+    text: str, _TIMESTAMP_PATTERN=re.compile(r"<\|\d+\|>"), _SPACE_PATTERN=re.compile(r"\s+")
+) -> str:
+    """
+    Strips timestamp tokens from text, e.g. turns:
+      '<|0|> Hey <|3|> <|3|> how <|5|> <|7|> are <|8|> <|8|> <|10|> you? <|12|>'
+      into:
+      'Hey how are you?'
+    """
+    # Regexp pattern args are cached compiled patterns (micro-optimization).
+    text = _TIMESTAMP_PATTERN.sub("", text)  # strip timestamp tokens if present
+    return _SPACE_PATTERN.sub(" ", text).strip()  # strip multi-whitespaces
+
+
+class FailedConversion:
+    pass
+
+
+def s2s_cut_to_conversation(
+    cut: Cut,
+    audio_locator_tag: str,
+    token_equivalent_duration: float,
+    input_roles: Sequence[str] = ("user", "User"),
+    output_roles: Sequence[str] = ("assistant", "Assistant", "agent", "Agent"),
+    strip_timestamp_tokens: bool = True,
+) -> NeMoMultimodalConversation:
+    """
+    Converts a lhotse Cut representing multi-turn speech-to-speech conversation (with multiple supervision segments)
+    into a multi-turn NeMoMultimodalConversation, where the user has AudioTurns and assistant responds in TextTurns.
+
+    Args:
+        cut: lhotse Cut to convert.
+        audio_locator_tag: special token indicating audio will be inserted in this location in the token sequence.
+        token_equivalent_duration: how much speech duration is counted as one token.
+        input_roles: when supervision.speaker is set to one of these values, we consider it user's turn.
+        output_roles: when supervision.speaker is set to one of these values, we consider it assistant's turn.
+        strip_timestamp_tokens: strips tokens like <|0|>, <|1|>, etc indicating timestamps from the text.
+    """
+    turn_cuts = cut.trim_to_supervisions(keep_overlapping=False)
+    turns = []
+    idx = 0
+    for per_turn_cut in turn_cuts:
+        assert (
+            len(per_turn_cut.supervisions) >= 1
+        ), f"Expected at least one supervision per turn, got none in cut {cut.id}"
+        # If len(per_turn_cut.supervisions) > 1, only the first turn is considered for cut creation
+        # We assume that len(per_turn_cut.supervisions) >= 1 happens because one of the turns is completely contained within
+        # another turn
+        turn_speaker = per_turn_cut.supervisions[0].speaker
+        turn_text = per_turn_cut.supervisions[0].text
+        if strip_timestamp_tokens:
+            turn_text = _strip_timestamps(turn_text)
+        if len(per_turn_cut.supervisions) > 1:
+            assert per_turn_cut.supervisions[1].text == turn_cuts[idx - 1].supervisions[0].text
+        if turn_speaker in input_roles:
+            turns.append(AudioTurn(cut=per_turn_cut, role="user", audio_locator_tag=audio_locator_tag, text=turn_text))
+        elif turn_speaker in output_roles:
+            turns.append(TextTurn(value=turn_text, role="assistant"))
+        else:
+            logging.warning(f"Speaker '{turn_speaker}' not found in user or agent roles for cut {cut.id}")
+            return FailedConversion()
+        idx += 1
+    if hasattr(cut, "system_prompt") and all(t.role != "system" for t in turns):
+        turns = [TextTurn(value=cut.system_prompt, role="system")] + turns
+
+    return NeMoMultimodalConversation(
+        id=cut.id,
+        turns=turns,
+        token_equivalent_duration=token_equivalent_duration,
+        custom=cut.custom,
+    )
+
+
+@data_type_parser(["s2s_as_conversation"])
+def read_s2s_as_conversation(config) -> tuple[CutSet, bool]:
+    cuts, is_tarred = read_cutset_from_config(config)
+    cuts = cuts.map(
+        partial(
+            s2s_cut_to_conversation,
+            audio_locator_tag=config.audio_locator_tag,
+            token_equivalent_duration=config.token_equivalent_duration,
+            input_roles=config.get("input_roles", ["user", "User"]),
+            output_roles=config.get("output_roles", ["assistant", "Assistant", "agent", "Agent"]),
+            strip_timestamp_tokens=config.get("strip_timestamp_tokens", True),
+        )
+    ).filter(lambda ex: not isinstance(ex, FailedConversion))
     return cuts, is_tarred
 
 
@@ -1036,7 +1201,7 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
     is_tarred = config.get("tarred_audio_filepaths") is not None
     if isinstance(config.manifest_filepath, (str, Path)):
         logging.info(
-            f"""Initializing Lhotse CutSet from a single NeMo manifest 
+            f"""Initializing Lhotse CutSet from a single NeMo manifest
             (is_tarred={is_tarred}): '{config.manifest_filepath}'"""
         )
         if is_tarred and not metadata_only:
@@ -1050,7 +1215,7 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
                 )
             )
             if not force_finite:
-                cuts = cuts.repeat()
+                cuts = cuts.repeat(preserve_id=True)
         else:
             cuts = CutSet(LazyNeMoIterator(config.manifest_filepath, **notar_kwargs, **common_kwargs))
     else:
@@ -1068,7 +1233,7 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
         #   i.e., NeMo concatenated dataset
         #   Assume it's [path1, path2, ...] (while tarred_audio_filepaths in the same format).
         logging.info(
-            f"""Initializing Lhotse CutSet from multiple NeMo manifest 
+            f"""Initializing Lhotse CutSet from multiple NeMo manifest
             (is_tarred={is_tarred}) sources with a weighted multiplexer.
             We found the following sources and weights: """
         )
@@ -1132,6 +1297,28 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
     return cuts, is_tarred
 
 
+@data_type_parser("multi_speaker_simulator")
+def read_multi_speaker_simulator(config: DictConfig) -> tuple[CutSet, bool]:
+    # Import here to avoid circular dependency
+    from nemo.collections.asr.parts.utils.asr_multispeaker_utils import MultiSpeakerMixtureGenerator
+
+    multi_speaker_cuts = CutSet(
+        MultiSpeakerMixtureGenerator(
+            manifest_filepath=config.manifest_filepath,
+            simulator_type=config.simulator_type,
+            sample_rate=config.get("sample_rate", 16000),
+            min_delay=config.get("min_delay", 0.5),
+            min_duration=config.get("min_duration", 0.1),
+            max_duration=config.get("max_duration", 60),
+            num_speakers=config.get("num_speakers", 2),
+            global_rank=config.get("global_rank", 0),
+            world_size=config.get("world_size", 1),
+        )
+    )
+    is_tarred = config.get("is_tarred", False)
+    return multi_speaker_cuts, is_tarred
+
+
 def mux(
     *cutsets: CutSet,
     weights: list[Union[int, float]],
@@ -1149,7 +1336,7 @@ def mux(
         cuts = CutSet.infinite_mux(*cutsets, weights=weights, seed=seed, max_open_streams=max_open_streams)
     else:
         if not force_finite:
-            cutsets = [cs.repeat() for cs in cutsets]
+            cutsets = [cs.repeat(preserve_id=True) for cs in cutsets]
         if len(cutsets) == 1:
             # CutSet.mux must take more than one CutSet.
             cuts = cutsets[0]

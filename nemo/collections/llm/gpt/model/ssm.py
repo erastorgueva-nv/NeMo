@@ -212,7 +212,9 @@ class SSMConfig(TransformerConfig, io.IOMixin):
         default_factory=lambda: default_mamba_stack_spec
     )
 
-    def configure_model(self, tokenizer, pre_process=None, post_process=None) -> "MCoreMambaModel":
+    def configure_model(
+        self, tokenizer, pre_process=None, post_process=None, vp_stage: Optional[int] = None
+    ) -> "MCoreMambaModel":
         """
         Configures the model for training or inference.
         """
@@ -220,6 +222,10 @@ class SSMConfig(TransformerConfig, io.IOMixin):
         if not isinstance(mamba_stack_spec, ModuleSpec):
             mamba_stack_spec = mamba_stack_spec()
 
+        assert getattr(self, "virtual_pipeline_model_parallel_size", None) is None and vp_stage is None, (
+            "Virtual pipeline model parallelism is temporarily unsupported in SSM/Mamaba "
+            "models due to upstream MCore MambaModel API dependency"
+        )
         return MCoreMambaModel(
             self,
             mamba_stack_spec=mamba_stack_spec,
@@ -232,8 +238,8 @@ class SSMConfig(TransformerConfig, io.IOMixin):
             rotary_percent=self.rotary_percent,
             rotary_base=self.rotary_base,
             seq_len_interpolation_factor=self.seq_len_interpolation_factor,
-            pre_process=pre_process or parallel_state.is_pipeline_first_stage(ignore_virtual=False),
-            post_process=post_process or parallel_state.is_pipeline_last_stage(ignore_virtual=False),
+            pre_process=pre_process or parallel_state.is_pipeline_first_stage(),
+            post_process=post_process or parallel_state.is_pipeline_last_stage(),
         )
 
 
@@ -561,12 +567,18 @@ class HFNemotronHImporter(io.ModelConnector["AutoModelForCausalLM", MambaModel])
                 base //= 2
             return base
 
-        if "8B" in source._name_or_path:
+        if "4B" in source._name_or_path:
+            nemotron_h_config = NemotronHConfig4B()
+        elif "8B" in source._name_or_path:
             nemotron_h_config = NemotronHConfig8B()
         elif "47B" in source._name_or_path:
             nemotron_h_config = NemotronHConfig47B()
         elif "56B" in source._name_or_path:
             nemotron_h_config = NemotronHConfig56B()
+        elif "Nano-9B-v2" in source._name_or_path:
+            nemotron_h_config = NemotronNano9Bv2()
+        elif "Nano-12B-v2" in source._name_or_path:
+            nemotron_h_config = NemotronNano12Bv2()
         else:
             raise ValueError(f"Unsupported model size: {source._name_or_path}")
 
@@ -679,15 +691,24 @@ class HFNemotronHExporter(io.ModelConnector[MambaModel, "AutoModelForCausalLM"])
         source: SSMConfig = io.load_context(str(self), subpath="model.config")
 
         # TODO @ataghibakhsh: Change AutoConfig to NemotronHConfig once merged to HF
-        if type(source) == NemotronHConfig8B:
-            hf_config = AutoConfig.from_pretrained("nvidia/Nemotron-H-8B-Base-8K", trust_remote_code=True)
+
+        # Check for local model path from environment variable first
+        local_model_path = os.environ.get('HF_LOCAL_MODEL_PATH')
+        if type(source) == NemotronHConfig4B:
+            model_path = local_model_path if local_model_path else "nvidia/Nemotron-H-4B-Base-8K"
+        elif type(source) == NemotronHConfig8B:
+            model_path = local_model_path if local_model_path else "nvidia/Nemotron-H-8B-Base-8K"
         elif type(source) == NemotronHConfig47B:
-            hf_config = AutoConfig.from_pretrained("nvidia/Nemotron-H-47B-Base-8K", trust_remote_code=True)
+            model_path = local_model_path if local_model_path else "nvidia/Nemotron-H-47B-Base-8K"
         elif type(source) == NemotronHConfig56B:
-            hf_config = AutoConfig.from_pretrained("nvidia/Nemotron-H-56B-Base-8K", trust_remote_code=True)
+            model_path = local_model_path if local_model_path else "nvidia/Nemotron-H-56B-Base-8K"
+        elif type(source) == NemotronNano9Bv2:
+            model_path = local_model_path if local_model_path else "nvidia/NVIDIA-Nemotron-Nano-9B-v2-Base"
+        elif type(source) == NemotronNano12Bv2:
+            model_path = local_model_path if local_model_path else "nvidia/NVIDIA-Nemotron-Nano-12B-v2-Base"
         else:
             raise ValueError(f"Unsupported model size: {source}")
-
+        hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         return hf_config
 
 
@@ -967,6 +988,21 @@ class NemotronHConfigBase(SSMConfig):
 
 
 @dataclass
+class NemotronHConfig4B(NemotronHConfigBase):
+    """NemotronHConfig4B"""
+
+    hybrid_override_pattern: str = "M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-"
+    num_layers: int = 52
+    hidden_size: int = 3072
+    mamba_num_heads: int = 112
+    kv_channels: int = 128
+    mamba_state_dim: int = 128
+    ffn_hidden_size: int = 12288
+    num_attention_heads: int = 32
+    use_mamba_mem_eff_path: bool = False
+
+
+@dataclass
 class NemotronHConfig8B(NemotronHConfigBase):
     """NemotronHConfig8B"""
 
@@ -1007,6 +1043,36 @@ class NemotronHConfig56B(NemotronHConfigBase):
     num_attention_heads: int = 64
 
 
+@dataclass
+class NemotronNano9Bv2(NemotronHConfigBase):
+    """NemotronNano9Bv2"""
+
+    hybrid_override_pattern: str = "M-M-M-MM-M-M-M*-M-M-M*-M-M-M-M*-M-M-M-M*-M-MM-M-M-M-M-M-"
+    num_layers: int = 56
+    hidden_size: int = 4480
+    mamba_num_heads: int = 128
+    kv_channels: int = 128
+    mamba_state_dim: int = 128
+    ffn_hidden_size: int = 15680
+    num_attention_heads: int = 40
+    mamba_head_dim: int = 80
+
+
+@dataclass
+class NemotronNano12Bv2(NemotronHConfigBase):
+    """NemotronNano12Bv2"""
+
+    hybrid_override_pattern: str = "M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M-"
+    num_layers: int = 62
+    hidden_size: int = 5120
+    mamba_num_heads: int = 128
+    kv_channels: int = 128
+    mamba_state_dim: int = 128
+    ffn_hidden_size: int = 20480
+    num_attention_heads: int = 40
+    mamba_head_dim: int = 80
+
+
 __all__ = [
     "SSMConfig",
     "BaseMambaConfig130M",
@@ -1017,7 +1083,10 @@ __all__ = [
     "NVIDIAMambaConfig8B",
     "NVIDIAMambaHybridConfig8B",
     "NemotronHConfigBase",
+    "NemotronHConfig4B",
     "NemotronHConfig8B",
     "NemotronHConfig47B",
     "NemotronHConfig56B",
+    "NemotronNano9Bv2",
+    "NemotronNano12Bv2",
 ]

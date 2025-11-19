@@ -31,6 +31,7 @@ from omegaconf.omegaconf import OmegaConf, open_dict
 from nemo.collections.asr.models import ASRModel, SpeechEncDecSelfSupervisedModel
 from nemo.collections.common.data.utils import move_data_to_device
 from nemo.collections.common.metrics import MetricStringToTorchMetric, TextMetricsSet
+from nemo.collections.common.parts.nlp_overrides import NLPSaveRestoreConnector
 from nemo.collections.multimodal.speech_llm.data.build_dataset import (
     build_speechllm_dataloader,
     build_speechllm_dataset,
@@ -48,8 +49,6 @@ from nemo.collections.nlp.modules.common.megatron.utils import (
     build_position_ids,
     get_iterator_k_split,
 )
-from nemo.collections.nlp.parts.nlp_overrides import NLPSaveRestoreConnector
-from nemo.collections.nlp.parts.utils_funcs import get_last_rank
 from nemo.core.classes.mixins import adapter_mixins
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, MaskType, NeuralType
 from nemo.utils import AppState, logging, model_utils
@@ -87,6 +86,10 @@ __all__ = ["ModularizedAudioT5Model", "DecoderTextPromptModularizedAudioT5Model"
 
 
 default_inference_config = {'tokens_to_generate': 30}
+
+
+def get_last_rank():
+    return torch.distributed.get_world_size() - 1
 
 
 class ModularizedAudioT5Model(MegatronT5LoraModel):
@@ -800,9 +803,7 @@ class ModularizedAudioT5Model(MegatronT5LoraModel):
         if parallel_state.get_pipeline_model_parallel_world_size() > 1:
             if isinstance(self.frozen_model, list):
                 for i, module in enumerate(self.frozen_model):
-                    parallel_state.set_virtual_pipeline_model_parallel_rank(i)
                     module.sync_initial_word_embeddings()
-                parallel_state.set_virtual_pipeline_model_parallel_rank(0)
             else:
                 self.frozen_model.sync_initial_word_embeddings()
 
@@ -1059,7 +1060,10 @@ class ModularizedAudioT5Model(MegatronT5LoraModel):
                 continue
             # Expand on_validation_epoch_end from parent class MegatronGPTModel as on_validation_epoch_end doesnt take outputs arg
             loss_vals = [x['loss'] for x in output]
-            if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
+            assert (
+                self.cfg.get("virtual_pipeline_model_parallel_size", None) is None
+            ), "Virtual pipeline model parallel size is no longer supported for nemo 1.0"
+            if parallel_state.is_pipeline_last_stage():
                 # only the last pipeline parallel stages return loss with their batch size
                 if self.cfg.data.get('validation_drop_last', True):
                     loss = torch.stack(loss_vals).mean()

@@ -21,18 +21,25 @@ Canary
 ~~~~~~
 
 Canary is the latest family of models from NVIDIA NeMo. Canary models are encoder-decoder models with a :ref:`FastConformer Encoder <Fast-Conformer>` and Transformer Decoder :cite:`asr-models-vaswani2017aayn`.
-They are multi-lingual, multi-task model, supporting automatic speech-to-text recognition (ASR) in 4 languages (English, German, French, Spanish) as well as translation between English and the 3 other supported languages.
+They are multi-lingual, multi-task model, supporting automatic speech-to-text recognition (ASR) in 25 EU languages as well as translation between English and the 24 other supported languages.
 
 Models:
 
+* `Canary-1B V2 <https://huggingface.co/nvidia/canary-1b-v2>`__ model card
 * `Canary-1B Flash <https://huggingface.co/nvidia/canary-1b-flash>`__ model card
 * `Canary-180M Flash <https://huggingface.co/nvidia/canary-180m-flash>`__ model card
 * `Canary-1B <https://huggingface.co/nvidia/canary-1b>`__ model card
 
 Spaces:
 
+* `Canary-1B V2 <https://huggingface.co/spaces/nvidia/canary-1b-v2>`__
 * `Canary-1B Flash <https://huggingface.co/spaces/nvidia/canary-1b-flash>`__
 * `Canary-1B <https://huggingface.co/spaces/nvidia/canary-1b>`__
+
+Canary models support the following decoding methods for chunked and streaming inference:
+
+* :ref:`Chunked Inference <canary_chunked_inference>`
+* :ref:`Streaming Inference <canary_streaming_inference>`
 
 
 Parakeet
@@ -284,6 +291,123 @@ To export as CTC (single encoder+decoder graph), `model.set_export_config({'deco
 Or, if ``<NeMo_git_root>/scripts/export.py`` is being used:
 `python export.py hybrid_transducer.nemo hybrid_transducer.onnx --export-config decoder_type=ctc`
 
+.. _Hybrid-Transducer-CTC-Prompt_model:
+
+Hybrid-Transducer-CTC with Prompt Conditioning
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The Hybrid RNNT-CTC model with prompt conditioning (``EncDecHybridRNNTCTCBPEModelWithPrompt``) extends the base Hybrid-Transducer-CTC model
+to support multi-language and multi-domain ASR through prompt conditioning. This model leverages prompts to guide the transcription process,
+enabling language-specific or domain-specific transcription from a single unified model.
+
+Key features of this model include:
+
+* **Prompt Feature**: Uses learnable prompt embeddings that are concatenated with acoustic features to guide transcription
+* **Multi-language Support**: Can transcribe audio in multiple languages based on language prompts
+* **Offline and Buffered Streaming Inference Support**: Can be used in offline and buffered streaming mode 
+
+The model can be instantiated using the :class:`~nemo.collections.asr.models.EncDecHybridRNNTCTCBPEModelWithPrompt` class.
+
+Architecture Overview
+^^^^^^^^^^^^^^^^^^^^^
+
+The model architecture builds upon the standard Hybrid-Transducer-CTC model by incorporating prompt information directly into the decoder through a concatenation-based approach. This design enables scalable multilingual ASR/AST capabilities.
+
+**Core Components:**
+
+1. **Prompt Supervision Source**: Prompt label information extracted from training and inference manifests or provided as an input
+2. **Prompt Vector Representation**: One-hot binary vectors where one element is 1 (prompt) and all others are 0
+3. **Concatenation-Based Prompt Encoding**: Direct combination of prompt vectors with acoustic features
+
+**Detailed Architecture:**
+
+**Prompt Vector Design:**
+- **Dimensionality**: Default to 128-dimensional vectors for scalability (supports current target language and future prompts) without the need to change the architecture
+- **Representation**: Binary one-hot encoding where each position represents a prompt ID
+- **Expansion**: Prompt vectors are expanded at each time step to match acoustic feature temporal dimensions
+
+**Concatenation Method Implementation:**
+The model adopts a concatenation approach where language vectors and ASR acoustic features are directly combined:
+
+1. **Feature Stacking**: Language vectors and encoded acoustic features are stacked along the feature dimension
+2. **Projection**: The concatenated representation passes through a projection network (``prompt_kernel``)
+
+
+**Inference Capabilities:**
+
+The model supports both offline and buffered streaming inference modes:
+
+- **Offline Mode**: Full context processing for maximum accuracy
+- **Buffered Streaming**: Real-time multilingual speech-to-text processing with language-aware decoding
+
+
+Configuration
+^^^^^^^^^^^^^
+
+The model supports several prompt-specific configuration parameters:
+
+* ``initialize_prompt_feature``: Boolean flag to enable prompt conditioning
+* ``num_prompts``: Number of supported prompt categories (default: 128)
+* ``prompt_dictionary``: Mapping from language/domain identifiers to prompt indices
+* ``prompt_field``: Field name used for prompt extraction from manifest files
+
+Example config files for this model can be found at:
+``<NeMo_git_root>/examples/asr/conf/fastconformer/hybrid_transducer_ctc/fastconformer_hybrid_transducer_ctc_bpe_prompt.yaml``
+
+Training
+^^^^^^^^
+
+To train the Hybrid-Transducer-CTC model with prompt feature, use the training script:
+
+``<NeMo_git_root>/examples/asr/asr_hybrid_transducer_ctc/speech_to_text_hybrid_rnnt_ctc_bpe_prompt.py``
+
+Example training command:
+
+.. code-block:: bash
+
+    python <NeMo_git_root>/examples/asr/asr_hybrid_transducer_ctc/speech_to_text_hybrid_rnnt_ctc_bpe_prompt.py \
+        --config-path=<NeMo_git_root>/examples/asr/conf/fastconformer/hybrid_transducer_ctc/ \
+        --config-name=fastconformer_hybrid_transducer_ctc_bpe_prompt.yaml \
+        model.train_ds.manifest_filepath=<path_to_train_manifest> \
+        model.validation_ds.manifest_filepath=<path_to_val_manifest> \
+        model.tokenizer.dir=<path_to_tokenizer> \
+        model.test_ds.manifest_filepath=<path_to_test_manifest> 
+
+Usage Examples
+^^^^^^^^^^^^^^
+
+**Basic Transcription with Language Prompts:**
+
+.. code-block:: python
+
+    # Load the model
+    asr_model = nemo_asr.models.EncDecHybridRNNTCTCBPEModelWithPrompt.restore_from("path/to/model.nemo")
+    
+    # Transcribe with specific target language
+    transcriptions = asr_model.transcribe(
+        paths2audio_files=["audio1.wav", "audio2.wav"],
+        target_lang="en-US",  # Specify target language
+
+    )
+
+
+Training Data Requirements
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The model requires training data with prompt annotations. The recommended dataset format uses Lhotse with the 
+:class:`~nemo.collections.asr.data.audio_to_text_lhotse_prompt.LhotseSpeechToTextBpeDatasetWithPrompt` dataset class.
+
+Manifest files should include prompt information:
+
+.. code-block:: json
+
+    {
+        "audio_filepath": "path/to/audio.wav",
+        "text": "transcription text",
+        "duration": 10.5,
+        "target_lang": "en-US"
+    }
+
 .. _Hybrid-ASR-TTS_model:
 
 Hybrid ASR-TTS Model
@@ -308,38 +432,6 @@ For the detailed information see:
 
 * :ref:`Text-only dataset <Hybrid-ASR-TTS_model__Text-Only-Data>` preparation
 * :ref:`Configs and training <Hybrid-ASR-TTS_model__Config>`
-
-
-.. _Confidence-Ensembles:
-
-Confidence-based Ensembles
---------------------------
-
-Confidence-based ensemble is a simple way to combine multiple models into a single system by only retaining the
-output of the most confident model. Below is a schematic illustration of how such ensembles work.
-
-.. image:: images/conf-ensembles-overview.png
-    :align: center
-    :alt: confidence-based ensembles
-    :scale: 50%
-
-For more details about this model, see the `paper <https://arxiv.org/abs/2306.15824>`_
-or read our `tutorial <https://colab.research.google.com/github/NVIDIA/NeMo/blob/stable/tutorials/asr/Confidence_Ensembles.ipynb>`_.
-
-NeMo support Confidence-based Ensembles through the
-:ref:`nemo.collections.asr.models.confidence_ensemble.ConfidenceEnsembleModel <confidence-ensembles-api>` class.
-
-A typical workflow to create and use the ensemble is like this
-
-1. Run `scripts/confidence_ensembles/build_ensemble.py <https://github.com/NVIDIA/NeMo/blob/main/scripts/confidence_ensembles/build_ensemble.py>`_
-   script to create ensemble from existing models. See the documentation inside the script for usage examples
-   and description of all the supported functionality.
-2. The script outputs a checkpoint that combines all the models in an ensemble. It can be directly used to transcribe
-   speech by calling ``.trascribe()`` method or using
-   `examples/asr/transcribe_speech.py <https://github.com/NVIDIA/NeMo/blob/main/examples/asr/transcribe_speech.py>`_.
-
-Note that the ensemble cannot be modified after construction (e.g. it does not support finetuning) and only
-transcribe functionality is supported (e.g., ``.forward()`` is not properly defined).
 
 .. _Jasper_model:
 

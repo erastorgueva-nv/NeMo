@@ -38,7 +38,7 @@ from transformers import DynamicCache
 
 from nemo.collections.audio.parts.utils.resampling import resample
 from nemo.collections.common.tokenizers import AutoTokenizer
-from nemo.collections.nlp.parts.nlp_overrides import NLPSaveRestoreConnector
+from nemo.collections.common.parts.nlp_overrides import NLPSaveRestoreConnector
 from nemo.collections.speechlm2.data.utils import get_pad_id
 from nemo.collections.speechlm2.models.duplex_s2s_model import tokens_to_str
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
@@ -132,7 +132,40 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
         if self.cfg.get("pretrained_s2s_model", None):
             logging.info(f"Loading pretrained s2s model from {self.cfg.pretrained_s2s_model}")
-            self.init_from_model_from_ckpt(self.cfg.pretrained_s2s_model)
+            if os.path.isdir(self.cfg.pretrained_s2s_model) and self.cfg.get("incremental_loading", False):
+                # Hugging Face format
+                from safetensors import safe_open
+                import gc
+                
+                # Load tensors incrementally to avoid OOM
+                model_state_dict = self.state_dict()
+                loaded_keys = []
+                missing_keys = []
+                
+                with safe_open(os.path.join(self.cfg.pretrained_s2s_model, "model.safetensors"), framework="pt", device="cpu") as f:
+                    available_keys = f.keys()
+                    for key in available_keys:
+                        if key in model_state_dict:
+                            # Load tensor and copy to model parameter
+                            tensor = f.get_tensor(key)
+                            model_state_dict[key].copy_(tensor)
+                            loaded_keys.append(key)
+                            del tensor  # Free memory immediately
+                        else:
+                            missing_keys.append(key)
+                        
+                        # Periodic garbage collection for very large models
+                        if len(loaded_keys) % 100 == 0:
+                            gc.collect()
+                
+                logging.info(f"Loaded {len(loaded_keys)} tensors from pretrained model")
+                if missing_keys:
+                    logging.warning(f"Keys in checkpoint but not in model: {len(missing_keys)} keys")
+                
+                del model_state_dict
+                gc.collect()
+            else:
+                self.init_from_model_from_ckpt(self.cfg.pretrained_s2s_model)
 
         self._use_fsdp = False
         self._use_tp = False

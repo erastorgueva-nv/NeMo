@@ -151,6 +151,7 @@ class Gemma2Config27B(Gemma2Config):
     num_layers: int = 46
     hidden_size: int = 4608
     num_attention_heads: int = 32
+    kv_channels: int = 128
     num_query_groups: int = 16
     ffn_hidden_size: int = 36864
     query_pre_attn_scalar: int = 144
@@ -357,7 +358,7 @@ class HFGemmaExporter(io.ModelConnector[Gemma2Model, "GemmaForCausalLM"]):
     def config(self) -> "Gemma2Config":
         """ """
 
-        source: Gemma2Config = io.load_context(str(self)).model.config
+        source: Gemma2Config = io.load_context(str(self), subpath="model.config")
 
         from transformers import Gemma2Config as HFGemmaConfig
 
@@ -597,25 +598,13 @@ class TERowParallelLinearLayerNorm(TERowParallelLinear):
         output_size: int,
         *,
         config: TransformerConfig,
-        init_method: Callable,
-        bias: bool,
-        input_is_parallel: bool,
-        skip_bias_add: bool,
-        is_expert: bool,
-        tp_comm_buffer_name: str = None,
-        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        **kwargs,
     ):
         super().__init__(
             input_size,
             output_size,
             config=config,
-            init_method=init_method,
-            bias=bias,
-            input_is_parallel=input_is_parallel,
-            skip_bias_add=skip_bias_add,
-            is_expert=is_expert,
-            tp_comm_buffer_name=tp_comm_buffer_name,
-            tp_group=tp_group,
+            **kwargs,
         )
         self.post_layernorm = TENorm(config, output_size)
 

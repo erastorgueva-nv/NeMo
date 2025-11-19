@@ -38,9 +38,12 @@ from nemo.utils.exp_manager import TimingCallback
 torch._dynamo.config.suppress_errors = True
 
 model_options: dict[str, Type[llm.SSMConfig]] = {
+    "4B": llm.NemotronHConfig4B,
     "8B": llm.NemotronHConfig8B,
     "47B": llm.NemotronHConfig47B,
     "56B": llm.NemotronHConfig56B,
+    "Nano9Bv2": llm.NemotronNano9Bv2,
+    "Nano12Bv2": llm.NemotronNano12Bv2,
 }
 
 

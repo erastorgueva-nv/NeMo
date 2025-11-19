@@ -19,18 +19,7 @@ import pytest
 import torch
 
 from nemo.collections.asr.parts.utils.rnnt_utils import BatchedAlignments, BatchedHyps, batched_hyps_to_hypotheses
-
-
-@contextmanager
-def avoid_sync_operations(device: torch.device):
-    try:
-        if device.type == "cuda":
-            torch.cuda.set_sync_debug_mode(2)  # fail if a blocking operation
-        yield
-    finally:
-        if device.type == "cuda":
-            torch.cuda.set_sync_debug_mode(0)  # default, blocking operations are allowed
-
+from tests.collections.asr.decoding.utils import avoid_sync_operations
 
 DEVICES: List[torch.device] = [torch.device("cpu")]
 
@@ -179,46 +168,6 @@ class TestBatchedHyps:
         assert hyps.last_timestamp.tolist() == [1, 2]
         assert hyps.last_timestamp_lasts.tolist() == [2, 1]
 
-    @pytest.mark.unit
-    @pytest.mark.parametrize("device", DEVICES)
-    def test_torch_jit_compatibility_add_results(self, device: torch.device):
-        @torch.jit.script
-        def hyps_add_wrapper(
-            active_indices: torch.Tensor, labels: torch.Tensor, time_indices: torch.Tensor, scores: torch.Tensor
-        ):
-            hyps = BatchedHyps(batch_size=2, init_length=3, device=active_indices.device)
-            hyps.add_results_(active_indices=active_indices, labels=labels, time_indices=time_indices, scores=scores)
-            return hyps
-
-        scores = torch.tensor([0.1, 0.1], device=device)
-        hyps = hyps_add_wrapper(
-            torch.tensor([0, 1], device=device),
-            torch.tensor([2, 4], device=device),
-            torch.tensor([0, 0], device=device),
-            scores,
-        )
-        assert torch.allclose(hyps.scores, scores)
-
-    @pytest.mark.unit
-    @pytest.mark.parametrize("device", DEVICES)
-    def test_torch_jit_compatibility_add_results_masked(self, device: torch.device):
-        @torch.jit.script
-        def hyps_add_wrapper(
-            active_mask: torch.Tensor, labels: torch.Tensor, time_indices: torch.Tensor, scores: torch.Tensor
-        ):
-            hyps = BatchedHyps(batch_size=2, init_length=3, device=active_mask.device)
-            hyps.add_results_masked_(active_mask=active_mask, labels=labels, time_indices=time_indices, scores=scores)
-            return hyps
-
-        scores = torch.tensor([0.1, 0.1], device=device)
-        hyps = hyps_add_wrapper(
-            torch.tensor([True, True], device=device),
-            torch.tensor([2, 4], device=device),
-            torch.tensor([0, 0], device=device),
-            scores,
-        )
-        assert torch.allclose(hyps.scores, scores)
-
 
 class TestBatchedAlignments:
     @pytest.mark.unit
@@ -345,26 +294,6 @@ class TestBatchedAlignments:
                 alignments.logits[i, : alignments.current_lengths[i]] == sample_logits[i, add_logits_mask[i]]
             ).all()
 
-    @pytest.mark.unit
-    @pytest.mark.parametrize("device", DEVICES)
-    def test_torch_jit_compatibility(self, device: torch.device):
-        @torch.jit.script
-        def alignments_add_wrapper(
-            active_indices: torch.Tensor, logits: torch.Tensor, labels: torch.Tensor, time_indices: torch.Tensor
-        ):
-            hyps = BatchedAlignments(batch_size=2, logits_dim=3, init_length=3, device=active_indices.device)
-            hyps.add_results_(active_indices=active_indices, logits=logits, labels=labels, time_indices=time_indices)
-            return hyps
-
-        logits = torch.tensor([[0.1, 0.1, 0.3], [0.5, 0.2, 0.9]], device=device)
-        hyps = alignments_add_wrapper(
-            active_indices=torch.tensor([0, 1], device=device),
-            logits=logits,
-            labels=torch.tensor([2, 4], device=device),
-            time_indices=torch.tensor([0, 0], device=device),
-        )
-        assert torch.allclose(hyps.logits[:, 0], logits)
-
 
 class TestConvertToHypotheses:
     @pytest.mark.unit
@@ -384,12 +313,12 @@ class TestConvertToHypotheses:
             scores=torch.tensor([1.0, 1.0], device=device),
         )
         hypotheses = batched_hyps_to_hypotheses(hyps)
-        assert (hypotheses[0].y_sequence == torch.tensor([5, 2], device=device)).all()
-        assert (hypotheses[1].y_sequence == torch.tensor([4], device=device)).all()
+        assert (hypotheses[0].y_sequence == torch.tensor([5, 2], device="cpu")).all()
+        assert (hypotheses[1].y_sequence == torch.tensor([4], device="cpu")).all()
         assert hypotheses[0].score == pytest.approx(1.5)
         assert hypotheses[1].score == pytest.approx(1.0)
-        assert (hypotheses[0].timestamp == torch.tensor([1, 1], device=device)).all()
-        assert (hypotheses[1].timestamp == torch.tensor([2], device=device)).all()
+        assert (hypotheses[0].timestamp == torch.tensor([1, 1], device="cpu")).all()
+        assert (hypotheses[1].timestamp == torch.tensor([2], device="cpu")).all()
 
     @pytest.mark.unit
     @pytest.mark.parametrize("device", DEVICES)
@@ -444,12 +373,12 @@ class TestConvertToHypotheses:
         )
 
         hypotheses = batched_hyps_to_hypotheses(hyps, alignments)
-        assert (hypotheses[0].y_sequence == torch.tensor([5, 2], device=device)).all()
-        assert (hypotheses[1].y_sequence == torch.tensor([4], device=device)).all()
+        assert (hypotheses[0].y_sequence == torch.tensor([5, 2], device="cpu")).all()
+        assert (hypotheses[1].y_sequence == torch.tensor([4], device="cpu")).all()
         assert hypotheses[0].score == pytest.approx(1.5)
         assert hypotheses[1].score == pytest.approx(1.0)
-        assert (hypotheses[0].timestamp == torch.tensor([0, 1], device=device)).all()
-        assert (hypotheses[1].timestamp == torch.tensor([1], device=device)).all()
+        assert (hypotheses[0].timestamp == torch.tensor([0, 1], device="cpu")).all()
+        assert (hypotheses[1].timestamp == torch.tensor([1], device="cpu")).all()
 
         etalon = [
             [
