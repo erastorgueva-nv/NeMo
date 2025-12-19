@@ -161,6 +161,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
 
+
     def _create_minimal_batch(self) -> dict:
         """Create a minimal valid batch when all cuts are filtered out."""
         # Create minimal tensors with batch size 1
