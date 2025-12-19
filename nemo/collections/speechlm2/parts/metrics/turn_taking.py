@@ -15,8 +15,6 @@ from collections import defaultdict
 import torch
 from nemo.utils import logging
 
-
-
 def compute_turn_taking_metrics(source_tokens, pred_tokens, eos_token_id, bos_token_id, tolerance=13, latency_multiplier=0.08):
     """
     Computes turn taking accuracy and latency.
@@ -72,9 +70,6 @@ def compute_turn_taking_metrics(source_tokens, pred_tokens, eos_token_id, bos_to
     avg_latency = sum(successful_latencies) / len(successful_latencies) if successful_latencies else 0.0
     
     return float(accuracy), float(avg_latency)
-
-
-
 
 class TurnTakingMetrics:
     """

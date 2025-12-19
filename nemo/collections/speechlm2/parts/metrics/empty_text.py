@@ -117,22 +117,4 @@ def count_empty_texts(hyps: List[str], verbose: bool = True) -> dict:
     """
     metric = EmptyTextMetric(verbose=verbose)
     metric.update("single_batch", hyps)
-    return metric.compute()
-
-
-if __name__ == "__main__":
-    # Example usage
-    test_hyps = [
-        "Hello world",
-        "",  # Empty string
-        "   ",  # Only whitespace
-        "Good morning",
-        "\t\n",  # Only whitespace characters
-        "Another text"
-    ]
-    
-    print("Testing EmptyTextMetric with sample data:")
-    print(f"Input hypotheses: {test_hyps}")
-    
-    result = count_empty_texts(test_hyps)
-    print(f"\nResults: {result}") 
+    return metric.compute() 

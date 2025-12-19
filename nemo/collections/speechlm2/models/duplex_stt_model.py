@@ -42,12 +42,12 @@ from nemo.collections.common.parts.nlp_overrides import NLPSaveRestoreConnector
 from nemo.collections.speechlm2.data.utils import get_pad_id
 from nemo.collections.speechlm2.models.duplex_s2s_model import tokens_to_str
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
-from nemo.collections.speechlm2.parts.label_prep import prepare_labels
+from nemo.collections.speechlm2.parts.label_prep import prepare_text_and_asr_labels
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.metrics.bleu import BLEU
-from nemo.collections.speechlm2.parts.metrics.text_wer import TextWER
+from nemo.collections.speechlm2.parts.metrics.wer import WER
 from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
-from nemo.collections.speechlm2.parts.metrics.token_accuracy import TurnTakingMetrics
+from nemo.collections.speechlm2.parts.metrics.turn_taking import TurnTakingMetrics
 from nemo.collections.speechlm2.parts.metrics.empty_text import EmptyTextMetric
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.pretrained import (
@@ -424,40 +424,6 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     loss_scale[i, bos_idx + 1:, :] = 0
         return loss_scale
 
-    def _convert_pad_to_sil(self, target_tokens: torch.Tensor) -> tuple[torch.Tensor, int]:
-        """
-        Convert pad tokens to sil tokens when agent is in listening state.
-        """
-        if 'Nemotron' in self.cfg.pretrained_llm:
-            sil_id = self.tokenizer.tokenizer._tokenizer.token_to_id('<SPECIAL_11>')
-        elif 'Qwen2.5' in self.cfg.pretrained_llm:
-            sil_id = self.tokenizer.tokenizer._tokenizer.token_to_id('<|object_ref_start|>')
-        else:
-            logging.warning("Model type not supported for sil_token conversion, skipping conversion")
-            return target_tokens, None
-
-        if sil_id is None:
-            logging.warning("sil_token not found in tokenizer vocabulary, skipping conversion")
-            return target_tokens, None
-
-        target_tokens = target_tokens.clone()
-        B, T = target_tokens.shape
-
-        for b in range(B):
-            inside_speech = False
-
-            for t in range(T):
-                token = target_tokens[b, t].item()
-
-                if token == self.text_bos_id:
-                    inside_speech = True
-                elif token == self.text_eos_id:
-                    inside_speech = False
-                elif token == self.text_pad_id and not inside_speech:
-                    target_tokens[b, t] = sil_id
-
-        return target_tokens, sil_id
-
     def prepare_inputs(self, batch: dict):     
         if self.cfg.get('use_old_noise_aug', None):
             noise_prob = self.cfg.get('old_noise_prob', 0.99)
@@ -485,7 +451,6 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 )
 
         
-
         source_encoded, source_encoded_lens, _ = self.perception(
             input_signal=batch["source_audio"],
             input_signal_length=batch["source_audio_lens"],
@@ -551,12 +516,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         elif diff > 0:
             target_tokens = target_tokens[:, : source_encoded.shape[1]]
 
-        # Optional: convert pad tokens to sil tokens
-        sil_id = None
-        if self.cfg.get("use_sil_token", False):
-            target_tokens, sil_id = self._convert_pad_to_sil(target_tokens)
-
-        inputs = prepare_labels(
+        inputs = prepare_text_and_asr_labels(
             batch=batch,
             target_tokens=target_tokens,
             source_encoded=source_encoded,
@@ -600,33 +560,18 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             bos_weight = token_weights.get("bos", 1.0)
             eos_weight = token_weights.get("eos", 1.0)
             text_weight = token_weights.get("text", 1.0)
-            sil_weight = token_weights.get("sil", 1.0)
 
-            if sil_id is not None:
-                loss_scale = torch.where(
-                    text_labels.unsqueeze(-1) == self.text_pad_id, pad_weight,
+            loss_scale = torch.where(
+                text_labels.unsqueeze(-1) == self.text_pad_id, pad_weight,
+                torch.where(
+                    text_labels.unsqueeze(-1) == self.text_bos_id, bos_weight,
                     torch.where(
-                        text_labels.unsqueeze(-1) == self.text_bos_id, bos_weight,
-                        torch.where(
-                            text_labels.unsqueeze(-1) == self.text_eos_id, eos_weight,
-                            torch.where(
-                                text_labels.unsqueeze(-1) == sil_id, sil_weight,
-                                text_weight
-                            )
-                        )
+                        text_labels.unsqueeze(-1) == self.text_eos_id, eos_weight,
+                        text_weight
                     )
                 )
-            else:
-                loss_scale = torch.where(
-                    text_labels.unsqueeze(-1) == self.text_pad_id, pad_weight,
-                    torch.where(
-                        text_labels.unsqueeze(-1) == self.text_bos_id, bos_weight,
-                        torch.where(
-                            text_labels.unsqueeze(-1) == self.text_eos_id, eos_weight,
-                            text_weight
-                        )
-                    )
-                )
+            )
+            # Don't penalize the agent replies for ASR training
             loss_scale = self._maybe_zero_out_scale_for_asr(loss_scale, text_labels, batch)
             if self.predict_user_text:
                 asr_loss_scale = torch.where(
@@ -639,9 +584,6 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                         )
                     )
                 )
-
-            if self.cfg.get("debug", False):
-                import pdb; pdb.set_trace()
 
         ans = {
             "input_embeds": input_embeds,
@@ -696,13 +638,6 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                         )
                         * inputs["asr_loss_scale"][:, :, 0].flatten(0, 1)
                     ).sum(-1) / num_frames
-                    if self.cfg.get("debug", False):
-                        import pdb; pdb.set_trace()
-                        stacked = torch.stack([inputs["asr_labels"][0], inputs["asr_loss_scale"][0, :, 0]], dim=1)
-                        stacked = stacked * (stacked != self.text_pad_id)
-                        print("Stacked asr_labels and asr_loss_scale for first batch (up to 500 steps):")
-                        print(stacked[:500].int())
-                    print(f'asr_loss: {asr_loss}')
 
                 with torch.no_grad():
                     predicted_tokens = torch.argmax(text_logits, dim=-1)  # (B, T)
@@ -779,7 +714,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
         if self.predict_user_text:
             self.src_bleu = BLEU().reset()
-            self.src_wer = TextWER().reset()
+            self.src_wer = WER().reset()
             self.empty_user_text = EmptyTextMetric().reset()
 
     def on_validation_epoch_end(self, prefix="val") -> None:
@@ -842,8 +777,6 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     pred_tokens=results["tokens_text"]
                 )
 
-            fake_pred_audio, fake_audio_len = self._generate_fake_audio_from_tokens(results["tokens_text"])
-
             pred_turns_list = self._split_agent_tokens_into_turns(results["tokens_text"])
 
             self.results_logger.update(
@@ -852,7 +785,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 hyps=results["text"],
                 asr_hyps=None,
                 samples_id=dataset_batch['sample_id'],
-                pred_audio=fake_pred_audio,
+                pred_audio=None,
                 pred_audio_sr=self.target_sample_rate,
                 user_audio=dataset_batch["source_audio"],
                 user_audio_sr=self.source_sample_rate,
@@ -926,104 +859,6 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         text_bos = torch.full((1,), fill_value=self.text_pad_id, device=self.device)
         input_embeds = self.embed_asr_tokens(text_bos)
         return input_embeds
-
-    def _remove_continuous_agent_bos_id(self, gen_text: torch.Tensor, bos_id: int,
-                                        is_asr: bool = False) -> torch.Tensor:
-        """Remove continuous appearance of bos_id."""
-        if is_asr:
-            cleaned_gen_text = gen_text.clone()
-            for b in range(cleaned_gen_text.size(0)):
-                in_bos = False
-                for t in range(cleaned_gen_text.size(1)):
-                    token = cleaned_gen_text[b, t]
-                    if token == bos_id:
-                        if in_bos:
-                            cleaned_gen_text[b, t] = self.text_pad_id
-                        else:
-                            in_bos = True
-                    elif token == self.text_pad_id:
-                        continue
-                    else:
-                        in_bos = False
-            gen_text = cleaned_gen_text
-        return gen_text
-
-    def _remove_last_turn_if_short(self, gen_text: torch.Tensor, bos_id: int, is_asr: bool = False) -> torch.Tensor:
-        """If the last turn contains less than 5 non-pad tokens, set the last turn all to pad."""
-        if is_asr:
-            fixed_gen_text = gen_text.clone()
-
-            for b in range(gen_text.size(0)):
-                bos_indices = (gen_text[b] == bos_id).nonzero(as_tuple=True)[0]
-
-                if len(bos_indices) > 0:
-                    last_bos_idx = bos_indices[-1].item()
-                    last_turn_tokens = gen_text[b, last_bos_idx:]
-                    non_pad_count = (last_turn_tokens != self.text_pad_id).sum().item()
-
-                    if non_pad_count < 5:
-                        fixed_gen_text[b, last_bos_idx + 1:] = self.text_pad_id
-            return fixed_gen_text
-        else:
-            return gen_text
-
-    def _find_agent_bos(self, gen_text: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        agent_bos_id = self.text_bos_id
-        agent_bos_indices = (gen_text == agent_bos_id).nonzero(as_tuple=True)
-        return agent_bos_indices
-
-    def _segment_alternating_user_agent_text(self, gen_text: torch.Tensor, is_asr: bool = False, user_eos_id=None) -> \
-    tuple[torch.Tensor, torch.Tensor]:
-        """Segment text into alternating user and agent text segments."""
-        user_bos_id = self.user_bos_id
-        agent_bos_id = self.text_bos_id
-
-        if is_asr:
-            gen_text_src = torch.where(gen_text == agent_bos_id, user_eos_id, gen_text)
-            gen_text_tgt = gen_text.clone()
-            return gen_text_src, gen_text_tgt
-
-        user_mask = torch.zeros_like(gen_text, dtype=torch.bool)
-        agent_mask = torch.zeros_like(gen_text, dtype=torch.bool)
-
-        for b in range(gen_text.size(0)):
-            user_bos_indices = (gen_text[b] == user_bos_id).nonzero(as_tuple=True)[0]
-            agent_bos_indices = (gen_text[b] == agent_bos_id).nonzero(as_tuple=True)[0]
-
-            all_bos_positions = []
-            for idx in user_bos_indices:
-                all_bos_positions.append((idx.item(), 'user'))
-            for idx in agent_bos_indices:
-                all_bos_positions.append((idx.item(), 'agent'))
-
-            all_bos_positions.sort(key=lambda x: x[0])
-
-            current_type = None
-            segment_start = 0
-
-            for pos, bos_type in all_bos_positions:
-                if current_type is not None:
-                    if current_type == 'user':
-                        user_mask[b, segment_start:pos] = True
-                    else:
-                        agent_mask[b, segment_start:pos] = True
-
-                current_type = bos_type
-                segment_start = pos
-
-            if current_type is not None:
-                if current_type == 'user':
-                    user_mask[b, segment_start:] = True
-                else:
-                    agent_mask[b, segment_start:] = True
-
-        gen_text_src = gen_text.clone()
-        gen_text_src[~user_mask] = self.text_pad_id
-
-        gen_text_tgt = gen_text.clone()
-        gen_text_tgt[~agent_mask] = self.text_pad_id
-
-        return gen_text_src, gen_text_tgt
 
     def _split_agent_tokens_into_turns(self, tokens_text: torch.Tensor):
         """Split sequence of agent_tokens into turns as detected by text_bos_id and text_eos_id."""
@@ -1110,58 +945,6 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
         return turns_list
 
-    def _generate_fake_audio_from_tokens(self, tokens_text: torch.Tensor):
-        """Generate fake audio based on text tokens for analysis."""
-        batch_size, seq_len = tokens_text.shape
-        token_duration = 0.08
-        samples_per_token = int(token_duration * self.target_sample_rate)
-        audio_len = seq_len * samples_per_token
-
-        sil_id = None
-        if self.cfg.get("use_sil_token", False):
-            if 'Nemotron' in self.cfg.pretrained_llm:
-                sil_id = self.tokenizer.tokenizer._tokenizer.token_to_id('<SPECIAL_11>')
-            elif 'Qwen2.5' in self.cfg.pretrained_llm:
-                sil_id = self.tokenizer.tokenizer._tokenizer.token_to_id('<|object_ref_start|>')
-
-        fake_audio = torch.zeros(batch_size, audio_len, device=tokens_text.device, dtype=torch.float32)
-        audio_lengths = torch.full((batch_size,), audio_len, device=tokens_text.device, dtype=torch.long)
-
-        for b in range(batch_size):
-            current_tokens = tokens_text[b].cpu().numpy()
-            audio_values = torch.zeros(seq_len, device=tokens_text.device, dtype=torch.float32)
-
-            in_speech = False
-
-            for t in range(seq_len):
-                token_id = int(current_tokens[t])
-
-                if token_id == self.text_bos_id:
-                    in_speech = True
-                    audio_values[t] = 1.0
-                elif token_id == self.text_eos_id:
-                    in_speech = False
-                    audio_values[t] = 0.0
-                elif sil_id is not None and token_id == sil_id:
-                    audio_values[t] = 0.2
-                elif token_id == self.text_pad_id:
-                    if in_speech:
-                        audio_values[t] = 0.5
-                    else:
-                        audio_values[t] = 0.0
-                else:
-                    if in_speech:
-                        audio_values[t] = 1.0
-                    else:
-                        audio_values[t] = 0.0
-
-            for t in range(seq_len):
-                start_sample = t * samples_per_token
-                end_sample = min((t + 1) * samples_per_token, audio_len)
-                fake_audio[b, start_sample:end_sample] = audio_values[t]
-
-        return fake_audio, audio_lengths
-
     def _init_inference(
             self,
             input_signal: torch.Tensor,
@@ -1172,12 +955,6 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             prompt_token_lens: torch.Tensor,
     ):
         """Initialize inference resources and prepare inputs."""
-        sil_id = None
-        if 'Nemotron' in self.cfg.pretrained_llm:
-            sil_id = self.tokenizer.tokenizer._tokenizer.token_to_id('<SPECIAL_11>')
-        elif 'Qwen2.5' in self.cfg.pretrained_llm:
-            sil_id = self.tokenizer.tokenizer._tokenizer.token_to_id('<|object_ref_start|>')
-
         if self.cfg.get("custom_sample_inference", None):
             device = input_signal.device
             input_signal, sr = torchaudio.load(self.cfg.custom_sample_inference)
@@ -1279,7 +1056,6 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     is_prompt_position_mask[i, :prompt_len_val] = True
 
         return {
-            "sil_id": sil_id,
             "input_signal": input_signal,
             "input_signal_lens": input_signal_lens,
             "source_encoded": source_encoded,
@@ -1308,9 +1084,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             speaker_encoder_emb=None,
         )
 
-        if inference_state["start_gen_pos"] > 0:
-            pass
-        else:
+        if inference_state["start_gen_pos"] == 0:
             inference_state["gen_text"][:, 0] = ans["text_logits"][:, -1].argmax(dim=-1)
             if self.predict_user_text:
                 inference_state["gen_asr"][:, 0] = ans["asr_logits"][:, -1].argmax(dim=-1)
@@ -1414,7 +1188,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 lengths = lengths_trimmed
 
         ans = {
-            "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, eval_text_turn_taking=self.cfg.get("eval_text_turn_taking", True), sil_id=inference_state["sil_id"]),
+            "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, eval_text_turn_taking=self.cfg.get("eval_text_turn_taking", True)),
             "src_text": src_text_cleaned,
             "tokens_text_src": gen_text_src,
             "tokens_text": gen_text,

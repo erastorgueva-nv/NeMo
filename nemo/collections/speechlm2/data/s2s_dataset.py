@@ -59,43 +59,66 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         output_roles (list[str], optional):
             List of speaker roles (cut.supervisions[:].speaker) to consider as outputs. Defaults to ["agent"].
 
-        force_align_user_text (bool, optional):
-            If True, performs force alignment on user audio segments to generate word-level timestamps.
-            Only applies to supervision turns where speaker.role is "user". Defaults to False.
+        aug_by_swap_role (bool, optional):
+            Whether to augment data by swapping user/agent roles. Defaults to False.
+
+        include_turn_metadata (bool, optional):
+            Whether to include detailed turn metadata in the output. Defaults to False.
+
+        cfg (dict, optional):
+            Configuration dictionary containing dataset-specific settings (e.g., word_align_position).
+
+        model_cfg (dict, optional):
+            Model configuration dictionary containing settings like predict_user_text, force_align_user_text,
+            and force_align_device.
 
     Returns:
-        A dictionary with the following keys:
-            - source_audio: Tensor of source waveform samples [B, T]
-            - source_audio_lens: Tensor of source audio lengths [B]
-            - target_audio: Tensor of target waveform samples [B, T]
-            - target_audio_lens: Tensor of target audio lengths [B]
-            - target_tokens: Tensor of target text tokens [B, T], with special tokens (BOS/EOS/PAD)
-                at positions aligned with audio frames
-            - target_token_lens: Tensor of target token sequence lengths [B]
-            - source_tokens: Tensor of source text tokens [B, T], with special tokens (BOS/EOS/PAD)
-                at positions aligned with audio frames
-            - source_token_lens: Tensor of source token sequence lengths [B]
-            - target_texts: List of full target texts joined from output_roles supervisions [B]
-            - prompt_tokens: Tensor of prompt text tokens [B, T]
-            - prompt_token_lens: Tensor of prompt token sequence lengths [B]
-            - target_turn_texts: (Optional, if include_turn_metadata=True) List of lists of turn dictionaries [B]
-                Each turn dict contains: start_time, duration, role, text
-            - source_turn_texts: (Optional, if include_turn_metadata=True) List of lists of turn dictionaries [B]
-                Each turn dict contains: start_time, duration, role, text
-            - system_prompt: (Optional, if include_turn_metadata=True) List of system prompts [B]
+        A dictionary with the following top-level keys:
+            - audio_data: Dictionary containing audio and token data (None if no audio cuts present):
+                - sample_id: List of cut IDs [B]
+                - source_audio: Tensor of source waveform samples [B, T]
+                - source_audio_lens: Tensor of source audio lengths [B]
+                - target_audio: Tensor of target waveform samples [B, T]
+                - target_audio_lens: Tensor of target audio lengths [B]
+                - target_tokens: Tensor of target text tokens [B, T], with special tokens (BOS/EOS/PAD)
+                    at positions aligned with audio frames
+                - target_token_lens: Tensor of target token sequence lengths [B]
+                - source_tokens: Tensor of source text tokens [B, T], with special tokens (BOS/EOS/PAD)
+                    at positions aligned with audio frames
+                - source_token_lens: Tensor of source token sequence lengths [B]
+                - source_texts: List of source texts joined from input_roles supervisions [B]
+                - target_texts: List of target texts joined from output_roles supervisions [B]
+                - all_texts: List of all texts joined from all supervisions [B]
+                - target_first_turn_audio: Tensor of first turn target audio [B, T]
+                - target_first_turn_audio_lens: Tensor of first turn audio lengths [B]
+                - formatter: List of formatter names for each cut [B]
+                - aug_by_noise: List of boolean flags for noise augmentation [B]
+                - prompt_tokens: (Optional, if system prompts exist) Tensor of prompt text tokens [B, T]
+                - prompt_token_lens: (Optional, if system prompts exist) Tensor of prompt token sequence lengths [B]
+                - target_turn_texts: (Optional, if include_turn_metadata=True) List of lists of turn dictionaries [B]
+                    Each turn dict contains: start_time, duration, role, text
+                - source_turn_texts: (Optional, if include_turn_metadata=True) List of lists of turn dictionaries [B]
+                    Each turn dict contains: start_time, duration, role, text
+                - system_prompt: (Optional, if include_turn_metadata=True) List of system prompts [B]
+            - text_data: Dictionary containing text-only data (None if no text cuts present):
+                - text_tokens: Tensor of text tokens [B, T]
+                - text_token_lens: Tensor of text token sequence lengths [B]
 
     Notes:
         - The dataset ensures frame-level alignment between audio and text by inserting tokens at
           specific frame positions based on the timing of supervision segments.
         - PAD tokens (typically 0) are used to fill gaps where there's no text.
-        - BOS tokens mark the beginning of each speech segment.
-        - EOS tokens mark the end of each speech segment.
+        - For target tokens: BOS tokens mark the beginning of each speech segment.
+        - For source tokens: special BOS markers ('^' and regular BOS) are used to distinguish user and agent turns.
+        - EOS tokens mark the end of each speech segment (or interruption points).
         - Text tokens from each speaker are placed at frame positions corresponding to their
           timestamp in the original recording, preserving the temporal relationship.
-          This is a segment-level alignment only, not word-level alignment.
+          This is segment-level alignment by default.
         - When force_align_user_text is enabled, user audio segments are
           force-aligned using wav2vec2 to generate word-level timestamps, which are then
           converted to frame-level token positions for more precise alignment.
+        - Role swapping augmentation (when enabled) creates additional training examples by swapping
+          user and agent roles while adjusting audio channels accordingly.
     """
 
     def __init__(
@@ -227,9 +250,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 bos_id=self.tokenizer.text_to_ids('^')[0], 
                 eos_id=self.tokenizer.text_to_ids('$')[0], 
                 word_align_position=self.word_align_position, 
-                remove_timestamps=not self.predict_user_text, 
-                user_bos_id=self.tokenizer.text_to_ids('^')[0], 
-                agent_bos_id=self.tokenizer.bos
+                remove_timestamps=not self.predict_user_text
             )
                 
             try:
@@ -240,17 +261,6 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             except Exception as e:
                 target_first_turn_audio = None
                 target_first_turn_audio_lens = None
-
-            if self.model_cfg is not None and self.model_cfg.get("debug", False):
-                print("source_tokens[0]:", source_tokens[0][:500]*(source_tokens[0][:500]!=self.tokenizer.pad_id))
-                print("target_tokens[0]:", target_tokens[0][:500]*(target_tokens[0][:500]!=self.tokenizer.pad_id))
-                print("cut.supervisions[0].duration:", int(cuts[0].supervisions[0].duration / 0.08))
-                # Find the indices of the first non-pad tokens in target_tokens[0]
-                first_non_pad_idx = (target_tokens[0] != self.tokenizer.pad_id).nonzero(as_tuple=True)[0][0].item() if (target_tokens[0] != self.tokenizer.pad_id).any() else None
-                print("First non-pad token index in target_tokens[0]:", first_non_pad_idx)
-                # print('Agent start timestamp: ', int(cuts[0].supervisions[1].start / 0.08))
-                import pdb; pdb.set_trace()
-
 
             audio_data = {
                 "sample_id": [str(cut.id) for cut in all_cuts_combined],
@@ -528,12 +538,10 @@ def collate_token_channel(
     eos_id: int = None,
     word_align_position: str = 'left',
     remove_timestamps: bool = False,
-    user_bos_id: int = None,
-    agent_bos_id: int = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     pad_id = get_pad_id(tokenizer)
     tokens = [
-        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id, bos_id=bos_id, eos_id=eos_id, word_align_position=word_align_position, remove_timestamps=remove_timestamps, user_bos_id=user_bos_id, agent_bos_id=agent_bos_id)
+        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id, bos_id=bos_id, eos_id=eos_id, word_align_position=word_align_position, remove_timestamps=remove_timestamps)
         for c in cuts
     ]
     token_lens = torch.tensor([len(tt) for tt in tokens])
@@ -577,8 +585,6 @@ def build_token_channel(
         eos_id: int = None,
         word_align_position: str = 'left',
         remove_timestamps: bool = False,
-        user_bos_id: int = None,
-        agent_bos_id: int = None,
 ) -> torch.Tensor:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
@@ -628,22 +634,6 @@ def build_token_channel(
             if eospos < len(tokens) and eos_id is not None:
                 # Normal case: place EOS at the intended position
                 tokens[eospos] = eos_id
-            else:
-                # Interruption case: place EOS at the last valid position
-                # This ensures the model learns to stop when interrupted by user
-                if endpos < len(tokens):
-                    # Case 1: text finished, interrupted during sil/audio generation
-                    # Place EOS right after the last text token (or at sequence end if closer)
-                    actual_eos_pos = min(endpos, len(tokens) - 1)
-                    tokens[actual_eos_pos] = eos_id
-                elif len(tokens) > 0:
-                    # Case 2: text truncated due to interruption
-                    # Place EOS at the very end of the sequence
-                    tokens[-1] = eos_id
-                logging.warning(
-                    f"Supervision was likely interrupted: {eospos=} >= {len(tokens)=}. "
-                    f"Placed EOS at fallback position to ensure proper turn-taking training. {diagnostic}"
-                )
 
     return tokens
 
@@ -684,13 +674,6 @@ def _text_with_timestamps_to_ids(text: str, tokenizer: TokenizerSpec,
     text_ids = []
     text_ids, start_times, end_times, word_lens = _extract_text_and_time_tokens(text, tokenizer, _TIMESTAMP_PATTERN_STR)
     text_ids_with_timestamps = _expand_text_with_timestamps_and_word_lengths(text_ids, word_lens, start_times, end_times, available_frames_for_text, frame_rate=0.08, pad_id=get_pad_id(tokenizer), word_align_position=word_align_position)
-    
-    if random.random() < 0.1:
-        logging.info(f'text_ids_with_timestamps: {text_ids_with_timestamps}')
-        logging.info(f'text_ids: {text_ids}')
-        logging.info(f'start_times: {start_times}')
-        logging.info(f'end_times: {end_times}')
-        logging.info(f'word_lens: {word_lens}')
     return text_ids_with_timestamps
 
 

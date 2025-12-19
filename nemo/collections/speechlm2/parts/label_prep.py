@@ -60,7 +60,7 @@ def delay_eos(tokens, eos_token_id, pad_token_id, shift=10):
     return tokens
 
 
-def prepare_labels(
+def prepare_text_and_asr_labels(
     batch,
     target_tokens,
     source_encoded,
@@ -76,14 +76,14 @@ def prepare_labels(
     device_mesh=None,
 ):
     """
-    Prepare text and ASR labels from batch data.
+    Prepare text and ASR labels for duplex STT model training.
     
     This function handles:
-    - Text channel delay/advance adjustments
-    - User text prediction with delayed source tokens
+    - Text channel delay/advance adjustments (for speech-text alignment)
+    - User text prediction with delayed source tokens (ASR channel)
     - User turn masking and agent turn boundary preservation
     - ASR head processing for conversational models
-    - Tensor parallelism adjustments
+    - Tensor parallelism adjustments for distributed training
     
     Args:
         batch: Dictionary containing batch data including source_tokens, target_tokens, etc.
@@ -171,17 +171,6 @@ def prepare_labels(
         target_tokens_flat = target_tokens.clone()
 
         # Keep user and agent text in separate channels and allow overlap between them
-        if cfg.get("debug", False):
-            i = 0
-            target_tokens_flat_masked = target_tokens_flat[i] * (target_tokens_flat[i] != text_pad_id)
-            print(f"target_tokens_flat[i]:", target_tokens_flat_masked)
-            target_tokens_masked = target_tokens[i] * (target_tokens[i] != text_pad_id)
-            print(f"target_tokens[i]:", target_tokens_masked)
-            source_tokens_flat_masked = source_tokens_flat[i] * (source_tokens_flat[i] != text_pad_id)
-            print(f"source_tokens_flat[i]:", source_tokens_flat_masked)
-            stacked = torch.stack([source_tokens_flat_masked, target_tokens_flat_masked], dim=1)
-            print("stacked[:500]:", stacked[:500])
-            import pdb; pdb.set_trace()
 
         # To be consistent with the single channel case, replace the user_eos_id with agent_eos_id
         source_tokens_flat = source_tokens_flat.clone()
@@ -190,11 +179,6 @@ def prepare_labels(
         asr_labels = source_tokens_flat[:, 1:]
         text_inputs = target_tokens_flat[:, :-1]
         text_labels = target_tokens_flat[:, 1:]
-
-        print(f"asr_inputs.shape: {asr_inputs.shape}")
-        print(f"text_inputs.shape: {text_inputs.shape}")
-        if asr_inputs.shape[1] != text_inputs.shape[1]:
-            import pdb; pdb.set_trace()
 
         result = {
             "asr_inputs": asr_inputs,
@@ -208,20 +192,6 @@ def prepare_labels(
         return result
     else:
         target_tokens_flat = target_tokens
-
-    if cfg.get("debug", False):
-        import pdb; pdb.set_trace()
-        i = 0
-        target_tokens_flat_masked = target_tokens_flat[i] * (target_tokens_flat[i] != text_pad_id)
-        print(f"target_tokens_flat[i]:", target_tokens_flat_masked)
-        target_tokens_masked = target_tokens[i] * (target_tokens[i] != text_pad_id)
-        print(f"target_tokens[i]:", target_tokens_masked)
-        if predict_user_text:
-            source_tokens_flat_masked = source_tokens_flat[i] * (source_tokens_flat[i] != text_pad_id)
-            print(f"source_tokens_flat[i]:", source_tokens_flat_masked)
-            stacked = torch.stack([source_tokens_flat_masked, target_tokens_flat_masked], dim=1)
-            print("ori_stacked[:500]:", stacked[:500])
-        import pdb; pdb.set_trace()
 
     if use_tp:
         tp_world_size = device_mesh["tensor_parallel"].size()
@@ -245,24 +215,6 @@ def prepare_labels(
         
         result["asr_inputs"] = asr_inputs
         result["asr_labels"] = asr_labels
-
-    if cfg.get("debug", False):
-        ori_stacked = torch.stack(
-            [
-                batch['source_tokens'][0] * (batch['source_tokens'][0] != text_pad_id),
-                batch['target_tokens'][0] * (batch['target_tokens'][0] != text_pad_id)
-            ],
-            dim=1
-        )
-        print("ori_stacked[:500]:", ori_stacked)
-        i = 0
-        asr_masked = result.get("asr_labels", result["text_labels"])[i][:1000] * (
-            result.get("asr_labels", result["text_labels"])[i][:1000] != text_pad_id
-        )
-        text_masked = result["text_labels"][i][:1000] * (result["text_labels"][i][:1000] != text_pad_id)
-        stacked = torch.stack([asr_masked, text_masked], dim=1)
-        print("delayed stacked[:500]:", stacked[:500])
-        import pdb; pdb.set_trace()
 
     result["source_encoded"] = source_encoded
 
