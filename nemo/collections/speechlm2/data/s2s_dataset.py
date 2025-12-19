@@ -185,6 +185,11 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             "formatter": ["s2s_duplex"],
         }
 
+    def _has_valid_input_and_target(self, cut: Cut) -> bool:
+        has_input_text = any(s.text.strip() for s in cut.supervisions if s.speaker in self.input_roles)
+        has_target_audio = hasattr(cut, "target_audio") and cut.target_audio is not None
+        return has_input_text and has_target_audio
+
     def __getitem__(self, all_cuts: CutSet) -> dict:
         # audio mini-batch
         cuts = all_cuts.filter(lambda c: isinstance(c, Cut))
@@ -194,7 +199,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             filtered_cuts = []
             skipped_cuts = []
             for cut in cuts:
-                if any(s.text.strip() for s in cut.supervisions if s.speaker in self.input_roles):
+                if self._has_valid_input_and_target(cut):
                     filtered_cuts.append(cut)
                 else:
                     skipped_cuts.append(cut.id)
