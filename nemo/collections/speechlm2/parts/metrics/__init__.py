@@ -13,9 +13,9 @@
 # limitations under the License.
 from .asr_bleu import ASRBLEU
 from .bleu import BLEU
-from .turn_taking import TurnTakingMetrics
-from .results_logger import ResultsLogger
 from .perplexity import Perplexity, ValidationLoss
+from .results_logger import ResultsLogger
+from .turn_taking import TurnTakingMetrics
 from .wer import WER
 
 __all__ = [

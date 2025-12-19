@@ -15,16 +15,16 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import torch
-from omegaconf import open_dict, OmegaConf
+from omegaconf import OmegaConf, open_dict
 from peft import PeftModel
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from nemo.collections.asr.models import ASRModel
 from nemo.collections.speechlm2.modules import AudioPerceptionModule
-
 from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.tts.models import AudioCodecModel
 from nemo.utils import logging
+
 
 def load_pretrained_nemo(cls, model_path_or_name: str):
     """
@@ -49,7 +49,7 @@ def load_pretrained_hf(model_path_or_name: str, pretrained_weights: bool = True,
     if pretrained_weights:
         return AutoModelForCausalLM.from_pretrained(model_path_or_name, torch_dtype=dtype, trust_remote_code=True)
     else:
-        config = AutoConfig.from_pretrained(model_path_or_name,  trust_remote_code=True)
+        config = AutoConfig.from_pretrained(model_path_or_name, trust_remote_code=True)
         return AutoModelForCausalLM.from_config(config, torch_dtype=dtype, trust_remote_code=True)
 
 
@@ -88,7 +88,7 @@ def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True
     Sets up an ``AudioPerceptionModule``, initializing its ``encoder`` and ``preprocessor``
     with a pretrained NeMo ``ASRModel``.
     The result is assigned to ``model.perception`` attribute and is trainable.
-    
+
     If user config specifies encoder parameters, they will override the pretrained model's config.
     """
     if pretrained_weights:
@@ -97,7 +97,7 @@ def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True
 
         if 'encoder' in model.cfg.perception:
             user_encoder_config = OmegaConf.to_container(model.cfg.perception.encoder, resolve=True)
-        
+
         asr = load_pretrained_nemo(ASRModel, model.cfg.pretrained_asr).eval()
         with open_dict(model.cfg):
             model.cfg.perception.preprocessor = asr.cfg.preprocessor
@@ -113,12 +113,13 @@ def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True
     else:
         model.perception = AudioPerceptionModule(model.cfg.perception).train()
 
+
 def set_model_dict_for_partial_init(pretrained_dict, model_dict):
     # 1. filter out different size layers
     for k, v in list(pretrained_dict.items()):
         if k in model_dict and hasattr(model_dict[k], "numel") and v.numel() != model_dict[k].numel():
             del pretrained_dict[k]
-            logging.info(" | > Layer with shape mismatach in the model definition: {}".format(k)) 
+            logging.info(" | > Layer with shape mismatach in the model definition: {}".format(k))
     # 2. filter out unnecessary keys
     pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
     # 3. overwrite entries in the existing state dict

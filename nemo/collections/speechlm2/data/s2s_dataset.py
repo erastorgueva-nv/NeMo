@@ -11,22 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import re
 import random
+import re
+
 import torch
 import torch.utils.data
 import torchaudio
-
 from lhotse import CutSet, MonoCut, Recording, Seconds, SupervisionSegment, compute_num_frames
 from lhotse.cut import Cut
 from lhotse.dataset.collation import collate_audio, collate_vectors
 from lhotse.utils import ifnone
 
-from nemo.collections.common.tokenizers import TokenizerSpec
-from nemo.collections.speechlm2.data.utils import get_pad_id
-from nemo.collections.speechlm2.data.force_align import ForceAligner
-from nemo.utils import logging
 from nemo.collections.common.data.lhotse.text_adapters import Formattable
+from nemo.collections.common.tokenizers import TokenizerSpec
+from nemo.collections.speechlm2.data.force_align import ForceAligner
+from nemo.collections.speechlm2.data.utils import get_pad_id
+from nemo.utils import logging
 
 
 class DuplexS2SDataset(torch.utils.data.Dataset):
@@ -151,22 +151,20 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
 
         self.cfg = cfg
         self.model_cfg = model_cfg
-        
 
         # Initialize force aligner if needed
         self.force_aligner = None
         if self.force_align_user_text:
             self.force_aligner = ForceAligner(device=self.force_align_device, frame_length=self.frame_length)
-        
+
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
-
 
     def _create_minimal_batch(self) -> dict:
         """Create a minimal valid batch when all cuts are filtered out."""
         # Create minimal tensors with batch size 1
         device = torch.device('cpu')  # Default device
-        
+
         return {
             "sample_id": ["empty_batch"],
             "source_audio": torch.zeros((1, 1000), dtype=torch.float32),  # 1 second of silence at 16kHz
@@ -205,9 +203,13 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 else:
                     skipped_cuts.append(cut.id)
             if skipped_cuts:
-                logging.info(f"Skipped {len(skipped_cuts)} cuts with empty input text. Skipped cut ids: {', '.join(skipped_cuts)}")
+                logging.info(
+                    f"Skipped {len(skipped_cuts)} cuts with empty input text. Skipped cut ids: {', '.join(skipped_cuts)}"
+                )
             if not filtered_cuts:
-                logging.warning(f"All cuts were filtered out! Original batch size: {len(cuts)}. Returning minimal valid batch to continue training.")
+                logging.warning(
+                    f"All cuts were filtered out! Original batch size: {len(cuts)}. Returning minimal valid batch to continue training."
+                )
                 return self._create_minimal_batch()
             cuts = CutSet.from_cuts(filtered_cuts)
 
@@ -227,42 +229,55 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 all_cuts_combined = CutSet.from_cuts(list(cuts) + swapped_cuts)
             else:
                 all_cuts_combined = cuts
-            
-            prompt_tokens, prompt_token_lens = collate_system_prompt(
-                all_cuts_combined, self.tokenizer
-            )
+
+            prompt_tokens, prompt_token_lens = collate_system_prompt(all_cuts_combined, self.tokenizer)
             source_audio, source_audio_lens = collate_audio(all_cuts_combined.resample(self.source_sample_rate))
             target_audio, target_audio_lens = collate_audio(
                 all_cuts_combined.resample(self.target_sample_rate), recording_field="target_audio"
             )
 
             target_tokens, target_token_lens = collate_token_channel(
-                all_cuts_combined, self.tokenizer, self.frame_length, roles=self.output_roles, bos_id=self.tokenizer.bos, eos_id=self.tokenizer.eos, remove_timestamps=True
+                all_cuts_combined,
+                self.tokenizer,
+                self.frame_length,
+                roles=self.output_roles,
+                bos_id=self.tokenizer.bos,
+                eos_id=self.tokenizer.eos,
+                remove_timestamps=True,
             )
 
             # Only run force alignment during training (when gradients are enabled)
             if self.force_align_user_text and torch.is_grad_enabled():
-                logging.info(f"Force aligning user text for {len(all_cuts_combined)} cuts on device {self.force_align_device}")
-                all_cuts_combined = self.force_aligner.batch_force_align_user_audio(all_cuts_combined, source_sample_rate=self.source_sample_rate)
-                
+                logging.info(
+                    f"Force aligning user text for {len(all_cuts_combined)} cuts on device {self.force_align_device}"
+                )
+                all_cuts_combined = self.force_aligner.batch_force_align_user_audio(
+                    all_cuts_combined, source_sample_rate=self.source_sample_rate
+                )
+
                 # Check if we have any cuts left after filtering
                 if len(all_cuts_combined) == 0:
-                    logging.warning("All cuts filtered out due to force alignment failures, returning minimal valid batch to continue training.")
+                    logging.warning(
+                        "All cuts filtered out due to force alignment failures, returning minimal valid batch to continue training."
+                    )
                     return self._create_minimal_batch()
 
             source_tokens, source_token_lens = collate_token_channel(
-                all_cuts_combined, self.tokenizer, self.frame_length,
+                all_cuts_combined,
+                self.tokenizer,
+                self.frame_length,
                 roles=self.input_roles,
-                bos_id=self.tokenizer.text_to_ids('^')[0], 
-                eos_id=self.tokenizer.text_to_ids('$')[0], 
-                word_align_position=self.word_align_position, 
-                remove_timestamps=not self.predict_user_text
+                bos_id=self.tokenizer.text_to_ids('^')[0],
+                eos_id=self.tokenizer.text_to_ids('$')[0],
+                word_align_position=self.word_align_position,
+                remove_timestamps=not self.predict_user_text,
             )
-                
+
             try:
                 target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio(
-                    all_cuts_combined.resample(self.target_sample_rate), roles=self.output_roles,
-                    recording_field="target_audio"
+                    all_cuts_combined.resample(self.target_sample_rate),
+                    roles=self.output_roles,
+                    recording_field="target_audio",
                 )
             except Exception as e:
                 target_first_turn_audio = None
@@ -279,7 +294,8 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 "source_tokens": source_tokens,
                 "source_token_lens": source_token_lens,
                 "source_texts": [
-                    " ".join(_strip_timestamps(s.text) for s in cut.supervisions if s.speaker in self.input_roles) for cut in all_cuts_combined
+                    " ".join(_strip_timestamps(s.text) for s in cut.supervisions if s.speaker in self.input_roles)
+                    for cut in all_cuts_combined
                 ],
                 "target_texts": [
                     " ".join(s.text for s in cut.supervisions if s.speaker in self.output_roles)
@@ -291,13 +307,13 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 "target_first_turn_audio": target_first_turn_audio,
                 "target_first_turn_audio_lens": target_first_turn_audio_lens,
                 "formatter": [getattr(cut, "formatter", "s2s_duplex") for cut in all_cuts_combined],
-                "aug_by_noise": [getattr(cut, "aug_by_noise", True) for cut in all_cuts_combined]
+                "aug_by_noise": [getattr(cut, "aug_by_noise", True) for cut in all_cuts_combined],
             }
-        
+
             if torch.sum(prompt_token_lens) > 0:
                 audio_data['prompt_tokens'] = prompt_tokens
                 audio_data['prompt_token_lens'] = prompt_token_lens
-            
+
             # Optionally include detailed turn metadata for analysis
             if self.include_turn_metadata:
                 audio_data["target_turn_texts"] = [
@@ -308,7 +324,8 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                             "role": s.speaker,
                             "text": s.text,
                         }
-                        for s in cut.supervisions if s.speaker in self.output_roles
+                        for s in cut.supervisions
+                        if s.speaker in self.output_roles
                     ]
                     for cut in all_cuts_combined
                 ]
@@ -320,14 +337,13 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                             "role": s.speaker,
                             "text": s.text,
                         }
-                        for s in cut.supervisions if s.speaker in self.input_roles
+                        for s in cut.supervisions
+                        if s.speaker in self.input_roles
                     ]
                     for cut in all_cuts_combined
                 ]
-                audio_data["system_prompt"] = [
-                    cut.custom.get('system_prompt', '') for cut in all_cuts_combined
-                ]
-                
+                audio_data["system_prompt"] = [cut.custom.get('system_prompt', '') for cut in all_cuts_combined]
+
         text_cuts = all_cuts.filter(lambda c: isinstance(c, Formattable))
         text_data = None
         if text_cuts:
@@ -338,9 +354,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 text_tokens.append(text_ids)
                 text_token_lens.append(text_ids.shape[0])
 
-            text_tokens = collate_vectors(
-                text_tokens, padding_value=get_pad_id(self.tokenizer)
-            )
+            text_tokens = collate_vectors(text_tokens, padding_value=get_pad_id(self.tokenizer))
             text_token_lens = torch.tensor(text_token_lens, dtype=torch.long)
             text_data = {
                 "text_tokens": text_tokens,
@@ -354,10 +368,11 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
 
     def _create_role_swapped_cut(self, cut):
 
-        from lhotse import AudioSource
         from io import BytesIO
-        import soundfile as sf
+
         import numpy as np
+        import soundfile as sf
+        from lhotse import AudioSource
 
         swapped_supervisions = []
         for sup in cut.supervisions:
@@ -379,7 +394,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 speaker=new_speaker,
                 gender=sup.gender,
                 custom=sup.custom,
-                alignment=sup.alignment
+                alignment=sup.alignment,
             )
             swapped_supervisions.append(swapped_sup)
 
@@ -419,7 +434,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 speaker=sup.speaker,
                 gender=sup.gender,
                 custom=sup.custom,
-                alignment=sup.alignment
+                alignment=sup.alignment,
             )
             adjusted_supervisions.append(adjusted_sup)
 
@@ -436,25 +451,24 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             if sup.speaker == 'User':
 
                 original_start = sup.start + first_remaining_start
-                agent_audio = cut.custom['target_audio'].to_cut().truncate(
-                    offset=original_start,
-                    duration=sup.duration
-                ).load_audio()
+                agent_audio = (
+                    cut.custom['target_audio']
+                    .to_cut()
+                    .truncate(offset=original_start, duration=sup.duration)
+                    .load_audio()
+                )
                 if len(agent_audio.shape) > 1:
                     agent_audio = agent_audio.squeeze()
                 actual_end = min(end_sample, start_sample + len(agent_audio))
-                new_source_audio[start_sample:actual_end] = agent_audio[:actual_end - start_sample]
+                new_source_audio[start_sample:actual_end] = agent_audio[: actual_end - start_sample]
 
             elif sup.speaker == 'Assistant':
                 original_start = sup.start + first_remaining_start
-                user_audio = cut.recording.to_cut().truncate(
-                    offset=original_start,
-                    duration=sup.duration
-                ).load_audio()
+                user_audio = cut.recording.to_cut().truncate(offset=original_start, duration=sup.duration).load_audio()
                 if len(user_audio.shape) > 1:
                     user_audio = user_audio.squeeze()
                 actual_end = min(end_sample, start_sample + len(user_audio))
-                new_target_audio[start_sample:actual_end] = user_audio[:actual_end - start_sample]
+                new_target_audio[start_sample:actual_end] = user_audio[: actual_end - start_sample]
 
         source_buffer = BytesIO()
         sf.write(source_buffer, new_source_audio, cut.sampling_rate, format='wav')
@@ -465,11 +479,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             sampling_rate=cut.sampling_rate,
             num_samples=len(new_source_audio),
             duration=total_duration,
-            sources=[AudioSource(
-                type="memory",
-                channels=[0],
-                source=source_buffer.getvalue()
-            )]
+            sources=[AudioSource(type="memory", channels=[0], source=source_buffer.getvalue())],
         )
 
         target_buffer = BytesIO()
@@ -481,11 +491,7 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             sampling_rate=cut.sampling_rate,
             num_samples=len(new_target_audio),
             duration=total_duration,
-            sources=[AudioSource(
-                type="memory",
-                channels=[0],
-                source=target_buffer.getvalue()
-            )]
+            sources=[AudioSource(type="memory", channels=[0], source=target_buffer.getvalue())],
         )
 
         swapped_cut = MonoCut(
@@ -500,30 +506,34 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
                 'total_turns': len(adjusted_supervisions),
                 'role_swapped': True,
                 'target_audio': new_target_recording,
-            }
+            },
         )
 
         return swapped_cut
 
 
 def collate_first_turn_audio(
-        cuts: CutSet,
-        roles: set[str],
-        recording_field: str = "target_audio",
+    cuts: CutSet,
+    roles: set[str],
+    recording_field: str = "target_audio",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     first_turn_audios = []
     first_turn_audios_lens = []
     for cut in cuts:
         # Find supervisions that match the specified roles
         matching_supervisions = [s for s in cut.supervisions if s.speaker in roles]
-        
+
         if not matching_supervisions:
             # Log warning and skip this cut if no matching supervisions found
-            logging.warning(f"No supervisions found with roles {roles} for cut {cut.id}. Available speakers: {[s.speaker for s in cut.supervisions]}")
+            logging.warning(
+                f"No supervisions found with roles {roles} for cut {cut.id}. Available speakers: {[s.speaker for s in cut.supervisions]}"
+            )
             continue
-            
+
         first_supervision = matching_supervisions[0]
-        truncated_audio = cut.truncate(offset=max(0, first_supervision.start), duration=first_supervision.duration).load_custom(recording_field)
+        truncated_audio = cut.truncate(
+            offset=max(0, first_supervision.start), duration=first_supervision.duration
+        ).load_custom(recording_field)
         first_turn_audios.append(truncated_audio.squeeze(0))
         first_turn_audios_lens.append(truncated_audio.shape[-1])
 
@@ -547,7 +557,17 @@ def collate_token_channel(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     pad_id = get_pad_id(tokenizer)
     tokens = [
-        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id, bos_id=bos_id, eos_id=eos_id, word_align_position=word_align_position, remove_timestamps=remove_timestamps)
+        build_token_channel(
+            c,
+            tokenizer=tokenizer,
+            frame_length=frame_length,
+            roles=roles,
+            pad_id=pad_id,
+            bos_id=bos_id,
+            eos_id=eos_id,
+            word_align_position=word_align_position,
+            remove_timestamps=remove_timestamps,
+        )
         for c in cuts
     ]
     token_lens = torch.tensor([len(tt) for tt in tokens])
@@ -569,28 +589,30 @@ def collate_system_prompt(
         # Check if system prompt exists in custom field
         if c.custom and c.custom.get("system_prompt", None):
             prompt_text = c.custom["system_prompt"]
-            tokens.append(torch.as_tensor(
-                [tokenizer.bos] + tokenizer.text_to_ids(prompt_text) + [tokenizer.eos],
-                dtype=torch.long
-            ))
+            tokens.append(
+                torch.as_tensor(
+                    [tokenizer.bos] + tokenizer.text_to_ids(prompt_text) + [tokenizer.eos], dtype=torch.long
+                )
+            )
         else:
             # No system prompt for this cut
             tokens.append(torch.as_tensor([], dtype=torch.long))
-    
+
     token_lens = torch.tensor([len(tt) for tt in tokens])
     tokens = collate_vectors(tokens, padding_value=pad_id)
     return tokens, token_lens
 
+
 def build_token_channel(
-        cut: Cut,
-        tokenizer: TokenizerSpec,
-        frame_length: Seconds,
-        roles: set[str],
-        pad_id: int = -1,
-        bos_id: int = None,
-        eos_id: int = None,
-        word_align_position: str = 'left',
-        remove_timestamps: bool = False,
+    cut: Cut,
+    tokenizer: TokenizerSpec,
+    frame_length: Seconds,
+    roles: set[str],
+    pad_id: int = -1,
+    bos_id: int = None,
+    eos_id: int = None,
+    word_align_position: str = 'left',
+    remove_timestamps: bool = False,
 ) -> torch.Tensor:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
@@ -613,7 +635,16 @@ def build_token_channel(
             text = supervision.text
 
             # Use different bos_id for user and agent
-            text_ids = torch.as_tensor([bos_id] + _text_to_ids(text, tokenizer, available_frames_for_text=available_frames_for_text, word_align_position=word_align_position, remove_timestamps=remove_timestamps))
+            text_ids = torch.as_tensor(
+                [bos_id]
+                + _text_to_ids(
+                    text,
+                    tokenizer,
+                    available_frames_for_text=available_frames_for_text,
+                    word_align_position=word_align_position,
+                    remove_timestamps=remove_timestamps,
+                )
+            )
 
             if available_frames_for_text > 0 and len(text_ids) > available_frames_for_text:
                 # Truncate text_ids to fit before the eos position.
@@ -645,7 +676,7 @@ def build_token_channel(
 
 
 def _strip_timestamps(
-        text: str, _TIMESTAMP_PATTERN=re.compile(r"<\|\d+\|>"), _SPACE_PATTERN=re.compile(r"\s+")
+    text: str, _TIMESTAMP_PATTERN=re.compile(r"<\|\d+\|>"), _SPACE_PATTERN=re.compile(r"\s+")
 ) -> str:
     """
     Strips timestamp tokens from text, e.g. turns:
@@ -657,13 +688,19 @@ def _strip_timestamps(
     text = _TIMESTAMP_PATTERN.sub("", text)  # strip timestamp tokens if present
     return _SPACE_PATTERN.sub(" ", text).strip()  # strip multi-whitespaces
 
-def _text_to_ids(text: str, tokenizer: TokenizerSpec,
-                 _TIMESTAMP_PATTERN_STR=r"<\|(\d+)\|>",
-                 available_frames_for_text=None,
-                 word_align_position='left',
-                 remove_timestamps=False):
+
+def _text_to_ids(
+    text: str,
+    tokenizer: TokenizerSpec,
+    _TIMESTAMP_PATTERN_STR=r"<\|(\d+)\|>",
+    available_frames_for_text=None,
+    word_align_position='left',
+    remove_timestamps=False,
+):
     if not remove_timestamps and re.compile(_TIMESTAMP_PATTERN_STR).search(text):
-        text_ids = _text_with_timestamps_to_ids(text, tokenizer, _TIMESTAMP_PATTERN_STR, available_frames_for_text, word_align_position)
+        text_ids = _text_with_timestamps_to_ids(
+            text, tokenizer, _TIMESTAMP_PATTERN_STR, available_frames_for_text, word_align_position
+        )
     else:
         _TIMESTAMP_PATTERN = re.compile(_TIMESTAMP_PATTERN_STR)
         text = _TIMESTAMP_PATTERN.sub("", text)
@@ -673,18 +710,31 @@ def _text_to_ids(text: str, tokenizer: TokenizerSpec,
     return text_ids
 
 
-def _text_with_timestamps_to_ids(text: str, tokenizer: TokenizerSpec,
-                                 _TIMESTAMP_PATTERN_STR=r"<\|(\d+)\|>",
-                                 available_frames_for_text=None,
-                                 word_align_position='left') -> list[int]:
+def _text_with_timestamps_to_ids(
+    text: str,
+    tokenizer: TokenizerSpec,
+    _TIMESTAMP_PATTERN_STR=r"<\|(\d+)\|>",
+    available_frames_for_text=None,
+    word_align_position='left',
+) -> list[int]:
     text_ids = []
-    text_ids, start_times, end_times, word_lens = _extract_text_and_time_tokens(text, tokenizer, _TIMESTAMP_PATTERN_STR)
-    text_ids_with_timestamps = _expand_text_with_timestamps_and_word_lengths(text_ids, word_lens, start_times, end_times, available_frames_for_text, frame_rate=0.08, pad_id=get_pad_id(tokenizer), word_align_position=word_align_position)
+    text_ids, start_times, end_times, word_lens = _extract_text_and_time_tokens(
+        text, tokenizer, _TIMESTAMP_PATTERN_STR
+    )
+    text_ids_with_timestamps = _expand_text_with_timestamps_and_word_lengths(
+        text_ids,
+        word_lens,
+        start_times,
+        end_times,
+        available_frames_for_text,
+        frame_rate=0.08,
+        pad_id=get_pad_id(tokenizer),
+        word_align_position=word_align_position,
+    )
     return text_ids_with_timestamps
 
 
-def _extract_text_and_time_tokens(text, tokenizer: TokenizerSpec,
-                                 _TIMESTAMP_PATTERN_STR=r"<\|(\d+)\|>"):
+def _extract_text_and_time_tokens(text, tokenizer: TokenizerSpec, _TIMESTAMP_PATTERN_STR=r"<\|(\d+)\|>"):
     # Find all time tokens
     time_tokens = re.findall(_TIMESTAMP_PATTERN_STR, text)
     start_time = [int(time_tokens[i]) for i in range(0, len(time_tokens), 2)]
@@ -704,8 +754,15 @@ def _extract_text_and_time_tokens(text, tokenizer: TokenizerSpec,
 
 
 def _expand_text_with_timestamps_and_word_lengths(
-        text_ids, word_lens, start_time, end_time, available_frames_for_text, frame_rate=0.08, pad_id=None, word_align_position='left'
-    ):    
+    text_ids,
+    word_lens,
+    start_time,
+    end_time,
+    available_frames_for_text,
+    frame_rate=0.08,
+    pad_id=None,
+    word_align_position='left',
+):
     """
     Expand word tokens according to start time tokens and word lengths for a batch of sequences.
 

@@ -14,10 +14,10 @@
 import os
 import random
 import warnings
+from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Optional, Sequence, Union
-from copy import deepcopy
 
 import numpy as np
 import torch

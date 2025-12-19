@@ -424,7 +424,7 @@ class DuplexS2SModel(LightningModule, HFHubMixin):
             torch.distributed.all_reduce(T_tensor, op=torch.distributed.ReduceOp.MAX)
             T = int(T_tensor.item())
             if T > T_local:
-                last_frame = input_embeds[:, T_local - 1: T_local, :]  # (B,1,H)
+                last_frame = input_embeds[:, T_local - 1 : T_local, :]  # (B,1,H)
                 pad = last_frame.repeat(1, T - T_local, 1)  # (B, T-T_local, H)
                 input_embeds = torch.cat([input_embeds, pad], dim=1)
         else:
@@ -448,7 +448,7 @@ class DuplexS2SModel(LightningModule, HFHubMixin):
             input_embeds[:, t] += self.embed_tokens(gen_text[:, t - 1])
             for cbidx in range(self._num_codebooks):
                 input_embeds[:, t] += self.embed_audio_tokens[cbidx](gen_audio[:, t - 1, cbidx])
-            ans = self(input_embeds[:, t: t + 1], cache=ans["cache"])
+            ans = self(input_embeds[:, t : t + 1], cache=ans["cache"])
             gen_text[:, t] = ans["text_logits"].argmax(dim=-1)[:, -1]
             gen_audio[:, t] = ans["audio_logits"].argmax(dim=-1)[:, -1]
 
@@ -616,8 +616,14 @@ def replace_control_speech_codes(speech_codes: torch.Tensor, control_codes: torc
     return torch.where(torch.isin(speech_codes, control_codes), speech_codes[:, :1], speech_codes)
 
 
-def tokens_to_str(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTokenizer, pad_id: int,
-                  user_bos_id: int = None, eval_text_turn_taking: bool = False) -> list[str]:
+def tokens_to_str(
+    tokens: torch.Tensor,
+    lengths: torch.Tensor,
+    tokenizer: AutoTokenizer,
+    pad_id: int,
+    user_bos_id: int = None,
+    eval_text_turn_taking: bool = False,
+) -> list[str]:
     """
     Convert token IDs to text strings, filtering out special tokens.
 

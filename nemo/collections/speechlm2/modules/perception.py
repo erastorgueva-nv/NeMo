@@ -129,6 +129,7 @@ class AudioPerceptionModule(NeuralModule, Exportable):
         else:
             return encoded, encoded_len
 
+
 class IdentityConnector(NeuralModule, Exportable):
     """User to pass encoder's representations as-is to the LLM."""
 

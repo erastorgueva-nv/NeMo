@@ -39,7 +39,6 @@ def inference(cfg):
         model_config = OmegaConf.to_container(cfg, resolve=True)
         model = DuplexSTTModel(model_config)
 
-
     dataset = DuplexS2SDataset(
         tokenizer=model.tokenizer,
         frame_length=cfg.data.frame_length,

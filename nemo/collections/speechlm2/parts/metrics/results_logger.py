@@ -1,17 +1,17 @@
-from whisper_normalizer.english import EnglishTextNormalizer
+import glob
 import json
 import os
 import shutil
+import time
 from collections import defaultdict
 from typing import List, Optional
-import glob
-import time
 
 import torch
 import torchaudio
+from whisper_normalizer.english import EnglishTextNormalizer
 
-from nemo.utils import logging
 from nemo.collections.speechlm2.parts.metrics.mcq_evaluator import MCQEvaluator
+from nemo.utils import logging
 
 
 def safe_remove_path(path):
@@ -57,13 +57,13 @@ class ResultsLogger:
         os.makedirs(self.metadata_save_path, exist_ok=True)
         self.cached_results = defaultdict(list)
         self.normalizer = EnglishTextNormalizer()
-        
+
         # Initialize MCQ evaluator with manifest directory in the same folder
         self.mcq_evaluator = None
         # Get the directory where this file is located
         current_file_dir = os.path.dirname(os.path.abspath(__file__))
         mcq_manifest_dir = os.path.join(current_file_dir, 'manifest_files')
-        
+
         if os.path.exists(mcq_manifest_dir):
             self.mcq_evaluator = MCQEvaluator(mcq_manifest_dir)
             logging.info(f"MCQ evaluator initialized with manifest directory: {mcq_manifest_dir}")
@@ -82,8 +82,7 @@ class ResultsLogger:
 
     @staticmethod
     def merge_and_save_audio(
-            out_audio_path: str, pred_audio: torch.Tensor, pred_audio_sr: int, user_audio: torch.Tensor,
-            user_audio_sr: int
+        out_audio_path: str, pred_audio: torch.Tensor, pred_audio_sr: int, user_audio: torch.Tensor, user_audio_sr: int
     ) -> None:
         user_audio = torchaudio.functional.resample(user_audio.float(), user_audio_sr, pred_audio_sr)
         T1, T2 = pred_audio.shape[0], user_audio.shape[0]
@@ -107,26 +106,26 @@ class ResultsLogger:
     ) -> List[dict]:
         """
         Merge two lists of turns chronologically based on start_time.
-        
+
         Args:
             turns_list_1: List of turn dicts with keys: start_time, duration, role, text
             turns_list_2: List of turn dicts with keys: start_time, duration, role, text
-                         OR predicted turns with keys: start_time, end_time, duration, text, 
+                         OR predicted turns with keys: start_time, end_time, duration, text,
                          token_ids, start_token_idx, end_token_idx, num_tokens, is_complete
-        
+
         Returns:
             List of turn dicts sorted by start_time, each with role and text
         """
         all_turns = []
-        
+
         if turns_list_1:
             all_turns.extend(turns_list_1)
         if turns_list_2:
             all_turns.extend(turns_list_2)
-        
+
         # Sort by start_time
         all_turns.sort(key=lambda x: x.get('start_time', 0))
-        
+
         # Extract role and text for each turn
         merged_turns = [
             {
@@ -135,26 +134,26 @@ class ResultsLogger:
             }
             for turn in all_turns
         ]
-        
+
         return merged_turns
 
     def update(
-            self,
-            name,
-            refs,
-            hyps,
-            asr_hyps,
-            samples_id,
-            pred_audio,
-            pred_audio_sr,
-            user_audio,
-            user_audio_sr,
-            src_refs: list[str],
-            src_hyps: list[str],
-            system_prompt=None,
-            source_turns: Optional[List[List[dict]]] = None,
-            target_turns: Optional[List[List[dict]]] = None,
-            pred_turns: Optional[List[List[dict]]] = None,
+        self,
+        name,
+        refs,
+        hyps,
+        asr_hyps,
+        samples_id,
+        pred_audio,
+        pred_audio_sr,
+        user_audio,
+        user_audio_sr,
+        src_refs: list[str],
+        src_hyps: list[str],
+        system_prompt=None,
+        source_turns: Optional[List[List[dict]]] = None,
+        target_turns: Optional[List[List[dict]]] = None,
+        pred_turns: Optional[List[List[dict]]] = None,
     ):
         rank = get_rank()
 
@@ -177,32 +176,30 @@ class ResultsLogger:
             # Add conversation turns only if there are multiple user turns (multi-turn conversation)
             user_turns = source_turns[i] if source_turns is not None else None
             has_multi_turn_conversation = user_turns is not None and len(user_turns) > 1
-            
+
             if has_multi_turn_conversation and (target_turns is not None or pred_turns is not None):
                 if system_prompt is not None:
                     out_dict["system_prompt"] = system_prompt[i]
-                
+
                 conversation_turns = {}
-                
+
                 # Create ground truth conversation: source (user) + target (agent) turns
                 if target_turns is not None:
                     conversation_turns["gt_conversation"] = self.merge_turns_chronologically(
                         turns_list_1=user_turns,
                         turns_list_2=target_turns[i],
                     )
-                
+
                 # Create predicted conversation: source (user) + predicted (agent) turns
                 if pred_turns is not None:
                     conversation_turns["pred_conversation"] = self.merge_turns_chronologically(
                         turns_list_1=user_turns,
                         turns_list_2=pred_turns[i],
                     )
-                
+
                 out_dict["conversation_turns"] = conversation_turns
-            
+
             self.cached_results[name].append(out_dict)
-
-
 
     def _merge_rank_files(self, dataset_name: str) -> List[dict]:
         """
@@ -247,7 +244,9 @@ class ResultsLogger:
         # logging.info(f"Total merged results for {dataset_name}: {len(all_results)} items")
         return all_results
 
-    def compute_and_save(self, special_subset_names: Optional[List[str]] = None, mcq_subset_names: Optional[List[str]] = None):
+    def compute_and_save(
+        self, special_subset_names: Optional[List[str]] = None, mcq_subset_names: Optional[List[str]] = None
+    ):
         """
         Saves all cached results. Now supports distributed training:
         1. Each rank saves its own results with rank suffix
@@ -264,7 +263,7 @@ class ResultsLogger:
         """
         if special_subset_names is None:
             special_subset_names = ['web-qa', 'llama-qa', 'trivia-qa']
-        
+
         if mcq_subset_names is None:
             mcq_subset_names = ['openbookqa', 'mmsu']
 
@@ -333,24 +332,25 @@ class ResultsLogger:
 
                     metrics_results[name] = {'acc': torch.tensor(acc), 'empty_rate': torch.tensor(empty_rate)}
                     logging.info(
-                        f"Metrics for special subset '{name}': Accuracy={acc}, Empty Rate={empty_rate} (total samples: {total_count})")
-                
+                        f"Metrics for special subset '{name}': Accuracy={acc}, Empty Rate={empty_rate} (total samples: {total_count})"
+                    )
+
                 # Compute MCQ metrics for MCQ datasets
                 if name in mcq_subset_names and merged_results and self.mcq_evaluator:
                     try:
                         mcq_metrics = self.mcq_evaluator.evaluate(name, merged_results)
-                        
+
                         # Log empty rate info
                         empty_rate = mcq_metrics['empty_rate']
                         logging.info(
                             f"MCQ empty rate for '{name}': {empty_rate*100:.1f}% ({mcq_metrics['num_empty']}/{mcq_metrics['num_samples']})"
                         )
-                        
+
                         # Store only the accuracy metric for wandb logging
                         # Use the naming convention: [dataset name]_mcq_acc
                         metrics_results[name] = {
                             'mcq_acc': torch.tensor(mcq_metrics['acc']),
-                            'empty_rate': torch.tensor(empty_rate)
+                            'empty_rate': torch.tensor(empty_rate),
                         }
                         logging.info(
                             f"MCQ metrics for '{name}': Accuracy={mcq_metrics['acc']*100:.2f}% ({mcq_metrics['num_correct']}/{mcq_metrics['num_samples']})"

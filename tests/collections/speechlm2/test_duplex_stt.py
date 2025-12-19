@@ -45,11 +45,13 @@ def resolve_pretrained_models():
         }
 
 
-def create_model(predict_user_text=False,
-                 force_use_noise_augmentation=False,
-                 old_noise_prob=0.0,
-                 old_noise_min_snr=0.0,
-                 old_noise_max_snr=0.0):
+def create_model(
+    predict_user_text=False,
+    force_use_noise_augmentation=False,
+    old_noise_prob=0.0,
+    old_noise_min_snr=0.0,
+    old_noise_max_snr=0.0,
+):
     """Helper function to create a model with configurable settings."""
     cfg = {
         "model": {
@@ -165,10 +167,12 @@ def test_s2s_speech_decoder_training_step(model, dataset, training_cutset_batch)
     assert not torch.isnan(results["loss"])
     assert results["loss"] > 0
 
+
 @pytest.fixture(scope="function")
 def model_with_asr():
     """Model fixture with ASR head enabled."""
     return create_model(predict_user_text=True)
+
 
 def test_s2s_speech_decoder_training_step_with_asr(model_with_asr, dataset, training_cutset_batch):
     # Model is initialized with ASR head enabled
@@ -179,11 +183,12 @@ def test_s2s_speech_decoder_training_step_with_asr(model_with_asr, dataset, trai
     assert torch.is_tensor(results["loss"])
     assert not torch.isnan(results["loss"])
     assert results["loss"] > 0
-    
+
     assert "asr_loss" in results
     assert torch.is_tensor(results["asr_loss"])
     assert not torch.isnan(results["asr_loss"])
     assert results["asr_loss"] >= 0
+
 
 @pytest.fixture(scope="function")
 def model_with_noise():
@@ -198,6 +203,7 @@ def model_with_noise():
     )
     return model
 
+
 @pytest.fixture(scope="function")
 def model_with_asr_and_noise():
     """Model fixture with both ASR head and noise augmentation enabled."""
@@ -210,6 +216,7 @@ def model_with_asr_and_noise():
     )
     return model
 
+
 def test_s2s_speech_decoder_training_step_with_noise(model_with_asr_and_noise, dataset, training_cutset_batch):
     # Model is initialized with both ASR head and noise augmentation enabled
     model_with_asr_and_noise.on_train_epoch_start()
@@ -219,7 +226,7 @@ def test_s2s_speech_decoder_training_step_with_noise(model_with_asr_and_noise, d
     assert torch.is_tensor(results["loss"])
     assert not torch.isnan(results["loss"])
     assert results["loss"] > 0
-    
+
     assert "asr_loss" in results
     assert torch.is_tensor(results["asr_loss"])
     assert not torch.isnan(results["asr_loss"])
@@ -241,7 +248,16 @@ def test_s2s_speech_decoder_offline_generation(model):
         input_signal_lens=torch.tensor([16000], device=model.device),
     )
 
-    assert ans.keys() == {'text', 'src_text', 'tokens_text_src', 'tokens_text', 'tokens_audio', 'tokens_len', 'source_audio', 'source_audio_len'}
+    assert ans.keys() == {
+        'text',
+        'src_text',
+        'tokens_text_src',
+        'tokens_text',
+        'tokens_audio',
+        'tokens_len',
+        'source_audio',
+        'source_audio_len',
+    }
 
     assert isinstance(ans["text"], list)
     assert isinstance(ans["text"][0], str)

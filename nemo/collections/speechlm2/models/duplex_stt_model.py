@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 import copy
+import os
 import random
 import tempfile
 
@@ -37,18 +37,18 @@ from torch.distributed.tensor.parallel import (
 from transformers import DynamicCache
 
 from nemo.collections.audio.parts.utils.resampling import resample
-from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.common.parts.nlp_overrides import NLPSaveRestoreConnector
+from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.utils import get_pad_id
 from nemo.collections.speechlm2.models.duplex_s2s_model import tokens_to_str
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.label_prep import prepare_text_and_asr_labels
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.metrics.bleu import BLEU
-from nemo.collections.speechlm2.parts.metrics.wer import WER
+from nemo.collections.speechlm2.parts.metrics.empty_text import EmptyTextMetric
 from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
 from nemo.collections.speechlm2.parts.metrics.turn_taking import TurnTakingMetrics
-from nemo.collections.speechlm2.parts.metrics.empty_text import EmptyTextMetric
+from nemo.collections.speechlm2.parts.metrics.wer import WER
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.pretrained import (
     load_pretrained_hf,
@@ -134,15 +134,18 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             logging.info(f"Loading pretrained s2s model from {self.cfg.pretrained_s2s_model}")
             if os.path.isdir(self.cfg.pretrained_s2s_model) and self.cfg.get("incremental_loading", False):
                 # Hugging Face format
-                from safetensors import safe_open
                 import gc
-                
+
+                from safetensors import safe_open
+
                 # Load tensors incrementally to avoid OOM
                 model_state_dict = self.state_dict()
                 loaded_keys = []
                 missing_keys = []
-                
-                with safe_open(os.path.join(self.cfg.pretrained_s2s_model, "model.safetensors"), framework="pt", device="cpu") as f:
+
+                with safe_open(
+                    os.path.join(self.cfg.pretrained_s2s_model, "model.safetensors"), framework="pt", device="cpu"
+                ) as f:
                     available_keys = f.keys()
                     for key in available_keys:
                         if key in model_state_dict:
@@ -153,15 +156,15 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                             del tensor  # Free memory immediately
                         else:
                             missing_keys.append(key)
-                        
+
                         # Periodic garbage collection for very large models
                         if len(loaded_keys) % 100 == 0:
                             gc.collect()
-                
+
                 logging.info(f"Loaded {len(loaded_keys)} tensors from pretrained model")
                 if missing_keys:
                     logging.warning(f"Keys in checkpoint but not in model: {len(missing_keys)} keys")
-                
+
                 del model_state_dict
                 gc.collect()
             else:
@@ -246,14 +249,14 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         return get_pad_id(self.tokenizer)
 
     def forward(
-            self,
-            input_embeds: Tensor,
-            cache=None,
-            input_audio_tokens=None,
-            seq_mask=None,
-            target_text_tokens=None,
-            modality_adapter_emb=None,
-            speaker_encoder_emb=None,
+        self,
+        input_embeds: Tensor,
+        cache=None,
+        input_audio_tokens=None,
+        seq_mask=None,
+        target_text_tokens=None,
+        modality_adapter_emb=None,
+        speaker_encoder_emb=None,
     ) -> dict[str, Tensor]:
         """
         Text prediction only (audio_loss_weight=0).
@@ -303,21 +306,22 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         return ans
 
     def add_noise_to_batch(
-            self,
-            batch_audio,
-            noise_folder,
-            snr_db=20,
-            noise_prob_scale_user=0.3,
-            noise_prob_scale_user_min_snr=-15,
-            noise_prob_scale_user_max_snr=24,
-            snr_measure_dur=0.0,
-            noise_resample=True,
-            noise_prob_low_pass=0.1,
+        self,
+        batch_audio,
+        noise_folder,
+        snr_db=20,
+        noise_prob_scale_user=0.3,
+        noise_prob_scale_user_min_snr=-15,
+        noise_prob_scale_user_max_snr=24,
+        snr_measure_dur=0.0,
+        noise_resample=True,
+        noise_prob_low_pass=0.1,
     ):
 
         batch_size, audio_length = batch_audio.shape
 
         import glob
+
         import librosa
         import numpy as np
         import soundfile as sf
@@ -338,8 +342,8 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 if snr_measure_dur > 0:
                     signal = signal[: int(snr_measure_dur * self.source_sample_rate)]
                     noise = noise[: int(snr_measure_dur * self.source_sample_rate)]
-                signal_power = torch.mean(signal ** 2) + 1e-8
-                noise_power = torch.mean(noise ** 2) + 1e-8
+                signal_power = torch.mean(signal**2) + 1e-8
+                noise_power = torch.mean(noise**2) + 1e-8
 
                 target_noise_power = signal_power / (10 ** (snr_db / 10))
                 scaling_factor = torch.sqrt(target_noise_power / noise_power)
@@ -379,7 +383,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 noise = noise.repeat(repeat_times)[:audio_length]
             else:
                 start_idx = torch.randint(0, noise.size(0) - audio_length + 1, (1,)).item()
-                noise = noise[start_idx: start_idx + audio_length]
+                noise = noise[start_idx : start_idx + audio_length]
 
             # Function to create a low-pass filter (with caching)
             def butter_lowpass(cutoff, fs, order=5):
@@ -405,14 +409,15 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             batch_audio[i] = batch_audio[i] + noise
 
         return batch_audio
-    
+
     def _is_noise_augmentation_dataset(self, formatter: str) -> bool:
         if self.cfg.get('force_use_noise_augmentation', False):
             return True
         return formatter != 's2s_duplex_overlap_as_s2s_duplex' and formatter != 'nemo_tarred_to_duplex'
 
-    def _maybe_zero_out_scale_for_asr(self, loss_scale: torch.Tensor, text_labels: torch.Tensor,
-                                      batch: dict) -> torch.Tensor:
+    def _maybe_zero_out_scale_for_asr(
+        self, loss_scale: torch.Tensor, text_labels: torch.Tensor, batch: dict
+    ) -> torch.Tensor:
         """
         Zero out the loss scale after text_bos_id token for ASR datasets.
         """
@@ -421,17 +426,17 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 bos_indices = (text_labels[i] == self.text_bos_id).nonzero(as_tuple=True)
                 if bos_indices[0].numel() > 0:
                     bos_idx = bos_indices[0][0].item()
-                    loss_scale[i, bos_idx + 1:, :] = 0
+                    loss_scale[i, bos_idx + 1 :, :] = 0
         return loss_scale
 
-    def prepare_inputs(self, batch: dict):     
+    def prepare_inputs(self, batch: dict):
         if self.cfg.get('use_old_noise_aug', None):
             noise_prob = self.cfg.get('old_noise_prob', 0.99)
             noise_min_snr = self.cfg.get('old_noise_min_snr', 20)
             noise_max_snr = self.cfg.get('old_noise_max_snr', 50)
             noise_path = self.cfg.get('old_noise_aug_path', None)
             noise_path_name = "*"
-            
+
             if (
                 self.training
                 and self._is_noise_augmentation_dataset(batch["formatter"][0])
@@ -450,7 +455,6 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     noise_prob_low_pass=self.cfg.get('noise_prob_low_pass', 0.1),
                 )
 
-        
         source_encoded, source_encoded_lens, _ = self.perception(
             input_signal=batch["source_audio"],
             input_signal_length=batch["source_audio_lens"],
@@ -465,9 +469,12 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             T_src = source_encoded.shape[1]
             T_tgt = target_tokens.shape[1]
 
-            new_source_encoded = torch.zeros(B, max_prompt_len + T_src, H,
-                                             dtype=source_encoded.dtype, device=source_encoded.device)
-            new_target_tokens = torch.full((B, max_prompt_len + T_tgt), self.text_pad_id, dtype=target_tokens.dtype, device=target_tokens.device)
+            new_source_encoded = torch.zeros(
+                B, max_prompt_len + T_src, H, dtype=source_encoded.dtype, device=source_encoded.device
+            )
+            new_target_tokens = torch.full(
+                (B, max_prompt_len + T_tgt), self.text_pad_id, dtype=target_tokens.dtype, device=target_tokens.device
+            )
             # If source_tokens are present (used by ASR head for user text prediction),
             # prepend PADs to align ASR labels with the prompt span as well.
             if "source_tokens" in batch:
@@ -488,31 +495,35 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     new_source_encoded[i, :prompt_len, :] = prompt_embedded[i, :prompt_len, :]
 
                 src_len = source_encoded_lens[i].item()
-                new_source_encoded[i, prompt_len:prompt_len + src_len, :] = source_encoded[i, :src_len, :]
+                new_source_encoded[i, prompt_len : prompt_len + src_len, :] = source_encoded[i, :src_len, :]
 
                 tgt_len = batch["target_token_lens"][i].item()
-                new_target_tokens[i, prompt_len:prompt_len + tgt_len] = target_tokens[i, :tgt_len]
+                new_target_tokens[i, prompt_len : prompt_len + tgt_len] = target_tokens[i, :tgt_len]
 
                 source_encoded_lens[i] = prompt_len + src_len
                 batch["target_token_lens"][i] = prompt_len + tgt_len
-                
+
                 # If source_tokens exist, copy them after the prompt and update lengths
                 if "source_tokens" in batch:
                     src_len = batch["source_token_lens"][i].item()
-                    new_source_tokens[i, prompt_len:prompt_len + src_len] = source_tokens[i, :src_len]
+                    new_source_tokens[i, prompt_len : prompt_len + src_len] = source_tokens[i, :src_len]
                     batch["source_token_lens"][i] = prompt_len + src_len
-            
+
             source_encoded = new_source_encoded
             target_tokens = new_target_tokens
             if "source_tokens" in batch:
                 batch["source_tokens"] = new_source_tokens
 
         if (diff := target_tokens.shape[1] - source_encoded.shape[1]) < 0:
-            target_tokens = torch.cat([
-                target_tokens,
-                (torch.ones(source_encoded.shape[0], abs(diff), device=source_encoded.device) * self.text_pad_id).to(
-                    torch.long),
-            ], dim=-1)
+            target_tokens = torch.cat(
+                [
+                    target_tokens,
+                    (
+                        torch.ones(source_encoded.shape[0], abs(diff), device=source_encoded.device) * self.text_pad_id
+                    ).to(torch.long),
+                ],
+                dim=-1,
+            )
         elif diff > 0:
             target_tokens = target_tokens[:, : source_encoded.shape[1]]
 
@@ -562,27 +573,25 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             text_weight = token_weights.get("text", 1.0)
 
             loss_scale = torch.where(
-                text_labels.unsqueeze(-1) == self.text_pad_id, pad_weight,
+                text_labels.unsqueeze(-1) == self.text_pad_id,
+                pad_weight,
                 torch.where(
-                    text_labels.unsqueeze(-1) == self.text_bos_id, bos_weight,
-                    torch.where(
-                        text_labels.unsqueeze(-1) == self.text_eos_id, eos_weight,
-                        text_weight
-                    )
-                )
+                    text_labels.unsqueeze(-1) == self.text_bos_id,
+                    bos_weight,
+                    torch.where(text_labels.unsqueeze(-1) == self.text_eos_id, eos_weight, text_weight),
+                ),
             )
             # Don't penalize the agent replies for ASR training
             loss_scale = self._maybe_zero_out_scale_for_asr(loss_scale, text_labels, batch)
             if self.predict_user_text:
                 asr_loss_scale = torch.where(
-                    asr_labels.unsqueeze(-1) == self.text_pad_id, pad_weight,
+                    asr_labels.unsqueeze(-1) == self.text_pad_id,
+                    pad_weight,
                     torch.where(
-                        asr_labels.unsqueeze(-1) == self.user_bos_id, bos_weight,
-                        torch.where(
-                            asr_labels.unsqueeze(-1) == self.user_eos_id, eos_weight,
-                            text_weight
-                        )
-                    )
+                        asr_labels.unsqueeze(-1) == self.user_bos_id,
+                        bos_weight,
+                        torch.where(asr_labels.unsqueeze(-1) == self.user_eos_id, eos_weight, text_weight),
+                    ),
                 )
 
         ans = {
@@ -603,12 +612,15 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             if is_frozen(m):
                 m.eval()
 
-        res = {"learning_rate": torch.as_tensor(
-            self.trainer.optimizers[0].param_groups[0]['lr'] if self._trainer is not None else 0)}
+        res = {
+            "learning_rate": torch.as_tensor(
+                self.trainer.optimizers[0].param_groups[0]['lr'] if self._trainer is not None else 0
+            )
+        }
 
         if batch["audio_data"] is not None:
             inputs = self.prepare_inputs(batch["audio_data"])
-            
+
             forward_outputs = self(inputs["input_embeds"])
 
             num_frames = inputs["input_lens"].sum()
@@ -621,13 +633,14 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 if self.cfg.get("mask_sequence_loss", True):
                     text_logits = text_logits * inputs["seq_mask"][:, :, 0].unsqueeze(-1)
 
-                text_loss = (torch.nn.functional.cross_entropy(
-                                        text_logits.flatten(0, 1),
-                                        inputs["text_labels"].flatten(0, 1),
-                                        reduction="none",
-                                    )
-                                    * inputs["loss_scale"][:, :, 0].flatten(0, 1)
-                            ).sum(-1) / num_frames
+                text_loss = (
+                    torch.nn.functional.cross_entropy(
+                        text_logits.flatten(0, 1),
+                        inputs["text_labels"].flatten(0, 1),
+                        reduction="none",
+                    )
+                    * inputs["loss_scale"][:, :, 0].flatten(0, 1)
+                ).sum(-1) / num_frames
 
                 if self.predict_user_text:
                     asr_loss = (
@@ -642,7 +655,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 with torch.no_grad():
                     predicted_tokens = torch.argmax(text_logits, dim=-1)  # (B, T)
                     target_tokens = inputs["text_labels"]  # (B, T)
-                    valid_mask = (target_tokens != self.text_pad_id)
+                    valid_mask = target_tokens != self.text_pad_id
 
                     correct_predictions = (predicted_tokens == target_tokens) & valid_mask
 
@@ -652,7 +665,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                         token_accuracy = torch.tensor(0.0, device=text_logits.device)
 
                 loss = self.cfg.text_loss_weight * text_loss
-    
+
                 if self.predict_user_text:
                     loss = loss + self.cfg.get('asr_loss_weight', 1.0) * asr_loss
 
@@ -692,8 +705,9 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 }
             )
 
-        res["loss"] = (1. - self.cfg.get('text_to_text_loss_weight', 0.0)) * res.get("audio_loss", 0.0) + \
-                      self.cfg.get('text_to_text_loss_weight', 0.0) * res.get("text_to_text_loss", 0.0)
+        res["loss"] = (1.0 - self.cfg.get('text_to_text_loss_weight', 0.0)) * res.get(
+            "audio_loss", 0.0
+        ) + self.cfg.get('text_to_text_loss_weight', 0.0) * res.get("text_to_text_loss", 0.0)
         self.log_dict(res, on_step=True)
 
         return res
@@ -709,7 +723,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             eos_token_id=self.tokenizer.text_to_ids('$')[0],
             bos_token_id=self.text_bos_id,
             tolerance=13,
-            latency_multiplier=0.08
+            latency_multiplier=0.08,
         ).reset()
 
         if self.predict_user_text:
@@ -730,8 +744,9 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 self.log(f"{prefix}_{name}_acc", result_dict['acc'].to(self.device), on_epoch=True, sync_dist=True)
 
             if 'mcq_acc' in result_dict:
-                self.log(f"{prefix}_{name}_mcq_acc", result_dict['mcq_acc'].to(self.device), on_epoch=True,
-                         sync_dist=True)
+                self.log(
+                    f"{prefix}_{name}_mcq_acc", result_dict['mcq_acc'].to(self.device), on_epoch=True, sync_dist=True
+                )
 
         turn_taking_metrics = self.turn_taking_metrics.compute()
         for k, m in turn_taking_metrics.items():
@@ -772,9 +787,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
             if "source_tokens" in dataset_batch and results["tokens_text"] is not None:
                 self.turn_taking_metrics.update(
-                    name=name,
-                    source_tokens=dataset_batch["source_tokens"],
-                    pred_tokens=results["tokens_text"]
+                    name=name, source_tokens=dataset_batch["source_tokens"], pred_tokens=results["tokens_text"]
                 )
 
             pred_turns_list = self._split_agent_tokens_into_turns(results["tokens_text"])
@@ -799,6 +812,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
             if self.cfg.get("eval_text_turn_taking", False):
                 import re
+
                 results["text"] = [re.sub(r"<\|.*?\|>", "", s).strip() for s in results["text"]]
 
             if self.predict_user_text:
@@ -911,8 +925,9 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                             f"Batch {b}: Found BOS at position {t} while already in a turn "
                             f"(started at {current_turn_start}). Saving incomplete turn."
                         )
-                        _save_current_turn(current_turn_start, current_turn_tokens, end_token_idx=t - 1,
-                                           is_complete=False)
+                        _save_current_turn(
+                            current_turn_start, current_turn_tokens, end_token_idx=t - 1, is_complete=False
+                        )
 
                     in_turn = True
                     current_turn_start = t
@@ -938,21 +953,22 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     f"Batch {b}: Sequence ended while in a turn (started at {current_turn_start}). "
                     f"Saving incomplete turn."
                 )
-                _save_current_turn(current_turn_start, current_turn_tokens, end_token_idx=seq_len - 1,
-                                   is_complete=False)
+                _save_current_turn(
+                    current_turn_start, current_turn_tokens, end_token_idx=seq_len - 1, is_complete=False
+                )
 
             turns_list.append(batch_turns)
 
         return turns_list
 
     def _init_inference(
-            self,
-            input_signal: torch.Tensor,
-            input_signal_lens: torch.Tensor,
-            input_pad_len: int,
-            force_bos_positions,
-            prompt_tokens: torch.Tensor,
-            prompt_token_lens: torch.Tensor,
+        self,
+        input_signal: torch.Tensor,
+        input_signal_lens: torch.Tensor,
+        input_pad_len: int,
+        force_bos_positions,
+        prompt_tokens: torch.Tensor,
+        prompt_token_lens: torch.Tensor,
     ):
         """Initialize inference resources and prepare inputs."""
         if self.cfg.get("custom_sample_inference", None):
@@ -964,7 +980,8 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
         if force_bos_positions is not None:
             assert input_signal.shape[0] == len(
-                force_bos_positions), "force_bos_positions must have the same length as batch size"
+                force_bos_positions
+            ), "force_bos_positions must have the same length as batch size"
 
         if input_pad_len > 0:
             input_signal = torch.nn.functional.pad(input_signal, (0, input_pad_len), mode='constant', value=0)
@@ -983,8 +1000,9 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             assert B == B_prompt, f"Batch size mismatch: source={B}, prompt={B_prompt}"
             assert H == H_prompt, f"Hidden size mismatch: source={H}, prompt={H_prompt}"
 
-            new_source_encoded = torch.zeros(B, max_prompt_len + T_local, H,
-                                             dtype=source_encoded.dtype, device=source_encoded.device)
+            new_source_encoded = torch.zeros(
+                B, max_prompt_len + T_local, H, dtype=source_encoded.dtype, device=source_encoded.device
+            )
 
             for i, prompt_len in enumerate(prompt_token_lens):
                 prompt_len = prompt_len.item()
@@ -993,7 +1011,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     new_source_encoded[i, :prompt_len, :] = prompt_embedded[i, :prompt_len, :]
 
                 src_len = lengths[i].item()
-                new_source_encoded[i, prompt_len:prompt_len + src_len, :] = source_encoded[i, :src_len, :]
+                new_source_encoded[i, prompt_len : prompt_len + src_len, :] = source_encoded[i, :src_len, :]
 
                 lengths[i] = prompt_len + src_len
 
@@ -1007,7 +1025,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             dist.all_reduce(T_tensor, op=dist.ReduceOp.MAX)
             T = int(T_tensor.item())
             if T > T_local:
-                last_frame_source = source_encoded[:, T_local - 1: T_local, :]
+                last_frame_source = source_encoded[:, T_local - 1 : T_local, :]
                 pad_source = last_frame_source.repeat(1, T - T_local, 1)
                 source_encoded = torch.cat([source_encoded, pad_source], dim=1)
         else:
@@ -1037,7 +1055,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 if prompt_len > 0:
                     gen_text[i, :prompt_len] = self.text_pad_id
                     if self.predict_user_text:
-                        gen_asr[i, :prompt_len] = self.text_pad_id    
+                        gen_asr[i, :prompt_len] = self.text_pad_id
 
         input_embeds[:, 0] += self._get_bos_embedding() * self.cfg.get("duplex_text_channel_weight", 1.0)
         if self.predict_user_text:
@@ -1093,16 +1111,23 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
     def _step_inference(self, t, inference_state, ans, force_bos_positions):
         """Perform inference for one step t in the autoregressive loop."""
-        last_emb = self.embed_tokens(inference_state["gen_text"][:, t - 1]) * self.cfg.get("duplex_text_channel_weight", 1.0)
+        last_emb = self.embed_tokens(inference_state["gen_text"][:, t - 1]) * self.cfg.get(
+            "duplex_text_channel_weight", 1.0
+        )
         if self.predict_user_text:
-            last_asr_emb = self.embed_asr_tokens(inference_state["gen_asr"][:, t - 1]) * self.cfg.get("duplex_asr_text_weight", 1.0)
+            last_asr_emb = self.embed_asr_tokens(inference_state["gen_asr"][:, t - 1]) * self.cfg.get(
+                "duplex_asr_text_weight", 1.0
+            )
             last_emb += last_asr_emb
         if force_bos_positions is not None:
             for batch_idx in range(last_emb.shape[0]):
-                if force_bos_positions[batch_idx] == t and not (inference_state["gen_text"][batch_idx, :t] == self.text_bos_id).any():
+                if (
+                    force_bos_positions[batch_idx] == t
+                    and not (inference_state["gen_text"][batch_idx, :t] == self.text_bos_id).any()
+                ):
                     last_emb[batch_idx] = self.embed_tokens(
-                        torch.full((1,), fill_value=self.text_bos_id, device=self.device)) * self.cfg.get(
-                        "duplex_text_channel_weight", 1.0)
+                        torch.full((1,), fill_value=self.text_bos_id, device=self.device)
+                    ) * self.cfg.get("duplex_text_channel_weight", 1.0)
 
         inference_state["input_embeds"][:, t] += last_emb
 
@@ -1110,35 +1135,41 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
         if inference_state["use_cache"]:
             ans = self(
-                inference_state["input_embeds"][:, t: t + 1],
+                inference_state["input_embeds"][:, t : t + 1],
                 cache=ans["cache"],
                 input_audio_tokens=None,
                 seq_mask=None,
                 target_text_tokens=None,
-                modality_adapter_emb=inference_state["source_encoded"][:, t: t + 1],
+                modality_adapter_emb=inference_state["source_encoded"][:, t : t + 1],
                 speaker_encoder_emb=None,
             )
             if not is_prompt_position.all():
                 generated_tokens = ans["text_logits"][:, -1].argmax(dim=-1)
-                inference_state["gen_text"][:, t] = torch.where(is_prompt_position, inference_state["gen_text"][:, t], generated_tokens)
+                inference_state["gen_text"][:, t] = torch.where(
+                    is_prompt_position, inference_state["gen_text"][:, t], generated_tokens
+                )
         else:
             ans = self(
-                inference_state["input_embeds"][:, :t + 1],
+                inference_state["input_embeds"][:, : t + 1],
                 cache=None,
                 input_audio_tokens=None,
                 seq_mask=None,
                 target_text_tokens=None,
-                modality_adapter_emb=inference_state["source_encoded"][:, :t + 1],
+                modality_adapter_emb=inference_state["source_encoded"][:, : t + 1],
                 speaker_encoder_emb=None,
             )
             if not is_prompt_position.all():
                 generated_tokens = ans["text_logits"][:, -1].argmax(dim=-1)
-                inference_state["gen_text"][:, t] = torch.where(is_prompt_position, inference_state["gen_text"][:, t], generated_tokens)
+                inference_state["gen_text"][:, t] = torch.where(
+                    is_prompt_position, inference_state["gen_text"][:, t], generated_tokens
+                )
 
         if self.predict_user_text:
             if not is_prompt_position.all():
                 generated_asr = ans["asr_logits"][:, -1].argmax(dim=-1)
-                inference_state["gen_asr"][:, t] = torch.where(is_prompt_position, inference_state["gen_asr"][:, t], generated_asr)
+                inference_state["gen_asr"][:, t] = torch.where(
+                    is_prompt_position, inference_state["gen_asr"][:, t], generated_asr
+                )
 
         return ans
 
@@ -1162,7 +1193,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         else:
             gen_text_src = None
             src_text_cleaned = None
-        
+
         if prompt_token_lens is not None:
             max_prompt_len = prompt_token_lens.max().item()
             if max_prompt_len > 0:
@@ -1176,11 +1207,11 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     prompt_len_val = prompt_len.item()
                     actual_len = lengths[i].item() - prompt_len_val
                     if actual_len > 0:
-                        gen_text_trimmed[i, :actual_len] = gen_text[i, prompt_len_val:prompt_len_val + actual_len]
+                        gen_text_trimmed[i, :actual_len] = gen_text[i, prompt_len_val : prompt_len_val + actual_len]
                         if self.predict_user_text:
-                            gen_asr_trimmed[i, :actual_len] = gen_asr[i, prompt_len_val:prompt_len_val + actual_len]
+                            gen_asr_trimmed[i, :actual_len] = gen_asr[i, prompt_len_val : prompt_len_val + actual_len]
                     lengths_trimmed[i] = actual_len
-                
+
                 gen_text = gen_text_trimmed
                 if self.predict_user_text:
                     gen_asr = gen_asr_trimmed
@@ -1188,7 +1219,13 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 lengths = lengths_trimmed
 
         ans = {
-            "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id, eval_text_turn_taking=self.cfg.get("eval_text_turn_taking", True)),
+            "text": tokens_to_str(
+                gen_text,
+                lengths,
+                tokenizer=self.tokenizer,
+                pad_id=self.text_pad_id,
+                eval_text_turn_taking=self.cfg.get("eval_text_turn_taking", True),
+            ),
             "src_text": src_text_cleaned,
             "tokens_text_src": gen_text_src,
             "tokens_text": gen_text,
@@ -1202,21 +1239,20 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
     @torch.no_grad()
     def offline_inference(
-            self,
-            input_signal: torch.Tensor,
-            input_signal_lens: torch.Tensor,
-            decode_audio: bool = True,
-            input_pad_len: int = 0,
-            force_bos_positions=None,
-            prompt_tokens: torch.Tensor = None,
-            prompt_token_lens: torch.Tensor = None,
+        self,
+        input_signal: torch.Tensor,
+        input_signal_lens: torch.Tensor,
+        decode_audio: bool = True,
+        input_pad_len: int = 0,
+        force_bos_positions=None,
+        prompt_tokens: torch.Tensor = None,
+        prompt_token_lens: torch.Tensor = None,
     ) -> dict[str, torch.Tensor]:
         """
         Autoregressive prediction (text only).
         """
         inference_state = self._init_inference(
-            input_signal, input_signal_lens, input_pad_len,
-            force_bos_positions, prompt_tokens, prompt_token_lens
+            input_signal, input_signal_lens, input_pad_len, force_bos_positions, prompt_tokens, prompt_token_lens
         )
 
         ans, inference_state = self._step_zero(inference_state)
@@ -1303,9 +1339,11 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     hidden_size = getattr(config, 'hidden_size', None)
 
                     if all([num_attention_heads, num_key_value_heads, hidden_size]):
-                        for attr_name, val in [("num_attention_heads", num_attention_heads),
-                                               ("num_key_value_heads", num_key_value_heads),
-                                               ("hidden_size", hidden_size)]:
+                        for attr_name, val in [
+                            ("num_attention_heads", num_attention_heads),
+                            ("num_key_value_heads", num_key_value_heads),
+                            ("hidden_size", hidden_size),
+                        ]:
                             if val % tp_mesh.size() != 0:
                                 logging.warning(
                                     f"config.{attr_name}={val} is not divisible by {tp_mesh.size()=}: "
@@ -1323,10 +1361,12 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                         if hasattr(attn_layer, 'hidden_size'):
                             attn_layer.hidden_size = hidden_size // tp_mesh.size()
 
-                        logging.info(f"Configured tensor parallel for attention: "
-                                     f"heads={num_attention_heads // tp_mesh.size()}, "
-                                     f"kv_heads={num_key_value_heads // tp_mesh.size()}, "
-                                     f"hidden_size={hidden_size // tp_mesh.size()}")
+                        logging.info(
+                            f"Configured tensor parallel for attention: "
+                            f"heads={num_attention_heads // tp_mesh.size()}, "
+                            f"kv_heads={num_key_value_heads // tp_mesh.size()}, "
+                            f"hidden_size={hidden_size // tp_mesh.size()}"
+                        )
                     else:
                         raise AttributeError("Required config attributes not found")
 
@@ -1382,4 +1422,3 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             logging.info(f"Error loading model state_dict !! Retrying with partial initialization!")
             model_dict = set_model_dict_for_partial_init(state_dict, self.state_dict())
             return super().load_state_dict(model_dict, strict=False)
-

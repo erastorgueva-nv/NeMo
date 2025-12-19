@@ -40,7 +40,7 @@ def delay_eos(tokens, eos_token_id, pad_token_id, shift=10):
     new_pos = eos_pos + shift  # [N]
 
     # Filter: new position must be in bounds and not overwrite EOS or PAD
-    valid = (new_pos < T)
+    valid = new_pos < T
     if valid.any():
         b_idx = b_idx[valid]
         old_pos = eos_pos[valid]
@@ -48,7 +48,7 @@ def delay_eos(tokens, eos_token_id, pad_token_id, shift=10):
 
         # Now, check overwrite safety in new positions
         target_vals = tokens[b_idx, new_pos]
-        safe = (target_vals != eos_token_id)
+        safe = target_vals != eos_token_id
 
         if safe.any():
             b_idx = b_idx[safe]
@@ -77,14 +77,14 @@ def prepare_text_and_asr_labels(
 ):
     """
     Prepare text and ASR labels for duplex STT model training.
-    
+
     This function handles:
     - Text channel delay/advance adjustments (for speech-text alignment)
     - User text prediction with delayed source tokens (ASR channel)
     - User turn masking and agent turn boundary preservation
     - ASR head processing for conversational models
     - Tensor parallelism adjustments for distributed training
-    
+
     Args:
         batch: Dictionary containing batch data including source_tokens, target_tokens, etc.
         target_tokens: Target text tokens (B, T)
@@ -99,7 +99,7 @@ def prepare_text_and_asr_labels(
         advance_text_channel_by: Number of frames to advance text channel prediction
         use_tp: Whether tensor parallelism is enabled
         device_mesh: Device mesh for tensor parallelism
-        
+
     Returns:
         dict: Dictionary containing:
             - text_inputs: Text input tokens (B, T-1)
@@ -107,7 +107,7 @@ def prepare_text_and_asr_labels(
             - asr_inputs: ASR input tokens (B, T-1) if predict_user_text is True
             - asr_labels: ASR label tokens (B, T-1) if predict_user_text is True
     """
-    
+
     # Apply text channel delay and advance adjustments
     # move back text channel by x, in inference it advance the text channel prediction
     # it is the oposite of speech delay applied on text channel
@@ -118,13 +118,16 @@ def prepare_text_and_asr_labels(
             device=target_tokens.device,
             dtype=torch.long,
         )
-        target_tokens = torch.cat([target_tokens[:, advance_text_channel_by :], pad], dim=-1)
+        target_tokens = torch.cat([target_tokens[:, advance_text_channel_by:], pad], dim=-1)
         # make sure that eos/bos is in the place (it can cut tokens from the first advance_text_channel_by tokens and this will breaks everything)
 
     if cfg.get("delay_text_channel_by", 0) > 0:
         delay_by = cfg.get("delay_text_channel_by", 0)
 
-        eos_mask = (target_tokens == text_eos_id) & (torch.arange(target_tokens.size(1), device=target_tokens.device).unsqueeze(0) >= (target_tokens.size(1) - delay_by))
+        eos_mask = (target_tokens == text_eos_id) & (
+            torch.arange(target_tokens.size(1), device=target_tokens.device).unsqueeze(0)
+            >= (target_tokens.size(1) - delay_by)
+        )
         for i in range(target_tokens.size(0)):
             if eos_mask[i].any():
                 target_tokens[i, -(delay_by)] = text_eos_id
@@ -144,10 +147,10 @@ def prepare_text_and_asr_labels(
 
     if cfg.get("delay_text_bos_by", None):
         target_tokens = delay_eos(target_tokens, text_bos_id, text_pad_id, shift=cfg.delay_text_bos_by)
-    
+
     if predict_user_text:
         source_tokens = batch["source_tokens"]
-        
+
         if source_tokens.shape != target_tokens.shape:
             min_len = min(source_tokens.shape[1], target_tokens.shape[1])
             source_tokens = source_tokens[:, :min_len]
@@ -198,25 +201,24 @@ def prepare_text_and_asr_labels(
         if (remainder := (target_tokens.shape[1] - 1) % tp_world_size) != 0:
             target_tokens = target_tokens[:, :-remainder]
             source_encoded = source_encoded[:, :-remainder]
-    
+
     text_inputs = target_tokens[:, :-1]
     text_labels = target_tokens[:, 1:]
-    
+
     result = {
         "text_inputs": text_inputs,
         "text_labels": text_labels,
     }
-    
+
     # Split the merged text channel into asr and text channels (no overlap between them)
     if cfg.get("predict_user_text", False):
         asr_ids = target_tokens.clone()
         asr_inputs = asr_ids[:, :-1]
         asr_labels = asr_ids[:, 1:]
-        
+
         result["asr_inputs"] = asr_inputs
         result["asr_labels"] = asr_labels
 
     result["source_encoded"] = source_encoded
 
     return result
-
