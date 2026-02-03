@@ -36,7 +36,7 @@ from torch.distributed.tensor.parallel import (
 )
 from transformers import DynamicCache
 
-from nemo.collections.audio.parts.utils.resampling import resample
+from nemo.collections.audio.parts.utils.transforms import resample
 from nemo.collections.common.parts.nlp_overrides import NLPSaveRestoreConnector
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.utils import get_pad_id

@@ -29,7 +29,7 @@ from torch.distributed.tensor.parallel import (
 )
 from transformers import DynamicCache
 
-from nemo.collections.audio.parts.utils.resampling import resample
+from nemo.collections.audio.parts.utils.transforms import resample
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.utils import get_pad_id
 from nemo.collections.speechlm2.models.duplex_s2s_model import replace_control_speech_codes, tokens_to_str
@@ -284,6 +284,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         for m in (self.perception.preprocessor, self.perception.encoder, self.llm, self.speech_generation):
             if is_frozen(m):
                 m.eval()
+        # Extract audio_data from new batch format
+        if batch.get("audio_data") is not None:
+            batch = batch["audio_data"]
         inputs = self.prepare_inputs(batch)
         forward_outputs = self(
             inputs["input_embeds"],
@@ -343,6 +346,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         for name, dataset_batch in batch.items():
             if dataset_batch is None:
                 continue  # some dataset is exhausted
+
+            # Extract audio_data from new batch format
+            if isinstance(dataset_batch, dict) and dataset_batch.get("audio_data") is not None:
+                dataset_batch = dataset_batch["audio_data"]
 
             results = self.offline_inference(
                 dataset_batch["source_audio"],
