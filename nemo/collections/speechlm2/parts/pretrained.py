@@ -41,18 +41,28 @@ def load_pretrained_nemo(cls, model_path_or_name: str):
         return cls.from_pretrained(model_path_or_name)
 
 
-def load_pretrained_hf(model_path_or_name: str, pretrained_weights: bool = True, dtype=torch.float32):
+def load_pretrained_hf(
+    model_path_or_name: str, pretrained_weights: bool = True, dtype=torch.float32, trust_remote_code: bool = False
+):
     """
     Load pretrained HuggingFace AutoModelForCausalLM.
 
     Setting ``pretrained_weights=False`` returns a model that has identical architecture with the checkpoint,
     but is randomly initialized.
+
+    Args:
+        model_path_or_name: Path or name of the model to load
+        pretrained_weights: Whether to load pretrained weights (True) or random init (False)
+        dtype: Data type for the model
+        trust_remote_code: Whether to trust remote code when loading model (needed for some models like Nemotron)
     """
     if pretrained_weights:
-        return AutoModelForCausalLM.from_pretrained(model_path_or_name, torch_dtype=dtype, trust_remote_code=True)
+        return AutoModelForCausalLM.from_pretrained(
+            model_path_or_name, torch_dtype=dtype, trust_remote_code=trust_remote_code
+        )
     else:
-        config = AutoConfig.from_pretrained(model_path_or_name, trust_remote_code=True)
-        return AutoModelForCausalLM.from_config(config, torch_dtype=dtype, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(model_path_or_name, trust_remote_code=trust_remote_code)
+        return AutoModelForCausalLM.from_config(config, torch_dtype=dtype, trust_remote_code=trust_remote_code)
 
 
 @contextmanager

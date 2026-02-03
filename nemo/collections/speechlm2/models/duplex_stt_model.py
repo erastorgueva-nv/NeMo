@@ -78,7 +78,11 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         self.predict_user_text = self.cfg.get("predict_user_text", False)
 
         # Load LLM first
-        llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights).train()
+        llm = load_pretrained_hf(
+            self.cfg.pretrained_llm,
+            pretrained_weights=self.cfg.pretrained_weights,
+            trust_remote_code=self.cfg.get("trust_remote_code", True),
+        ).train()
 
         # Handle different model types with all their specific configurations
         if 'Nemotron' in self.cfg.pretrained_llm:
