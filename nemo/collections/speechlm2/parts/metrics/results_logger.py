@@ -16,11 +16,11 @@ import glob
 import json
 import os
 import shutil
-import soundfile as sf
 import time
 from collections import defaultdict
 from typing import List, Optional
 
+import soundfile as sf
 import torch
 from whisper_normalizer.english import EnglishTextNormalizer
 
@@ -52,6 +52,7 @@ Key abstraction:
     - `ResultsLogger`: A lightweight utility class that manages audio dumping
       and metadata bookkeeping across inference batches.
 """
+
 
 def safe_remove_path(path):
     shutil.rmtree(path, ignore_errors=True)
@@ -235,7 +236,8 @@ class ResultsLogger:
                     out_audio_path,
                     pred_audio[i],
                     pred_audio_sr,
-                    user_audio[i] if user_audio is not None else None, user_audio_sr
+                    user_audio[i] if user_audio is not None else None,
+                    user_audio_sr,
                 )
 
             # Save additional audio artifacts if provided (from upstream)
@@ -275,7 +277,9 @@ class ResultsLogger:
                 )
 
             if pre_audio_trimmed is not None:
-                out_audio_path_trimmed = os.path.join(self.audio_save_path, f"{name}_{sample_id}_rank{rank}_pred_trimmed.wav")
+                out_audio_path_trimmed = os.path.join(
+                    self.audio_save_path, f"{name}_{sample_id}_rank{rank}_pred_trimmed.wav"
+                )
                 sf.write(
                     out_audio_path_trimmed,
                     pre_audio_trimmed[i].squeeze().unsqueeze(0).detach().cpu().numpy().astype('float32').T,
@@ -283,7 +287,9 @@ class ResultsLogger:
                 )
 
             if reference_audio is not None:
-                out_audio_path_ref = os.path.join(self.audio_save_path, f"{name}_{sample_id}_rank{rank}_spk_reference.wav")
+                out_audio_path_ref = os.path.join(
+                    self.audio_save_path, f"{name}_{sample_id}_rank{rank}_spk_reference.wav"
+                )
                 sf.write(
                     out_audio_path_ref,
                     reference_audio[i].squeeze().unsqueeze(0).detach().cpu().numpy().astype('float32').T,
