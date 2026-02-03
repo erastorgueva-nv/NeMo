@@ -267,3 +267,46 @@ def test_s2s_speech_decoder_offline_generation(model):
     assert gen_text.dtype == torch.long
     assert (gen_text >= 0).all()
     assert (gen_text < model.text_vocab_size).all()
+
+
+def test_s2s_speech_decoder_offline_generation_regression_with_asr(model_with_asr):
+    """Test offline generation with ASR head enabled for user text prediction."""
+    # 16000 samples == 1 second == 12.5 frames ~= 14 frames after encoder padding
+    ans = model_with_asr.offline_inference(
+        input_signal=torch.randn(1, 16000, device=model_with_asr.device),
+        input_signal_lens=torch.tensor([16000], device=model_with_asr.device),
+    )
+
+    # Verify all expected output keys are present
+    assert ans.keys() == {
+        'text',
+        'src_text',
+        'tokens_text_src',
+        'tokens_text',
+        'tokens_audio',
+        'tokens_len',
+        'source_audio',
+        'source_audio_len',
+    }
+
+    # Verify agent text output
+    assert isinstance(ans["text"], list)
+    assert isinstance(ans["text"][0], str)
+
+    # Verify user text (ASR) output
+    assert isinstance(ans["src_text"], list)
+    assert isinstance(ans["src_text"][0], str)
+
+    # Verify generated text tokens
+    gen_text = ans["tokens_text"]
+    assert gen_text.shape == (1, 14)
+    assert gen_text.dtype == torch.long
+    assert (gen_text >= 0).all()
+    assert (gen_text < model_with_asr.text_vocab_size).all()
+
+    # Verify ASR tokens
+    asr_tokens = ans["tokens_text_src"]
+    assert asr_tokens.shape[0] == 1  # batch size
+    assert asr_tokens.dtype == torch.long
+    assert (asr_tokens >= 0).all()
+    assert (asr_tokens < model_with_asr.text_vocab_size).all()

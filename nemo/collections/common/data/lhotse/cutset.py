@@ -260,7 +260,11 @@ def read_txt_paths(config: DictConfig) -> tuple[CutSet, bool]:
 
 @data_type_parser("txt_jsonl")
 def read_txt_jsonl_paths(config: DictConfig) -> tuple[CutSet, bool]:
-    """Read paths to text files in JSONL format and create a CutSet."""
+    """Read paths to text files in JSONL format and create a CutSet.
+
+    This parser reads JSONL files where each line contains a JSON object with text fields.
+    The text_field parameter specifies which field in the JSON object contains the text to be used.
+    """
     cuts = CutSet(
         LhotseTextJsonlAdapter(
             paths=config.paths,
@@ -272,23 +276,6 @@ def read_txt_jsonl_paths(config: DictConfig) -> tuple[CutSet, bool]:
     )
     if not config.get("force_finite", False):
         cuts = cuts.repeat(preserve_id=True)
-    return cuts, True
-
-
-@data_type_parser("txt_jsonl")
-def read_txt_jsonl_paths(config: DictConfig) -> tuple[CutSet, bool]:
-    """Read paths to text files in JSONL format and create a CutSet."""
-    cuts = CutSet(
-        LhotseTextJsonlAdapter(
-            paths=config.paths,
-            language=config.language,
-            text_field=config.text_field,
-            shuffle_shards=config.shuffle,
-            shard_seed=config.shard_seed,
-        )
-    )
-    if not config.get("force_finite", False):
-        cuts = cuts.repeat()
     return cuts, True
 
 

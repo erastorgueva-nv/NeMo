@@ -103,7 +103,7 @@ def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True
             model.cfg.perception.preprocessor = asr.cfg.preprocessor
             model.cfg.perception.encoder = asr.cfg.encoder
             model.cfg.perception.output_dim = model.llm.config.hidden_size
-            # Override with user-specified encoder parameters
+            # Override with user-specified encoder parameters, e.g. initializiing a non-causal encoder for causal setup.
             if user_encoder_config:
                 for key, value in user_encoder_config.items():
                     if value is not None:  # Only override if user explicitly set a value

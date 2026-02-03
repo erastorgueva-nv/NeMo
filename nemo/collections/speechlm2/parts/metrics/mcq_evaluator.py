@@ -1,6 +1,17 @@
 """
 Simplified MCQ (Multiple Choice Question) evaluator for openbookqa and mmsu datasets.
-Extracted and simplified from VoiceBench evaluation system.
+
+This code is based on the VoiceBench evaluation system:
+- Repository: https://github.com/MatthewCYM/VoiceBench
+- Paper: "VoiceBench: Benchmarking LLM-Based Voice Assistants" (arXiv:2410.17196)
+  https://arxiv.org/abs/2410.17196
+- Original License: Apache-2.0
+
+Modifications for NeMo:
+- Extracted MCQ evaluation logic only (specifically the answer extraction templates)
+- Simplified for openbookqa and mmsu datasets
+- Adapted to NeMo's logging and data structures
+- Removed dependencies on VoiceBench's evaluation framework
 """
 
 import json

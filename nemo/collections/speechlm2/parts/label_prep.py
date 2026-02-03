@@ -106,6 +106,45 @@ def prepare_text_and_asr_labels(
             - text_labels: Text label tokens (B, T-1)
             - asr_inputs: ASR input tokens (B, T-1) if predict_user_text is True
             - asr_labels: ASR label tokens (B, T-1) if predict_user_text is True
+
+    Example:
+        Input conversation (simplified):
+            User: "Hello" → source_tokens: [PAD, USER_BOS, 123, 456, USER_EOS, PAD, PAD, PAD]
+            Agent: "Hi there" → target_tokens: [PAD, PAD, PAD, TEXT_BOS, 789, 101, TEXT_EOS, PAD]
+
+        With predict_user_text=True:
+            Input:
+                target_tokens: [[0, 0, 0, 2, 789, 101, 3, 0]]  # Shape: (1, 8)
+                source_tokens: [[0, 1, 123, 456, 4, 0, 0, 0]]  # From batch
+                source_encoded: Tensor of shape (1, 8, 1024)
+
+            Output:
+                {
+                    'text_inputs': [[0, 0, 0, 2, 789, 101, 3]],    # (1, 7) - agent text input
+                    'text_labels': [[0, 0, 2, 789, 101, 3, 0]],    # (1, 7) - agent text target
+                    'asr_inputs': [[0, 1, 123, 456, 3, 0, 0]],     # (1, 7) - user text input (user_eos→text_eos)
+                    'asr_labels': [[1, 123, 456, 3, 0, 0, 0]],     # (1, 7) - user text target
+                    'source_encoded': Tensor of shape (1, 8, 1024),
+                    'source_token_lens': [...],
+                    'target_token_lens': [...]
+                }
+
+        With predict_user_text=False (single channel):
+            Input:
+                target_tokens: [[2, 789, 101, 3, 0, 0, 0, 0]]  # Shape: (1, 8)
+                source_encoded: Tensor of shape (1, 8, 1024)
+
+            Output:
+                {
+                    'text_inputs': [[2, 789, 101, 3, 0, 0, 0]],    # (1, 7)
+                    'text_labels': [[789, 101, 3, 0, 0, 0, 0]],    # (1, 7)
+                    'source_encoded': Tensor of shape (1, 8, 1024)
+                }
+
+        With delay_text_channel_by=2:
+            Shifts target_tokens right by 2 positions, adding padding at start:
+                Before: [[2, 789, 101, 3, 0, 0, 0, 0]]
+                After:  [[0, 0, 2, 789, 101, 3, 0, 0]]
     """
 
     # Apply text channel delay and advance adjustments

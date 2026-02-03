@@ -116,6 +116,36 @@ The DuplexS2SModel adds speech generation capabilities to the configuration:
       perception:
         # ... (similar to SALM perception module)
 
+DuplexS2SSpeechDecoderModel Configuration
+--------------------------------------
+
+The DuplexS2SSpeechDecoderModel is similar to DuplexS2SModel, but focuses on an additional speech generation transformer decoder:
+
+.. code-block:: yaml
+
+    model:
+      # Pretrained model paths
+      pretrained_llm: "TinyLlama/TinyLlama_v1.1"
+      pretrained_audio_codec: "path/to/audio_codec.nemo"
+      pretrained_asr: "stt_en_fastconformer_hybrid_large_streaming_80ms"
+
+      # Speech decoder settings
+      speech_decoder:
+        target: nemo.collections.speechlm2.modules.speech_generation.TransformerARSpeechDecoder
+        d_model: 1024
+        n_layers: 12
+        n_heads: 16
+        d_kv: 64
+        d_ff: 4096
+        max_seq_len: 2048
+        dropout: 0.1
+        layernorm_epsilon: 1e-5
+        activation_function: "gelu_new"
+        init_method_std: 0.02
+        use_cache: True
+
+      # ... other settings
+
 DuplexSTTModel Configuration
 --------------------------------------
 
@@ -278,6 +308,7 @@ Example configurations for all model types can be found in the example directory
 
 - SALM: `examples/speechlm2/conf/salm.yaml`
 - DuplexS2SModel: `examples/speechlm2/conf/s2s_duplex.yaml`
+- DuplexS2SSpeechDecoderModel: `examples/speechlm2/conf/s2s_duplex_speech_decoder.yaml`
 - DuplexSTTModel: `examples/speechlm2/conf/s2s_duplex_stt.yaml`
 
 Using Configuration Files

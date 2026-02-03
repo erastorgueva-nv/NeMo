@@ -13,11 +13,13 @@
 # limitations under the License.
 
 import os
+
 import pytest
+import soundfile as sf
 import torch
-import torchaudio
 from lhotse import CutSet, Recording, SupervisionSegment
 from lhotse.testing.dummies import dummy_cut, dummy_recording
+from scipy import signal
 
 from nemo.collections.speechlm2.data.force_align import ForceAligner
 
@@ -36,8 +38,8 @@ def force_aligner():
 
 
 @pytest.fixture(scope="module")
-def test_cutset_real_audio(test_data_dir):
-    """Create a test cutset with real audio files, resampled to 16kHz"""
+def test_cutset_synthetic_audio(test_data_dir):
+    """Create a test cutset with TTS-generated synthetic audio files, resampled to 16kHz"""
     audio1_path = os.path.join(test_data_dir, "1.wav")
     audio2_path = os.path.join(test_data_dir, "2.wav")
 
@@ -51,18 +53,18 @@ def test_cutset_real_audio(test_data_dir):
     audio2_resampled_path = os.path.join(test_data_dir, "2_16k.wav")
 
     # Resample audio1
-    waveform1, sr1 = torchaudio.load(audio1_path)
+    waveform1, sr1 = sf.read(audio1_path)
     if sr1 != target_sample_rate:
-        resampler1 = torchaudio.transforms.Resample(orig_freq=sr1, new_freq=target_sample_rate)
-        waveform1 = resampler1(waveform1)
-    torchaudio.save(audio1_resampled_path, waveform1, target_sample_rate)
+        num_samples = int(len(waveform1) * target_sample_rate / sr1)
+        waveform1 = signal.resample(waveform1, num_samples)
+    sf.write(audio1_resampled_path, waveform1, target_sample_rate)
 
     # Resample audio2
-    waveform2, sr2 = torchaudio.load(audio2_path)
+    waveform2, sr2 = sf.read(audio2_path)
     if sr2 != target_sample_rate:
-        resampler2 = torchaudio.transforms.Resample(orig_freq=sr2, new_freq=target_sample_rate)
-        waveform2 = resampler2(waveform2)
-    torchaudio.save(audio2_resampled_path, waveform2, target_sample_rate)
+        num_samples = int(len(waveform2) * target_sample_rate / sr2)
+        waveform2 = signal.resample(waveform2, num_samples)
+    sf.write(audio2_resampled_path, waveform2, target_sample_rate)
 
     # Create recordings from resampled audio files
     rec1 = Recording.from_file(audio1_resampled_path)
@@ -104,20 +106,20 @@ def test_cutset_real_audio(test_data_dir):
         os.remove(audio2_resampled_path)
 
 
-def test_force_align_real_audio(force_aligner, test_cutset_real_audio):
-    """Test force alignment with real audio files from 1.wav and 2.wav"""
+def test_force_align_synthetic_audio(force_aligner, test_cutset_synthetic_audio):
+    """Test force alignment with TTS-generated synthetic audio files from 1.wav and 2.wav"""
     import re
 
     # Store original texts before alignment
     original_texts = {}
-    for cut in test_cutset_real_audio:
+    for cut in test_cutset_synthetic_audio:
         for sup in cut.supervisions:
             if sup.speaker == "user":
                 original_texts[sup.id] = sup.text
 
-    result_cuts = force_aligner.batch_force_align_user_audio(test_cutset_real_audio, source_sample_rate=16000)
+    result_cuts = force_aligner.batch_force_align_user_audio(test_cutset_synthetic_audio, source_sample_rate=16000)
 
-    assert len(result_cuts) == len(test_cutset_real_audio)
+    assert len(result_cuts) == len(test_cutset_synthetic_audio)
     assert len(result_cuts) == 2
 
     for cut in result_cuts:
