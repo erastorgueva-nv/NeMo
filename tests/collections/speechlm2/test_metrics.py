@@ -171,17 +171,16 @@ def test_turn_taking_import():
     eos_token_id = 4
     bos_token_id = 5
 
-    accuracy, latency = compute_turn_taking_metrics(
-        source_tokens, pred_tokens, eos_token_id, bos_token_id
-    )
+    accuracy, latency = compute_turn_taking_metrics(source_tokens, pred_tokens, eos_token_id, bos_token_id)
     assert isinstance(accuracy, float)
     assert isinstance(latency, float)
 
 
 def test_mcq_evaluator_import():
     """Test that MCQ evaluator can be imported and initialized"""
-    from nemo.collections.speechlm2.parts.metrics.mcq_evaluator import MCQEvaluator
     import tempfile
+
+    from nemo.collections.speechlm2.parts.metrics.mcq_evaluator import MCQEvaluator
 
     with tempfile.TemporaryDirectory() as tmpdir:
         evaluator = MCQEvaluator(manifest_dir=tmpdir)
@@ -191,9 +190,10 @@ def test_mcq_evaluator_import():
 
 def test_results_logger_import():
     """Test that results logger can be imported"""
+    import tempfile
+
     from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
 
-    import tempfile
     with tempfile.TemporaryDirectory() as tmpdir:
         logger = ResultsLogger(save_path=tmpdir)
         assert logger is not None
@@ -202,14 +202,17 @@ def test_results_logger_import():
 def test_results_logger_single_rank(tmp_path):
     """Test ResultsLogger with single rank (non-distributed)"""
     from unittest.mock import patch
+
     from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
 
     save_path = str(tmp_path / "single_rank")
 
     # Mock distributed functions to simulate single rank
-    with patch('nemo.collections.speechlm2.parts.metrics.results_logger.get_rank', return_value=0), \
-         patch('nemo.collections.speechlm2.parts.metrics.results_logger.get_world_size', return_value=1), \
-         patch('torch.distributed.is_available', return_value=False):
+    with (
+        patch('nemo.collections.speechlm2.parts.metrics.results_logger.get_rank', return_value=0),
+        patch('nemo.collections.speechlm2.parts.metrics.results_logger.get_world_size', return_value=1),
+        patch('torch.distributed.is_available', return_value=False),
+    ):
 
         logger = ResultsLogger(save_path=save_path)
 
@@ -233,6 +236,7 @@ def test_results_logger_single_rank(tmp_path):
 
         # Check that files were created
         import os
+
         metadata_path = os.path.join(save_path, "metadatas", "test_dataset_rank0.json")
         assert os.path.exists(metadata_path)
 
@@ -243,21 +247,24 @@ def test_results_logger_single_rank(tmp_path):
 
 def test_results_logger_multi_rank(tmp_path):
     """Test ResultsLogger with multiple ranks (simulated distributed training)"""
-    from unittest.mock import patch, MagicMock
-    from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
     import json
     import os
+    from unittest.mock import MagicMock, patch
+
+    from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
 
     save_path = str(tmp_path / "multi_rank")
     world_size = 4
 
     # Simulate each rank saving its own results
     for rank in range(world_size):
-        with patch('nemo.collections.speechlm2.parts.metrics.results_logger.get_rank', return_value=rank), \
-             patch('nemo.collections.speechlm2.parts.metrics.results_logger.get_world_size', return_value=world_size), \
-             patch('torch.distributed.is_available', return_value=True), \
-             patch('torch.distributed.is_initialized', return_value=True), \
-             patch('torch.distributed.barrier'):  # Mock barrier to avoid actual distributed ops
+        with (
+            patch('nemo.collections.speechlm2.parts.metrics.results_logger.get_rank', return_value=rank),
+            patch('nemo.collections.speechlm2.parts.metrics.results_logger.get_world_size', return_value=world_size),
+            patch('torch.distributed.is_available', return_value=True),
+            patch('torch.distributed.is_initialized', return_value=True),
+            patch('torch.distributed.barrier'),
+        ):  # Mock barrier to avoid actual distributed ops
 
             logger = ResultsLogger(save_path=save_path)
 
@@ -285,12 +292,14 @@ def test_results_logger_multi_rank(tmp_path):
                     fout.write(json.dumps(item, ensure_ascii=False) + '\n')
 
     # Now simulate rank 0 merging all results
-    with patch('nemo.collections.speechlm2.parts.metrics.results_logger.get_rank', return_value=0), \
-         patch('nemo.collections.speechlm2.parts.metrics.results_logger.get_world_size', return_value=world_size), \
-         patch('torch.distributed.is_available', return_value=True), \
-         patch('torch.distributed.is_initialized', return_value=True), \
-         patch('torch.distributed.barrier'), \
-         patch('torch.distributed.broadcast_object_list'):  # Mock broadcast
+    with (
+        patch('nemo.collections.speechlm2.parts.metrics.results_logger.get_rank', return_value=0),
+        patch('nemo.collections.speechlm2.parts.metrics.results_logger.get_world_size', return_value=world_size),
+        patch('torch.distributed.is_available', return_value=True),
+        patch('torch.distributed.is_initialized', return_value=True),
+        patch('torch.distributed.barrier'),
+        patch('torch.distributed.broadcast_object_list'),
+    ):  # Mock broadcast
 
         logger = ResultsLogger(save_path=save_path)
         # Manually set cached_results to simulate what rank 0 would have
@@ -312,12 +321,13 @@ def test_results_logger_multi_rank(tmp_path):
 
 def test_results_logger_rank_file_wait(tmp_path):
     """Test that rank 0 waits for other ranks' files"""
-    from unittest.mock import patch
-    from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
-    import os
     import json
+    import os
     import threading
     import time
+    from unittest.mock import patch
+
+    from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
 
     save_path = str(tmp_path / "wait_test")
     os.makedirs(os.path.join(save_path, "metadatas"), exist_ok=True)
@@ -341,8 +351,10 @@ def test_results_logger_rank_file_wait(tmp_path):
     thread.start()
 
     # Rank 0 tries to merge - should wait for rank 1's file
-    with patch('nemo.collections.speechlm2.parts.metrics.results_logger.get_rank', return_value=0), \
-         patch('nemo.collections.speechlm2.parts.metrics.results_logger.get_world_size', return_value=world_size):
+    with (
+        patch('nemo.collections.speechlm2.parts.metrics.results_logger.get_rank', return_value=0),
+        patch('nemo.collections.speechlm2.parts.metrics.results_logger.get_world_size', return_value=world_size),
+    ):
 
         logger = ResultsLogger(save_path=save_path)
         merged_results = logger._merge_rank_files("test_dataset")
