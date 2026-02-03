@@ -396,6 +396,7 @@ def test_results_logger_merge_turns_chronologically():
     assert merged[0]["role"] == "user"
     assert merged[1]["role"] == "agent"
 
+
 def test_intelligibility():
     metric = Intelligibility(pretrained_asr=None, verbose=False, reuse_asr_hyps=True)
     metric.update(
