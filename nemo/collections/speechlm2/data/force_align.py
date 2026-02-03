@@ -89,8 +89,7 @@ class ForceAligner:
             # Calculate output timestep duration
             try:
                 self.output_timestep_duration = (
-                    self.asr_model.cfg['preprocessor']['window_stride']
-                    * self.asr_model.encoder.subsampling_factor
+                    self.asr_model.cfg['preprocessor']['window_stride'] * self.asr_model.encoder.subsampling_factor
                 )
             except Exception as e:
                 # Default fallback based on typical FastConformer settings
@@ -169,9 +168,7 @@ class ForceAligner:
                 if alignment_result is not None:
                     # Convert alignment to timestamped text
                     original_text = supervision.text
-                    timestamped_text = self._convert_alignment_to_timestamped_text(
-                        alignment_result, original_text
-                    )
+                    timestamped_text = self._convert_alignment_to_timestamped_text(alignment_result, original_text)
                     supervision.text = timestamped_text
                     success_count += 1
                 else:
