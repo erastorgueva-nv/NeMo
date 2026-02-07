@@ -1,0 +1,148 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from dataclasses import dataclass, field
+from typing import List, Any, Optional
+
+import torch
+from nemo.collections.asr.inference.utils.text_segment import Word
+
+
+@dataclass
+class S2SStreamingState:
+	"""
+	State for streaming speech generation.
+
+	This dataclass stores streaming tensors and counters used during
+	incremental generation. It keeps initialization metadata so it can be
+	reset to a clean state on demand.
+	"""
+	# Initialization metadata (required)
+	device: torch.device
+	dtype: torch.dtype
+	max_len: int
+	num_audio_codebooks: int
+	output_sample_rate: int
+
+	# Runtime tensors (initialized in __post_init__)
+	audio_buffer: torch.Tensor = field(init=False)
+	generated_text_tokens: torch.Tensor = field(init=False)
+	generated_audio_tokens: torch.Tensor = field(init=False)
+	speech_state: torch.Tensor = field(init=False)
+
+	# Counters
+	counter: int = 0
+	context_length: int = 1 # TODO - make this variable
+	# Accumulated text output
+	output_text_str: str = ""
+	output_text_tokens: List[str] = field(default_factory=list)
+	# Accumulated ASR text output
+	output_asr_text_str: str = ""
+	output_asr_text_tokens: List[str] = field(default_factory=list)
+	# Accumulated words with timings
+	output_words: List[Word] = field(default_factory=list)
+
+	def __post_init__(self) -> None:
+		"""Allocate tensors lazily based on provided metadata."""
+		with torch.no_grad():
+			# Empty 2D buffer: shape (1, 0). Will be appended over time.
+			self.audio_buffer = torch.empty((1, 0), device=self.device, dtype=self.dtype)
+			# Token tensors as fixed-size workspaces
+			self.generated_text_tokens = torch.empty(
+				1, self.max_len, device=self.device, dtype=torch.long
+			)
+			self.generated_audio_tokens = torch.empty(
+				1, self.max_len, self.num_audio_codebooks, device=self.device, dtype=torch.long
+			)
+			self.speech_state = torch.zeros(1, device=self.device, dtype=torch.long)
+
+	def reset(self) -> None:
+		"""Reset all tensors and counters to their initial state."""
+		with torch.no_grad():
+			self.audio_buffer = torch.empty((1, 0), device=self.device, dtype=self.dtype)
+			self.generated_text_tokens.zero_()
+			self.generated_audio_tokens.zero_()
+			self.speech_state.zero_()
+			self.counter = 0
+			self.context_length = 1
+			self.output_text_str = ""
+			self.output_text_tokens.clear()
+			self.output_asr_text_str = ""
+			self.output_asr_text_tokens.clear()
+			self.output_words.clear()
+
+	def update_state(self, processed_frames: torch.Tensor, output_text_tokens: Any = None, output_text: str | None = None, output_asr_text: str | None = None) -> None:
+		"""Append new audio to the right of the buffer; token/text args are accepted for API compatibility."""
+		if processed_frames is None:
+			return
+		if not isinstance(processed_frames, torch.Tensor):
+			raise TypeError("processed_frames must be a torch.Tensor")
+		with torch.no_grad():
+			# Ensure 2D [1, T] layout by flattening extra dims
+			append_tensor = processed_frames
+			if append_tensor.dim() > 1:
+				append_tensor = append_tensor.reshape(1, -1)
+			elif append_tensor.dim() == 1:
+				append_tensor = append_tensor.unsqueeze(0)
+			prior_samples = int(self.audio_buffer.shape[-1])
+			appended_samples = int(append_tensor.shape[-1])
+			self.audio_buffer = torch.cat([self.audio_buffer, append_tensor.to(self.device, dtype=self.dtype)], dim=-1)
+			self.counter += 1
+
+		# Accumulate text output if provided and create a Word with naive timing
+		if isinstance(output_text, str) and output_text:
+			self.output_text_tokens.append(output_text) # TODO - append token ids instead of strings?
+			# Directly concatenate - spacing is already handled by tokenizer (Ġ → space)
+			self.output_text_str += output_text
+			try:
+				if appended_samples > 0 and self.output_sample_rate > 0:
+					start_t = float(prior_samples) / float(self.output_sample_rate)
+					end_t = float(prior_samples + appended_samples) / float(self.output_sample_rate)
+					self.output_words.append(Word(text=output_text, start=start_t, end=end_t, conf=1.0))
+			except Exception:
+				pass
+		
+		if isinstance(output_asr_text, str) and output_asr_text:
+			self.output_asr_text_tokens.append(output_asr_text)
+			self.output_asr_text_str += output_asr_text
+
+	@property
+	def speech_frames(self) -> List[torch.Tensor]:
+		"""Backward-compatible view for code expecting a list of chunks."""
+		return [self.audio_buffer]
+
+	def get_processed_frames(self) -> List[torch.Tensor]:
+		"""Return a copy-like view of accumulated audio."""
+		return [self.audio_buffer.clone()]
+
+	def get_output_text_tokens(self) -> List[Any]:
+		"""Return accumulated text tokens (strings)."""
+		return list(self.output_text_tokens)
+
+	def get_output_text(self) -> str:
+		"""Return accumulated text as a single string."""
+		return self.output_text_str
+
+	def get_output_asr_text(self) -> str:
+		"""Return accumulated ASR text as a single string."""
+		return self.output_asr_text_str
+
+	def get_output_words(self) -> List[Word]:
+		"""Return accumulated words with timings."""
+		return list(self.output_words)
+
+	def cleanup_after_response(self) -> None:
+		"""Clear transient audio; keep token workspaces allocated."""
+		with torch.no_grad():
+			self.audio_buffer = torch.empty((1, 0), device=self.device, dtype=self.dtype)

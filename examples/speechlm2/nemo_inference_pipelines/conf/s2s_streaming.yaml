@@ -1,0 +1,88 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Runtime args (overridden via CLI)
+# audio_file: "/path/to/your/audio_or_directory"
+audio_file: ???
+output_filename: ./generated/output.json
+output_ctm_dir: ./generated/ctm
+
+pipeline_type: s2s_streaming
+
+# S2S model block
+s2s:
+  model_path: ???
+  llm_checkpoint_path: ???
+  speaker_reference: ???
+  engine_type: ??? # Engine type: 'native' or 'vllm_llm' or 'vllm_eartts' or 'vllm_llm_vllm_eartts'
+  vllm_llm_config:
+    model_path: ${s2s.model_path}             # Inherits from s2s.model_path
+    max_model_len: 8192                       # Maximum sequence length for vLLM
+    gpu_memory_utilization: 0.35               # GPU memory utilization (0.0-1.0)
+    dtype: bfloat16                           # Data type for vLLM inference
+    engine_path: null                         # Path to vLLM engine (null = auto-convert if needed)
+    pretrained_llm: ${s2s.llm_checkpoint_path}  # Inherits from s2s.llm_checkpoint_path
+  
+  vllm_tts_config:
+    model_path: ${s2s.vllm_llm_config.model_path}             # Inherits from s2s.model_path
+    max_model_len: ${s2s.vllm_llm_config.max_model_len}
+    gpu_memory_utilization: ${s2s.vllm_llm_config.gpu_memory_utilization}
+    dtype: float32                              # EarTTS requires float32 for proper audio quality (bfloat16 causes hallucinations)
+    engine_path: null
+    pretrained_llm: null
+    skip_tokenizer_init: true
+
+  device: cuda 
+  # ========================
+  # Device Configuration
+  # ========================
+  device_id: 0                                # GPU device ID
+  compute_dtype: bfloat16                     # Compute precision: 'bfloat16' for Ampere+, 
+                                              #                    'float16' for older GPUs 
+                                              #                    'float32'
+  # ========================
+  # Inference settings
+  # ========================
+  codec_token_history_size: 98
+  use_perception_cache: false                  # Enable cache-aware streaming for perception encoder
+  use_perception_cudagraph: false              # Enable CUDA graph-accelerated perception encoder  
+
+  top_p: 1.0
+  repetition_penalty: 1.0
+  force_turn_taking: true
+  force_turn_taking_threshold: 40
+  force_turn_taking_pad_window: 25
+
+
+  system_prompt: ???
+
+
+
+# ========================
+# Pipeline settings
+# ========================
+matmul_precision: high                     # Matrix multiplication precision: highest, high, medium
+
+streaming:
+  input_sample_rate: 16000                          # Audio sample rate in Hz
+  output_sample_rate: 22050                          # Audio sample rate in Hz
+  batch_size: 1                               # Number of audio frames per batch
+  att_context_size: [70,0]                    # Attention context size: [70,13],[70,6],[70,2],[70,0]
+  #use_cache: true                             # Whether to use cache for streaming
+  #use_feat_cache: true                        # Whether to cache mel-spec features, set false to re-calculate all mel-spec features in audio buffer
+  #window_size: 510                            # FFT window length
+  chunk_size_in_secs: ???                    # Needs to be multiple of 80ms
+  buffer_size_in_secs: ???                    # Audio buffer size in seconds (larger = more context, better quality)
+  request_type: frame                         # Type of request: frame, only frame is supported for cache-aware streaming
+  max_len: 8192                               # 
