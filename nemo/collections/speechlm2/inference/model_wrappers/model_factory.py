@@ -263,9 +263,20 @@ class VllmLLMModel(ModelInterface):
         self._dtype = dtype
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Force greedy decoding in vLLM by setting temperature=0 if not specified
-        if 'temperature' not in sampling_kwargs:
-            sampling_kwargs['temperature'] = 0.0
+        # Configure vLLM sampling to match _sample_text_token behavior
+        # If top_p < 1.0 or repetition_penalty != 1.0, enable sampling
+        if top_p < 1.0 or repetition_penalty != 1.0:
+            # Need temperature > 0 for top_p to take effect
+            if 'temperature' not in sampling_kwargs:
+                sampling_kwargs['temperature'] = 1.0
+            if 'top_p' not in sampling_kwargs:
+                sampling_kwargs['top_p'] = top_p
+            if 'repetition_penalty' not in sampling_kwargs:
+                sampling_kwargs['repetition_penalty'] = repetition_penalty
+        else:
+            # Greedy decoding (temperature=0)
+            if 'temperature' not in sampling_kwargs:
+                sampling_kwargs['temperature'] = 0.0
 
         if engine_path is None:
             # convert model to vLLM format if needed
@@ -368,7 +379,8 @@ class VllmLLMModel(ModelInterface):
 
     def __call__(
         self,
-        input_embeds: torch.Tensor,
+        acoustic_embeds: torch.Tensor,
+        asr_token_ids: Optional[torch.Tensor] = None,
         request_id: Optional[str] = "request_id_1",
         **kwargs
     ) -> Dict[str, Any]:
@@ -376,12 +388,14 @@ class VllmLLMModel(ModelInterface):
         Perform inference using vLLM streaming engine.
 
         Args:
-            inputs:
-            cache: Optional cache object (currently not used for streaming)
-            generated_tokens: Optional tensor of generated tokens
-            current_step: Current decoding step
+            acoustic_embeds: Acoustic embeddings from perception [batch, seq_len, hidden_dim]
+            asr_token_ids: Previous ASR token IDs [batch, seq_len] (pad_id at t=0, gen_asr[t-1] at t>0)
             request_id: Unique request identifier for this generation
-            **kwargs: Additional model-specific arguments
+            **kwargs: Additional model-specific arguments including:
+                - generated_tokens: Optional tensor of generated tokens (for repetition penalty)
+                - current_step: Current decoding step
+                - decode_steps: Number of decoding steps (default: 1)
+                - prompt_token_ids: Optional list of prompt token IDs for prefill
 
         Returns:
             Dictionary containing:
@@ -391,15 +405,20 @@ class VllmLLMModel(ModelInterface):
                 - is_finished: Whether generation is complete
                 - request_id: The request identifier
         """
+        # Package inputs for processing
+        inputs = {
+            "acoustic_embeds": acoustic_embeds,
+            "asr_token_ids": asr_token_ids,
+        }
         # Run async inference
         result = self._loop.run_until_complete(
-            self._async_inference(input_embeds, request_id, **kwargs)
+            self._async_inference(inputs, request_id, **kwargs)
         )
         return result
 
     async def _async_inference(
         self,
-        inputs: Union[torch.Tensor, list[torch.Tensor]],
+        inputs: Dict[str, torch.Tensor],
         request_id: str,
         **kwargs
     ) -> Dict[str, Any]:
@@ -407,12 +426,14 @@ class VllmLLMModel(ModelInterface):
         Async inference using the streaming engine.
 
         Args:
-            input_embeds: Input embeddings [batch, seq_len, hidden_dim]
+            inputs: Dictionary containing:
+                - acoustic_embeds: [batch, seq_len, hidden_dim]
+                - asr_token_ids: [batch, seq_len]
             request_id: Unique request identifier
-            seq_len: Number of decoding steps to perform
+            **kwargs: Additional arguments (decode_steps, prompt_token_ids, etc.)
 
         Returns:
-            Dictionary with text_logits and other outputs
+            Dictionary with predicted tokens and other outputs
         """
         # Check request status and restart if needed
         from nemo.collections.speechlm2.inference.vllm.streaming_llm_engine import StreamStatus
@@ -434,86 +455,95 @@ class VllmLLMModel(ModelInterface):
                 # Start fresh
                 await self.engine.start_generation(request_id=request_id)
 
-        # Process embeddings to generate tokens
+        # Process inputs to generate tokens
         return await self._process_inputs_to_outputs(inputs, request_id, **kwargs)
 
     async def _process_inputs_to_outputs(
         self,
-        input_embeds: torch.Tensor,
+        inputs: Dict[str, torch.Tensor],
         request_id: str,
         decode_steps: int = 1,
         prompt_token_ids: Optional[list] = None,
-        generated_tokens: Optional[torch.Tensor] = None,
-        current_step: int = 0
+        **kwargs
     ) -> Dict[str, Any]:
         """
-        Process embeddings sequentially to generate text and ASR tokens.
+        Process inputs sequentially to generate text and ASR tokens.
 
         Args:
-            input_embeds: Input embeddings [batch, seq_len, hidden_dim]
+            inputs: Dictionary containing:
+                - acoustic_embeds: [batch, seq_len, hidden_dim] - acoustic embeddings
+                - asr_token_ids: [batch, seq_len] - previous ASR token IDs
             request_id: Request identifier
             decode_steps: Number of decoding steps to perform; decode steps = 0 means prefill
             prompt_token_ids: Optional list of prompt token IDs for prefill
-            generated_tokens: Previously generated tokens [batch, num_generated].
-                             Required for repetition_penalty. If None, creates empty tensor.
-            current_step: Current decoding step. Used for repetition penalty.
         """
+        acoustic_embeds = inputs["acoustic_embeds"]
+        asr_token_ids_input = inputs["asr_token_ids"]
 
         if decode_steps == 0:
             # prefill only, no token generation
-            input_embeds = input_embeds.flatten(0, 1)  # [seq_len, hidden_dim]
-            result = await self.engine.generate_next_token([input_embeds],
-                                                            prompt_token_ids,
-                                                            request_id=request_id)
+            # Flatten batch dimension for prefill
+            acoustic_flat = acoustic_embeds.flatten(0, 1)  # [seq_len, hidden_dim]
+            asr_flat = asr_token_ids_input.flatten(0, 1)  # [seq_len]
+            input_tensors = [acoustic_flat, asr_flat]
+
+            result = await self.engine.generate_next_token(
+                input_tensors,
+                prompt_token_ids,
+                request_id=request_id
+            )
             return True if result is not None else False
 
-        # Process each embedding in sequence
-        text_token_ids = []
-        asr_token_ids = []
+        # Process each step in sequence
+        text_token_ids_out = []
+        asr_token_ids_out = []
         result = None
         for i in range(decode_steps):
-            # Extract single embedding [1, hidden_dim]
-            single_embed = input_embeds[:, i:i+1, :].squeeze(1)  # [batch, hidden_dim]
+            # Extract single step inputs
+            # acoustic_embeds: [batch, seq_len, hidden_dim] -> [1, hidden_dim]
+            # Keep 2D so engine length is 1, not hidden_dim.
+            single_acoustic = acoustic_embeds[:, i:i+1, :].squeeze(0)  # [1, hidden_dim]
+
+            # asr_token_ids: [batch, seq_len] -> [1] (keep 1D, not scalar)
+            single_asr_tok = asr_token_ids_input[:, i:i+1].squeeze(0) # [1]
+
+            # Build input tensors list: [acoustic_embeds, asr_token_ids]
+            # text_token_ids comes from vLLM's regular sampling (input_ids), not as custom input
+            input_tensors = [single_acoustic, single_asr_tok]
 
             # Generate next token
-            result = await self.engine.generate_next_token([single_embed], request_id=request_id)
+            # vLLM handles text token sampling internally and returns it in result.token_id
+            result = await self.engine.generate_next_token(input_tensors, request_id=request_id)
             if result is None:
                 # No token generated (finished or error)
                 break
 
-            text_token_ids.append(result.token_id)
-            asr_token_ids.append(result.custom_outputs["asr_tokens"])  # Assuming custom_outputs contains asr tokens
+            # text token comes from vLLM's regular output (sampled internally)
+            text_token_ids_out.append(result.token_id)
+            # asr token comes from custom output (always greedy/argmax)
+            asr_token_ids_out.append(result.custom_outputs["asr_tokens"])
 
             if result.is_finished:
                 break
 
-        assert len(text_token_ids) <= decode_steps, "Generated more tokens than input embeddings"
+        assert len(text_token_ids_out) <= decode_steps, "Generated more tokens than input steps"
         # Handle case when no tokens were generated
         is_finished = False
-        if text_token_ids:
-            is_finished = len(text_token_ids) < decode_steps or (result and result.is_finished)
+        if text_token_ids_out:
+            is_finished = len(text_token_ids_out) < decode_steps or (result and result.is_finished)
 
-        text_logits = result.custom_outputs["text_logits"] if result else None
-
-        predicted_token = text_token_ids[-1]
-        if self.top_p < 1.0 or self.repetition_penalty != 1.0:
-            # Use provided generated_tokens or create empty tensor
-            batch_size = text_logits.shape[0]
-            if generated_tokens is None:
-                gen_tokens = torch.empty(batch_size, 0, device=text_logits.device, dtype=torch.long)
-            else:
-                gen_tokens = generated_tokens
-
-            # Apply sampling with top-p and repetition penalty
-            predicted_token = self._sample_text_token(
-                logits=text_logits,
-                generated_tokens=gen_tokens,
-                current_step=current_step,
+        if not text_token_ids_out:
+            raise RuntimeError(
+                f"vLLM did not return any tokens for request {request_id} "
+                f"(decode_steps={decode_steps})."
             )
+
+        # Use vLLM's token directly - sampling is handled by vLLM's SamplingParams
+        predicted_token = text_token_ids_out[-1]
 
         return {
             "predicted_token": predicted_token,
-            "asr_predicted_token": asr_token_ids[-1],
+            "asr_predicted_token": asr_token_ids_out[-1],
             "cache": None,  # vLLM manages cache internally
             "is_finished": is_finished,
             "request_id": request_id

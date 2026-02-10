@@ -1311,62 +1311,64 @@ class RealtimeStreamingInference:
             base_frame_index = max(base_frame_index, 0)
 
         new_input_embeds = []
+        pad_id = self.model.stt_model.text_pad_id
+
         for chunk_offset in range(num_frames_per_inference):
             current_frame_idx = frame_idx + chunk_offset
             current_frame_index = base_frame_index + chunk_offset
             current_frame_index = min(current_frame_index, total_encoded_frames - 1)
             current_frame_embedding = source_encoded[:, current_frame_index:current_frame_index + 1, :]
 
-            current_input_emb = current_frame_embedding.clone()
-
-            if current_frame_idx == 0 and not has_prompt:
-                # Only add BOS if there's no prompt (BOS is already in prompt's position 0)
-                current_input_emb += self._get_bos_embedding()
-                current_input_emb += self._get_asr_bos_embedding()
-            elif current_frame_idx == 0 and has_prompt:
-                # With prompt: first audio frame uses pad embedding (like offline_inference)
-                # gen_text[:, -1] from prompt positions is pad_id
-                pad_id = self.model.stt_model.text_pad_id
-                pad_token = torch.full((1,), fill_value=pad_id, device=self.device, dtype=torch.long)
-                pad_emb = self.model.stt_model.embed_tokens(pad_token).to(dtype=self.dtype)
-                pad_asr_emb = self.model.stt_model.embed_asr_tokens(pad_token).to(dtype=self.dtype)
-                current_input_emb += pad_emb
-                current_input_emb += pad_asr_emb
+            # Determine ASR token ID for this step
+            # At t=0: use pad_id
+            # At t>0: use previous generated ASR token
+            # Note: text_token_ids are handled by vLLM internally via input_ids (from previous sampling)
+            if current_frame_idx == 0:
+                asr_token_id = torch.full((1, 1), fill_value=pad_id, device=self.device, dtype=torch.long)
             else:
-                # t > 0: add embeddings from model's own predictions at t-1
-                last_token_emb = self.model.stt_model.embed_tokens(gen_text[:, current_frame_idx - 1])
-                current_input_emb += last_token_emb
-                last_asr_token_emb = self.model.stt_model.embed_asr_tokens(gen_asr_text[:, current_frame_idx - 1])
-                current_input_emb += last_asr_token_emb
+                asr_token_id = gen_asr_text[:, current_frame_idx - 1:current_frame_idx]  # [1, 1]
 
             start_stt_model = time.time()
 
-            if use_cache or self.use_vllm_llm:
-                if self.use_vllm_llm:
-                    # vLLM requires request_id
-                    ans = self.model_llm_interface(
-                        current_input_emb,
-                        request_id=effective_request_id,
-                        generated_tokens=gen_text,
-                        current_step=current_frame_idx
-                    )
+            if self.use_vllm_llm:
+                # vLLM: pass acoustic_embeds and asr_token_ids
+                # text_token_ids come from vLLM's regular sampling (input_ids)
+                # Embedding combination happens inside the vLLM model
+                ans = self.model_llm_interface(
+                    acoustic_embeds=current_frame_embedding,
+                    asr_token_ids=asr_token_id,
+                    request_id=effective_request_id,
+                )
+                dynamic_cache = ans["cache"]
+            else:
+                # Native: compute combined embedding here
+                current_input_emb = current_frame_embedding.clone()
+                if current_frame_idx == 0:
+                    current_input_emb += self._get_bos_embedding()
+                    current_input_emb += self._get_asr_bos_embedding()
                 else:
+                    last_token_emb = self.model.stt_model.embed_tokens(gen_text[:, current_frame_idx - 1])
+                    current_input_emb += last_token_emb
+                    last_asr_token_emb = self.model.stt_model.embed_asr_tokens(gen_asr_text[:, current_frame_idx - 1])
+                    current_input_emb += last_asr_token_emb
+
+                if use_cache:
                     ans = self.model_llm_interface(
                         current_input_emb,
                         cache=dynamic_cache,
                         generated_tokens=gen_text,
                         current_step=current_frame_idx
                     )
-                dynamic_cache = ans["cache"]
-            else:
-                new_input_embeds.append(current_input_emb)
-                full_input_embeds = torch.cat(input_embeds_history + new_input_embeds, dim=1)
-                ans = self.model_llm_interface(
-                    full_input_embeds,
-                    cache=None,
-                    generated_tokens=gen_text,
-                    current_step=current_frame_idx
-                )
+                    dynamic_cache = ans["cache"]
+                else:
+                    new_input_embeds.append(current_input_emb)
+                    full_input_embeds = torch.cat(input_embeds_history + new_input_embeds, dim=1)
+                    ans = self.model_llm_interface(
+                        full_input_embeds,
+                        cache=None,
+                        generated_tokens=gen_text,
+                        current_step=current_frame_idx
+                    )
 
             torch.cuda.synchronize()
             time_stt_model = time.time() - start_stt_model
