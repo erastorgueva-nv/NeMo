@@ -187,6 +187,7 @@ class StreamingS2SGenerator(S2SPipelineInterface):
 		# Retrieve per-stream cache slices
 		# If this is the first frame of a stream, ensure we have a fresh context
 		tts_prefill_code = None
+		has_prompt = False
 		if bos_flags[0]:
 			print(f"🎬 Starting new stream {stream_ids[0]} - ensuring clean state")
 			# Recreate context_manager entirely to ensure fresh KV cache (BS=1)
@@ -200,6 +201,9 @@ class StreamingS2SGenerator(S2SPipelineInterface):
 			# Prefill TTS speaker embedding and system prompt for new stream
 			# Returns TTS prefill output code if vLLM EarTTS prefill happened
 			tts_prefill_code = self._prefill_system_prompt(stream_ids[0])
+			# Track whether a system prompt was prefilled so that infer_one_step
+			# uses pad embedding (not BOS) at frame 0 — matching the standalone pipeline.
+			has_prompt = bool(self.system_prompt)
 		
 		request_id = self._request_id_for_stream(stream_ids[0])
 		
@@ -255,6 +259,7 @@ class StreamingS2SGenerator(S2SPipelineInterface):
 			gen_asr_text=context.gen_asr_text,
 			request_id=request_id,
 			perception_cache=context.perception_cache,
+			has_prompt=has_prompt,
 		)
 
 		# Persist updated cache & clean finished streams
