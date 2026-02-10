@@ -747,11 +747,18 @@ class VllmEARTTSModel(VllmLLMModel):
 
         assert inputs["context_hidden_state"] is None, "EARTTS vllm model does not support context_hidden_state input"
 
+        codes = inputs["code"].squeeze(0)  # T x 31
+        if codes.shape[0] > 1:
+            # in prefill stage, we needto shift acoustic tokens for vllm,
+            # replicating the NeMo logic from here:
+            # https://github.com/erastorgueva-nv/NeMo/blob/duplex-realtime-inference/nemo/collections/speechlm2/modules/ear_tts_model.py#L1357
+            codes = torch.nn.functional.pad(codes[:-1], [0, 0, 1, 0])
         input_tensors = [
-            inputs["code"].squeeze(0),  # Remove batch dim if present
+            codes,
             inputs["subword_ids"].squeeze(0),
             inputs["subword_mask"].squeeze(0),
         ]
+
         if "non_prompt_mask" in inputs:
             # Apply edge detection to match native model's BOS placement logic:
             # BOS should only be applied at the FIRST position where non_prompt_mask is True
