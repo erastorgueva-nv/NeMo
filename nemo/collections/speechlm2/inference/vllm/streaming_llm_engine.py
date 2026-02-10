@@ -17,6 +17,7 @@ Speech Streaming Engine Wrapper
 A clean wrapper for streaming speech-to-speech generation with custom embeddings.
 """
 
+import os
 import torch
 import asyncio
 from typing import Optional, Dict, Any, AsyncGenerator, Tuple
@@ -27,6 +28,7 @@ from vllm.v1.engine.async_llm import AsyncLLM
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.config.model import CustomInputSpec
+from vllm.attention.selector import _cached_get_attn_backend
 
 from nemo.utils import logging
 
@@ -428,6 +430,13 @@ class EARTTSStreamingEngine(LLMStreamingEngine):
         self.sampling_params = SamplingParams(**default_sampling)
         logging.info("EARTTSStreamingEngine initialized with EARTTS-specific sampling parameters.")
 
+    async def initialize(self):
+        # Force TRITON_ATTN backend for EarTTS
+        os.environ["VLLM_ATTENTION_BACKEND"] = "TRITON_ATTN"
+        _cached_get_attn_backend.cache_clear()
+        await super().initialize()
+        os.environ.pop("VLLM_ATTENTION_BACKEND", None)
+        _cached_get_attn_backend.cache_clear()
 
 
 def create_engine(engine_type: str = "llm", **kwargs) -> LLMStreamingEngine:
