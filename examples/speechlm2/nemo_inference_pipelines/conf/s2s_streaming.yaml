@@ -66,6 +66,8 @@ s2s:
 
 
   system_prompt: ???
+  tts_system_prompt: null              # TTS system prompt - conditions TTS generation style
+                                       # Requires a checkpoint trained with individual TTS prompts
 
 
 
