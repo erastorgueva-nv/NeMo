@@ -35,7 +35,10 @@ import tritonclient.grpc as grpcclient
 from tqdm import tqdm
 from tritonclient.utils import *
 
-from nemo.utils import logging as logger
+# Use Python's built-in logging so this script can run without NeMo installed
+import logging
+logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Default values
 DEFAULT_HOST = "localhost"
