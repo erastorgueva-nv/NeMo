@@ -423,6 +423,7 @@ class EARTTSStreamingEngine(LLMStreamingEngine):
             "temperature": 0.0,
             "skip_sampling": True,
             "ignore_eos": True,
+            "guidance_scale": 0.5,
         }
         self.sampling_params = SamplingParams(**default_sampling)
         logging.info("EARTTSStreamingEngine initialized with EARTTS-specific sampling parameters.")
