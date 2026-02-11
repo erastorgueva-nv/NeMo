@@ -609,6 +609,48 @@ class RealtimeStreamingInference:
         input_embeds = self.model.stt_model.embed_asr_tokens(text_bos)
         return input_embeds.to(dtype=self.dtype)
 
+    def _prepare_system_prompt(self, system_prompt: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        f"""
+        Prepares system prompt for LLM.
+        Input to LLM is acoustic embeddings, text token ids and asr token ids.
+        Here we prepare each of those inputs based on textual system prompt.
+            * text_token_ids = bos_id + text_to_ids(system_prompt) + eos_id
+            * asr_token_ids = asr_bos_id + [asr_pad_id] * (prompt_len - 1)
+            * acoustic_embeds = bos_emb + pad_emb.repeated(prompt_len - 1)
+
+        Args:
+            system_prompt: The system prompt text
+
+        Returns:
+            text_token_ids: list
+            asr_token_ids: [1, prompt_len]
+            acoustic_embeds: [1, prompt_len, H]
+        """
+        assert system_prompt is not None and system_prompt.strip(), "System prompt cannot be empty"
+        
+        # text token ids
+        prompt_token_ids_lst = (
+            [self.tokenizer.bos_id] +
+            self.tokenizer.text_to_ids(system_prompt) +
+            [self.tokenizer.eos_id]
+        )
+        prompt_len = len(prompt_token_ids_lst)
+
+        # asr token ids
+        # text pad id is used as both asr bos id and as asr pad id
+        asr_token_ids_lst = [self.model.stt_model.text_pad_id] * prompt_len
+        asr_token_ids = torch.tensor(asr_token_ids_lst, dtype=torch.long).unsqueeze(0)  # [1, prompt_len]
+
+        # acoustic embeds
+        bos_emb = self._get_bos_embedding()  # [1, H]
+        pad_id = self.model.stt_model.text_pad_id
+        pad_token = torch.full((1,), fill_value=pad_id, dtype=torch.long, device=self.device)
+        pad_emb = self.model.stt_model.embed_tokens(pad_token).to(dtype=self.dtype)  # [1, H]
+        # repeat pad_emb for prompt_len - 1 times and concat with bos_emb
+        acoustic_embeds = torch.cat([bos_emb, pad_emb.repeat(prompt_len - 1, 1)], dim=0).unsqueeze(0)  # [1, prompt_len, H]
+
+        return prompt_token_ids_lst, asr_token_ids, acoustic_embeds.to(asr_token_ids.device)
+
     def _prepare_system_prompt_embeddings(
         self,
         system_prompt: str,
@@ -625,51 +667,18 @@ class RealtimeStreamingInference:
 
         Returns:
             Tuple of (prompt_embedded [1, prompt_len, H], prompt_length)
-            Returns (None, 0) if system_prompt is empty
         """
 
-        if not system_prompt or not system_prompt.strip():
-            return None, 0
-
-        logging.info(f"\n📝 Preparing system prompt: {system_prompt[:100]}...")
-
-        # Step 1: Tokenize the prompt
-        # Format: [bos] + text_tokens + [eos] (consistent with collate_system_prompt)
-        prompt_token_ids = (
-            [self.tokenizer.bos_id] +
-            self.tokenizer.text_to_ids(system_prompt) +
-            [self.tokenizer.eos_id]
-        )
-        prompt_tokens = torch.tensor(prompt_token_ids, dtype=torch.long, device=self.device).unsqueeze(0)  # [1, prompt_len]
-        prompt_len = prompt_tokens.shape[1]
-
-        logging.info(f"   Prompt length: {prompt_len} tokens")
-
-        # Step 2: Embed the prompt tokens (this acts as the "audio channel" for prompt positions)
-        prompt_embedded = self.model.stt_model.embed_tokens(prompt_tokens)  # [1, prompt_len, H]
-        prompt_embedded = prompt_embedded.to(dtype=self.dtype)
-
-        # Step 3: Add pad embeddings for text and ASR channels (for positions t > 0)
-        # In offline_inference, prompt positions use gen_text[:, t-1] = pad_id
-        pad_id = self.model.stt_model.text_pad_id
-        pad_token = torch.full((1,), fill_value=pad_id, device=self.device, dtype=torch.long)
-        pad_emb = self.model.stt_model.embed_tokens(pad_token).to(dtype=self.dtype)  # [1, H]
-        pad_asr_emb = self.model.stt_model.embed_asr_tokens(pad_token).to(dtype=self.dtype)  # [1, H]
-
-        # For positions t > 0, add pad embeddings (simulating gen_text[:, t-1] = pad_id)
-        if prompt_len > 1:
-            prompt_embedded[:, 1:, :] += pad_emb
-            prompt_embedded[:, 1:, :] += pad_asr_emb
-
-        # Step 4: For position 0, add BOS embeddings
-        bos_emb = self._get_bos_embedding()  # [1, H]
-        asr_bos_emb = self._get_asr_bos_embedding()  # [1, H]
-        prompt_embedded[:, 0, :] += bos_emb.squeeze(0)
-        prompt_embedded[:, 0, :] += asr_bos_emb.squeeze(0)
-
+        text_token_ids_lst, asr_token_ids, acoustic_embeds = self._prepare_system_prompt(system_prompt)
+        
+        text_token_ids = torch.tensor(text_token_ids_lst, dtype=torch.long).unsqueeze(0)  # [1, prompt_len]
+        text_embedded = self.model.stt_model.embed_tokens(text_token_ids.to(self.device)).to(dtype=self.dtype)  # [1, prompt_len, H]
+        asr_embedded = self.model.stt_model.embed_asr_tokens(asr_token_ids.to(self.device)).to(dtype=self.dtype)  # [1, prompt_len, H]
+        
+        # total embedding
+        prompt_embedded = text_embedded + asr_embedded + acoustic_embeds.to(self.device)
         logging.info(f"   ✅ System prompt embeddings prepared: shape {prompt_embedded.shape}")
-
-        return prompt_embedded, prompt_len
+        return prompt_embedded, text_token_ids.shape[1]
 
     def _setup_perception_cache(self):
         """Setup cache-aware streaming for the perception encoder."""
@@ -1728,48 +1737,49 @@ class RealtimeStreamingInference:
             llm_cache = None
             input_embeds_history = []  # For no-cache mode
 
-        # Process system prompt if provided (before streaming audio)
-        prompt_embedded = None
-        prompt_len = 0
-        
-        if system_prompt:
-            start_get_prompt_embeddings = time.time()
-            prompt_embedded, prompt_len = self._prepare_system_prompt_embeddings(system_prompt)
-            logging.info(f"Time taken to get prompt embeddings: {time.time() - start_get_prompt_embeddings:.3f}s")
-            if prompt_embedded is not None and "vllm" in self.engine_type.lower():
-                # Prepare token IDs for the prompt
-                prompt_token_ids = (
-                    [self.tokenizer.bos_id] +
-                    self.tokenizer.text_to_ids(system_prompt) +
-                    [self.tokenizer.eos_id]
-                )
+        # Process system prompt if provided (before streaming audio)        
+        if system_prompt is not None and system_prompt.strip():
+            if "vllm" in self.engine_type.lower():
+                # prepare prompt inputs for vLLM prefill
+                start_get_prompt = time.time()
+                text_token_ids_lst, asr_token_ids, acoustic_embeds = self._prepare_system_prompt(system_prompt)
+                logging.info(f"Time taken to prepare system prompt for vLLM: {time.time() - start_get_prompt:.3f}s")
 
                 # For vLLM mode: use efficient BATCH prefill (~20x faster than sequential)
+                prompt_len = len(text_token_ids_lst)
                 logging.info(f"   Batch prefilling {prompt_len} prompt embeddings...")
                 start_batch_prefill = time.time()
                 with torch.no_grad():
                     success = self.model_llm_interface(
-                        prompt_embedded,
+                        acoustic_embeds=acoustic_embeds,
+                        asr_token_ids=asr_token_ids,
                         request_id=stream_request_id,
                         decode_steps=0,
-                        prompt_token_ids=prompt_token_ids,
+                        prompt_token_ids=text_token_ids_lst,
                     )
                 logging.info(f"Time taken to batch prefill stt model: {time.time() - start_batch_prefill:.3f}s")
                 if success:
                     logging.info(f" System prompt prefilled ({prompt_len} tokens)")
                 else:
                     raise RuntimeError("vLLM batch prefill for system prompt failed.")
-            elif prompt_embedded is not None and not use_cache:
-                # For no-cache mode (Nemotron): add prompt embeddings to history
-                # Split into individual frames for consistent processing
-                for t in range(prompt_len):
-                    input_embeds_history.append(prompt_embedded[:, t:t+1, :])
-                logging.info(f"   Added {prompt_len} prompt embeddings to input_embeds_history")
-            elif prompt_embedded is not None and use_cache:
-                # For cache mode: process prompt through LLM to update cache
-                with torch.no_grad():
-                    ans = self.model.stt_model(prompt_embedded, cache=llm_cache)
-                    llm_cache = ans.get("cache", llm_cache)
+            else:
+                # prepare combined prompt embedding for native llm
+                start_get_prompt_embeddings = time.time()
+                prompt_embedded, prompt_len = self._prepare_system_prompt_embeddings(system_prompt)
+                logging.info(f"Time taken to get prompt embeddings: {time.time() - start_get_prompt_embeddings:.3f}s")
+                
+                if use_cache:
+                    # For cache mode: process prompt through LLM to update cache
+                    with torch.no_grad():
+                        ans = self.model.stt_model(prompt_embedded, cache=llm_cache)
+                        llm_cache = ans.get("cache", llm_cache)
+                    logging.info(f"   ✅ System prompt processed, cache updated")
+                else:
+                    # For no-cache mode (Nemotron): add prompt embeddings to history
+                    # Split into individual frames for consistent processing
+                    for t in range(prompt_len):
+                        input_embeds_history.append(prompt_embedded[:, t:t+1, :])
+                    logging.info(f"   Added {prompt_len} prompt embeddings to input_embeds_history")
                 logging.info(f"   ✅ System prompt processed, cache updated")
 
         # Initialize TTS
