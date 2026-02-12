@@ -152,26 +152,15 @@ def convert_nemo_to_hf_format(
     base_config = AutoConfig.from_pretrained(pretrained_llm, trust_remote_code=True)
     
     # Modify config for custom inputs/outputs
-    # Custom inputs:
-    # - acoustic_embeds: [T, hidden_size] - acoustic embeddings from perception encoder
-    # - asr_token_ids: [T] - previous ASR token IDs (pad_id at t=0, gen_asr[t-1] at t>0)
-    # Text token (input_ids) comes from vLLM's regular sampling output, not as custom input
-    # The embedding combination (acoustic + embed_tokens(input_ids) + embed_asr_tokens) happens inside the model
-    # Custom outputs:
-    # - asr_tokens: ASR tokens (always greedy/argmax)
     custom_config = {
         "custom_input_specs": [
             {
-                "name": "acoustic_embeds",
-                "dtype": dtype,
-                "dim": base_config.hidden_size
-            },
-            {
-                "name": "asr_token_ids",
-                "dtype": "int32",
+              "name": "combined_embeds",
+              "dtype": dtype,
+              "dim": base_config.hidden_size
             }
         ],
-        "custom_outputs": ["asr_tokens"]
+        "custom_outputs": ["text_logits", "asr_tokens", "asr_logits"]
     }
     base_config.update(custom_config)
 
