@@ -433,21 +433,39 @@ class RealtimeStreamingInference:
 
             # Filter to non-TTS weights
             tts_keys = ['tts_model.', 'speech_generation.']
-            nano_filtered = {k: v for k, v in nano_state_dict.items()
-                           if not any(k.startswith(prefix) for prefix in tts_keys)}
 
-            logging.info(f"  Loading {len(nano_filtered)} parameters (excluding TTS)...")
+            # If using vLLM for LLM, also exclude LLM weights to save memory
+            # vLLM will load its own copy of the LLM
+            if self.use_vllm_llm:
+                llm_keys = ['stt_model.llm.']
+                exclude_keys = tts_keys + llm_keys
+                logging.info(f"  Using vLLM - excluding LLM weights from nano checkpoint")
+            else:
+                exclude_keys = tts_keys
+
+            nano_filtered = {k: v for k, v in nano_state_dict.items()
+                           if not any(k.startswith(prefix) for prefix in exclude_keys)}
+
+            logging.info(f"  Loading {len(nano_filtered)} parameters (excluded: {exclude_keys})...")
+
+            # Free the full state dict immediately to save CPU memory
+            del nano_state_dict
+            gc.collect()
 
             nano_filtered = set_model_dict_for_partial_init(nano_filtered, self.model.state_dict())
             missing, unexpected = self.model.load_state_dict(nano_filtered, strict=False)
 
-            missing_non_tts = [k for k in missing if not any(k.startswith(prefix) for prefix in tts_keys)]
-            unexpected_non_tts = [k for k in unexpected if not any(k.startswith(prefix) for prefix in tts_keys)]
+            # Free filtered dict
+            del nano_filtered
+            gc.collect()
 
-            if missing_non_tts:
-                logging.info(f"  ⚠️  {len(missing_non_tts)} non-TTS keys missing (might be OK)")
-            if unexpected_non_tts:
-                logging.info(f"  ⚠️  {len(unexpected_non_tts)} unexpected non-TTS keys")
+            missing_non_excluded = [k for k in missing if not any(k.startswith(prefix) for prefix in exclude_keys)]
+            unexpected_non_excluded = [k for k in unexpected if not any(k.startswith(prefix) for prefix in exclude_keys)]
+
+            if missing_non_excluded:
+                logging.info(f"  ⚠️  {len(missing_non_excluded)} keys missing (might be OK)")
+            if unexpected_non_excluded:
+                logging.info(f"  ⚠️  {len(unexpected_non_excluded)} unexpected keys")
 
         # Step 5: Load eartts's checkpoint (TTS only)
         if self.model_path is not None:
@@ -498,13 +516,27 @@ class RealtimeStreamingInference:
 
         logging.info("\n✅ Hybrid loading completed!")
 
+        # If using vLLM for LLM, delete native LLM BEFORE moving to device to save memory
+        if self.use_vllm_llm:
+            logging.info("\n🔧 Deleting native LLM before GPU transfer (will use vLLM instead)...")
+            if hasattr(self.model.stt_model, 'llm') and self.model.stt_model.llm is not None:
+                # Delete all submodules of LLM to free memory
+                for name, child in list(self.model.stt_model.llm.named_children()):
+                    delattr(self.model.stt_model.llm, name)
+                del self.model.stt_model.llm
+                self.model.stt_model.llm = None
+            gc.collect()
+            torch.cuda.empty_cache()
+            logging.info("  ✓ Native LLM deleted")
+
         # Setup model
         self.model.to(self.device)
         self.model.eval()
 
         # Convert only the S2S components to the configured dtype, not the TTS model
         logging.info(f"Converting S2S components to {self.dtype} (keeping TTS in float32)...")
-        self.model.stt_model.llm = self.model.stt_model.llm.to(self.dtype)
+        if self.model.stt_model.llm is not None:
+            self.model.stt_model.llm = self.model.stt_model.llm.to(self.dtype)
         self.model.stt_model.lm_head = self.model.stt_model.lm_head.to(self.dtype)
         self.model.stt_model.embed_tokens = self.model.stt_model.embed_tokens.to(self.dtype)
         self.model.stt_model.asr_head = self.model.stt_model.asr_head.to(self.dtype)
@@ -530,8 +562,7 @@ class RealtimeStreamingInference:
             if self.vllm_llm_config is None:
                 raise ValueError("vllm_llm_config must be provided when engine_type contains'vllm_llm'")
 
-            # Free LLM memory before loading vLLM
-            self.model.stt_model.llm = None
+            # LLM already deleted above, just ensure cleanup
             gc.collect()
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
@@ -1980,8 +2011,8 @@ def main():
                        help="Path to vLLM-compatible model checkpoint if the path not exists, it will be auto-converted")
     parser.add_argument("--vllm_max_model_len", type=int, default=768,
                        help="Maximum sequence length for vLLM (default: 768)")
-    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.4,
-                       help="GPU memory utilization for vLLM (default: 0.4)")
+    parser.add_argument("--vllm_gpu_memory_utilization", type=float, nargs='+', default=[0.4],
+                       help="GPU memory utilization for vLLM. Single value shared by both engines; two values assign to LLM and TTS respectively.")
     parser.add_argument("--vllm_llm_dtype", type=str, default="bfloat16",
                        help="Data type for vLLM (default: bfloat16)")
 
@@ -2029,12 +2060,17 @@ def main():
             "tts_system_prompt": args.tts_system_prompt,
         }
 
+        # Pop GPU memory utilization values: first for LLM, second (or same) for TTS
+        _gpu_mem = list(args.vllm_gpu_memory_utilization)
+        gpu_mem_llm = _gpu_mem.pop(0)
+        gpu_mem_tts = _gpu_mem.pop(0) if _gpu_mem else gpu_mem_llm
+
         # Add vLLM configuration if using vLLM engine
         if "vllm_llm" in args.engine_type:
             model_cfg_dict["vllm_llm_config"] = {
                 "model_path": args.model_path,
                 "max_model_len": args.vllm_max_model_len,
-                "gpu_memory_utilization": args.vllm_gpu_memory_utilization,
+                "gpu_memory_utilization": gpu_mem_llm,
                 "dtype": args.vllm_llm_dtype,
                 "engine_path": args.vllm_llm_engine_path,  # Will auto-convert if needed
                 "pretrained_llm": args.llm_checkpoint_path,
@@ -2044,7 +2080,7 @@ def main():
             model_cfg_dict["vllm_tts_config"] = {
                 "model_path": args.model_path, # we use exactly the same whole duplexs2s ckpt
                 "max_model_len": args.vllm_max_model_len,
-                "gpu_memory_utilization": args.vllm_gpu_memory_utilization,
+                "gpu_memory_utilization": gpu_mem_tts,
                 "dtype": args.vllm_eartts_dtype,
                 "engine_path": args.vllm_eartts_engine_path,
                 "pretrained_llm": None,

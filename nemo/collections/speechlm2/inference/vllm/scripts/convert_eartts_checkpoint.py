@@ -19,6 +19,7 @@ import argparse
 import torch
 from omegaconf import OmegaConf, DictConfig
 from safetensors.torch import save_file, load_file
+from transformers import AutoConfig
 
 from nemo.collections.speechlm2.models.duplex_ear_tts import DuplexEARTTS
 
@@ -70,7 +71,7 @@ def convert(outdir, config, model_path):
     max_char_len = max(len(char_ids) for char_ids in subword_id_to_char_ids.values())
     hidden_size = cfg.model.tts_config.backbone_config.hidden_size
 
-    # load checkpoint
+    # load checkpoint (support both safetensors and pytorch formats)
     weights = load_file(model_path)
     # select tts model weights, strip off one nested layer
     weights = {k[len("tts_model."):]: v for k, v in weights.items() if "tts_model." in k}
@@ -83,6 +84,7 @@ def convert(outdir, config, model_path):
     # ======================
     # embedding module weights
     bos_emb = weights["tts_model.bos_emb"]
+    null_emb = weights["tts_model.null_emb"]
     embed_subwords_weight = torch.zeros(
         (vocab_size, max_char_len), dtype=bos_emb.dtype, device=bos_emb.device
     )
@@ -100,6 +102,7 @@ def convert(outdir, config, model_path):
     # create weights for the embedding model that runs outside of the eartts
     embedding_module_weights = {}
     embedding_module_weights["bos_emb"] = bos_emb
+    embedding_module_weights["null_emb"] = null_emb
 
     # embedding transformer has a lot of weights
     for key, weight in weights.items():
@@ -113,6 +116,8 @@ def convert(outdir, config, model_path):
         if "tts_model.gated_fusion_audio_text" in key:
             key = key[len("tts_model.") :]
             embedding_module_weights[key] = weight
+    if "tts_model.audio_prompt_projection_W" in weights:
+        embedding_module_weights["audio_prompt_projection_W"] = weights["tts_model.audio_prompt_projection_W"]
     embedding_module_weights["embed_subword.embed_subwords.weight"] = (
         embed_subwords_weight
     )
@@ -161,7 +166,20 @@ def convert(outdir, config, model_path):
     flat_config = {"architectures": ["EarTTSForCausalLM"], "model_type": "eartts"}
     # not using vocab size of the backbone model
     flat_config["vocab_size"] = 1
-    # forward backbone configs
+
+    # Parse backbone config exactly as NeMo does to get all defaults from transformers
+    backbone_type = cfg.model.tts_config.get("backbone_type", None)
+    backbone_config_dict = OmegaConf.to_container(
+        cfg.model.tts_config.backbone_config, resolve=True
+    ) if cfg.model.tts_config.get("backbone_config") else {}
+    
+    # Create AutoConfig the same way NeMo does - this fills in all defaults
+    parsed_backbone_config = AutoConfig.for_model(backbone_type, **backbone_config_dict)
+    
+    # Store the backbone type for vllm to use
+    flat_config["backbone_type"] = backbone_type
+    
+    # Forward all backbone configs from the parsed AutoConfig (includes defaults)
     for key in [
         "hidden_size",
         "intermediate_size",
@@ -169,14 +187,25 @@ def convert(outdir, config, model_path):
         "num_attention_heads",
         "num_key_value_heads",
         "head_dim",
+        "max_position_embeddings",
+        "rope_theta",
+        "rope_local_base_freq",
+        "sliding_window",
+        "layer_types",
     ]:
-        flat_config[key] = cfg.model.tts_config.backbone_config[key]
+        if hasattr(parsed_backbone_config, key):
+            value = getattr(parsed_backbone_config, key)
+            # convert to list if it's a tuple or other iterable (except str)
+            if hasattr(value, '__iter__') and not isinstance(value, (str, dict)):
+                value = list(value)
+            flat_config[key] = value
     # forward overall configs
     for key in ["latent_size", "codebook_size", "num_quantizers", "exponent"]:
         flat_config[key] = cfg.model.tts_config[key]
     # forward mog head configs
     for key in ["num_layers", "low_rank", "num_predictions", "min_log_std", "eps"]:
         flat_config[f"mog_{key}"] = cfg.model.tts_config.mog_head_config[key]
+
     # forward inference configs (with name mapping for vLLM model)
     # num_iter is hardcoded to 8 in native model's _get_generation_config
     flat_config["num_iter"] = 8
@@ -197,6 +226,10 @@ def convert(outdir, config, model_path):
     flat_config["use_subword_flag_emb"] = cfg.model.tts_config.use_subword_flag_emb
     flat_config["use_bos_eos_emb"] = cfg.model.tts_config.use_bos_eos_emb
     flat_config["use_gated_fusion_for_text_audio"] = cfg.model.tts_config.use_gated_fusion_for_text_audio
+    flat_config["use_audio_prompt_frozen_projection"] = cfg.model.tts_config.use_audio_prompt_frozen_projection
+    # hardcode enabling guidance so emb is created and application
+    # of cfg is captured into a cuda graph
+    flat_config["enable_guidance"] = True
 
     # configuring custom inputs/outputs
     flat_config["custom_input_specs"] = [
