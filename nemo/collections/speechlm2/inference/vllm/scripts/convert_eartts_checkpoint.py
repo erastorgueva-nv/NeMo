@@ -116,6 +116,8 @@ def convert(outdir, config, model_path):
         if "tts_model.gated_fusion_audio_text" in key:
             key = key[len("tts_model.") :]
             embedding_module_weights[key] = weight
+    if "tts_model.audio_prompt_projection_W" in weights:
+        embedding_module_weights["audio_prompt_projection_W"] = weights["tts_model.audio_prompt_projection_W"]
     embedding_module_weights["embed_subword.embed_subwords.weight"] = (
         embed_subwords_weight
     )
@@ -224,6 +226,7 @@ def convert(outdir, config, model_path):
     flat_config["use_subword_flag_emb"] = cfg.model.tts_config.use_subword_flag_emb
     flat_config["use_bos_eos_emb"] = cfg.model.tts_config.use_bos_eos_emb
     flat_config["use_gated_fusion_for_text_audio"] = cfg.model.tts_config.use_gated_fusion_for_text_audio
+    flat_config["use_audio_prompt_frozen_projection"] = cfg.model.tts_config.use_audio_prompt_frozen_projection
     # hardcode enabling guidance so emb is created and application
     # of cfg is captured into a cuda graph
     flat_config["enable_guidance"] = True
