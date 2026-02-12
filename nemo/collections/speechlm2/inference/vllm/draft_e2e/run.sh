@@ -18,7 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 NEMO_DIR=/home/vklimkov/NemoDuplexRealtimeInference
 INPUT_AUDIO_PATH="/home/vklimkov/moshi_client_nemo_20251117_151731_input_sf.wav"
-CKPT_PATH="/home/vklimkov/duplex-eartts-fp32-stt-3-december_stt_edresson_model_R_digits_norm_eip_0.1_EA_model_step_9005"
+CKPT_PATH="/home/vklimkov/duplex-eartts-2mim_sw_et_eos_dp_eos_dup_fp32_1delay_ind_prompts_12heads_afp_nfisher_h2_david_main_branch-stt-AR3_12556_new_branch_load_fixed"
 CACHE_DIR="/tmp/cache"
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -46,18 +46,20 @@ umask 000
 # Convert checkpoint (skip if already done)
 # ──────────────────────────────────────────────────────────────────────────────
 ENGINES_DIR="${SCRIPT_DIR}/engines/"
-if [ ! -d "${ENGINES_DIR}" ]; then
+if [ ! -d "${ENGINES_DIR}/eartts" ]; then
     python ${SCRIPT_DIR}/../scripts/convert_eartts_checkpoint.py \
         --config ${CKPT_PATH}/config.json \
         --model ${CKPT_PATH}/model.safetensors \
         --outdir ${ENGINES_DIR}/eartts
-
+fi
+if [ ! -d "${ENGINES_DIR}/llm" ]; then
     python ${SCRIPT_DIR}/../scripts/convert_nemotronllm_checkpoint.py \
         --config ${CKPT_PATH}/config.json \
         --checkpoint ${CKPT_PATH}/model.safetensors \
         --output-dir ${ENGINES_DIR}/llm \
         --dtype bfloat16
-
+fi
+if [ ! -d "${ENGINES_DIR}/fastconformer" ]; then
     python ${SCRIPT_DIR}/../scripts/convert_fastconformer_checkpoint.py \
         --s2s-checkpoint ${CKPT_PATH} \
         --outdir ${ENGINES_DIR}/fastconformer
@@ -68,7 +70,8 @@ fi
 # ──────────────────────────────────────────────────────────────────────────────
 python3 ${SCRIPT_DIR}/infer.py \
     --audio ${INPUT_AUDIO_PATH} \
-    --tts-prompt-data ${SCRIPT_DIR}/eartts_prompt.pt \
+    --tts-prompt-data ${SCRIPT_DIR}/eartts_prefill_data.pt \
+    --llm-prompt-data ${SCRIPT_DIR}/llm_prefill_data.pt \
     --output ${SCRIPT_DIR}/generated.wav \
     --fastconformer ${ENGINES_DIR}/fastconformer \
     --llm ${ENGINES_DIR}/llm \
