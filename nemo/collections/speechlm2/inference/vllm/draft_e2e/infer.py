@@ -125,6 +125,15 @@ def load_codec(s2s_ckpt_path: str, device: str = "cuda"):
     cfg.data.target_sample_rate = 22050
     cfg.model.pretrained_model = None
 
+    # Compatibility fix: remove 'pretrained_tokenizer_name' from cas_config
+    # (the new codebase's CharAwareSubwordEncoder no longer accepts this parameter;
+    #  NemotronVoiceChat.__init__ handles this, but we bypass it here)
+    _pretrained_tokenizer_name = None
+    if hasattr(cfg.model, "tts_config") and hasattr(cfg.model.tts_config, "cas_config"):
+        _pretrained_tokenizer_name = cfg.model.tts_config.cas_config.get("pretrained_tokenizer_name", None)
+        if _pretrained_tokenizer_name is not None:
+            del cfg.model.tts_config.cas_config.pretrained_tokenizer_name
+
     with fp32_precision():
         model = DuplexEARTTS(OmegaConf.to_container(cfg, resolve=True))
 
