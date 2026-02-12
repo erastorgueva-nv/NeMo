@@ -31,7 +31,8 @@
 #
 # Environment variables (optional):
 #   S2S_ENGINE_TYPE             - Engine type (default: native)
-#   S2S_SYSTEM_PROMPT           - System prompt text (default: none)
+#   S2S_SYSTEM_PROMPT           - LLM system prompt text (default: none)
+#   S2S_TTS_SYSTEM_PROMPT       - TTS system prompt, (default: none)
 #   S2S_CHUNK_SIZE_IN_SECS      - Chunk size in seconds, multiple of 0.08 (default: 0.08)
 #   S2S_BUFFER_SIZE_IN_SECS     - Audio buffer size in seconds (default: 5.6)
 #   S2S_TRITON_CONFIG_PATH      - Override the YAML config file path
@@ -54,6 +55,7 @@ export S2S_SPEAKER_REFERENCE="${S2S_SPEAKER_REFERENCE:?Please set S2S_SPEAKER_RE
 # ========================
 export S2S_ENGINE_TYPE="${S2S_ENGINE_TYPE:-native}"
 export S2S_SYSTEM_PROMPT="${S2S_SYSTEM_PROMPT:-}"
+export S2S_TTS_SYSTEM_PROMPT="${S2S_TTS_SYSTEM_PROMPT:-}"
 export S2S_CHUNK_SIZE_IN_SECS="${S2S_CHUNK_SIZE_IN_SECS:-0.08}"
 export S2S_BUFFER_SIZE_IN_SECS="${S2S_BUFFER_SIZE_IN_SECS:-5.6}"
 export S2S_TRITON_CONFIG_PATH="${S2S_TRITON_CONFIG_PATH:-${SCRIPT_DIR}/../conf/s2s_streaming.yaml}"
@@ -68,6 +70,7 @@ echo "  S2S_ENGINE_TYPE:         ${S2S_ENGINE_TYPE}"
 echo "  S2S_CHUNK_SIZE_IN_SECS:  ${S2S_CHUNK_SIZE_IN_SECS}"
 echo "  S2S_BUFFER_SIZE_IN_SECS: ${S2S_BUFFER_SIZE_IN_SECS}"
 echo "  S2S_SYSTEM_PROMPT:       ${S2S_SYSTEM_PROMPT:-<not set>}"
+echo "  S2S_TTS_SYSTEM_PROMPT:   ${S2S_TTS_SYSTEM_PROMPT:-<not set>}"
 echo "  MODEL_REPO_DIR:          ${MODEL_REPO_DIR}"
 echo "  S2S_TRITON_CONFIG_PATH:  ${S2S_TRITON_CONFIG_PATH}"
 echo "========================="

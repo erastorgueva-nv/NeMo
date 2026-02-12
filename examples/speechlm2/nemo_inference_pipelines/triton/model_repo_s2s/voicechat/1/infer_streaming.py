@@ -58,6 +58,7 @@ class TritonPythonModel:
             # Optional (with defaults)
             "s2s.engine_type":            ("S2S_ENGINE_TYPE", "native"),
             "s2s.system_prompt":          ("S2S_SYSTEM_PROMPT", None),
+            "s2s.tts_system_prompt":      ("S2S_TTS_SYSTEM_PROMPT", None),
             "streaming.chunk_size_in_secs": ("S2S_CHUNK_SIZE_IN_SECS", 0.08),
             "streaming.buffer_size_in_secs": ("S2S_BUFFER_SIZE_IN_SECS", 5.6),
         }

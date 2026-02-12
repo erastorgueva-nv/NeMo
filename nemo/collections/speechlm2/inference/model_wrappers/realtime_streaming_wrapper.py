@@ -227,6 +227,9 @@ class RealtimeStreamingInference:
         if self.decode_audio and not self.speaker_reference:
             raise ValueError("`model_cfg.speaker_reference` must be provided when decode_audio is enabled.")
 
+        self.tts_system_prompt = model_cfg.get("tts_system_prompt", None)
+        logging.info(f"TTS system prompt: {self.tts_system_prompt}")
+
         compute_dtype = model_cfg.get("compute_dtype", "bfloat16")
         self.dtype = self._resolve_dtype(compute_dtype)
 
@@ -1184,6 +1187,7 @@ class RealtimeStreamingInference:
         self.model.tts_model.set_init_inputs(
             speaker_audio=speaker_audio,
             speaker_audio_lens=speaker_audio_lens,
+            system_prompt=self.tts_system_prompt,
         )
         init_inputs = self.model.tts_model.get_init_inputs(B=1)
 
@@ -2027,7 +2031,8 @@ def main():
     # System prompt
     parser.add_argument("--system_prompt", type=str, default=None,
                        help="System prompt to provide context to the model. Can also be specified per-record in input JSON.")
-
+    parser.add_argument("--tts_system_prompt", type=str, default=None,
+                       help="System prompt for EARTTS model.")
     args = parser.parse_args()
 
     # Validate arguments: either audio_path OR input_json must be provided
@@ -2052,6 +2057,7 @@ def main():
             "path_to_enc_save": args.path_to_enc_save,
             "top_p": args.top_p,
             "repetition_penalty": args.repetition_penalty,
+            "tts_system_prompt": args.tts_system_prompt,
         }
 
         # Pop GPU memory utilization values: first for LLM, second (or same) for TTS
