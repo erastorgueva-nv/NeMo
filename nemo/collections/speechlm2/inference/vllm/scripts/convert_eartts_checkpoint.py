@@ -226,7 +226,9 @@ def convert(outdir, config, model_path):
     flat_config["use_subword_flag_emb"] = cfg.model.tts_config.use_subword_flag_emb
     flat_config["use_bos_eos_emb"] = cfg.model.tts_config.use_bos_eos_emb
     flat_config["use_gated_fusion_for_text_audio"] = cfg.model.tts_config.use_gated_fusion_for_text_audio
-    flat_config["use_audio_prompt_frozen_projection"] = cfg.model.tts_config.use_audio_prompt_frozen_projection
+    flat_config["use_audio_prompt_frozen_projection"] = getattr(
+        cfg.model.tts_config, "use_audio_prompt_frozen_projection", False
+    )
     # hardcode enabling guidance so emb is created and application
     # of cfg is captured into a cuda graph
     flat_config["enable_guidance"] = True

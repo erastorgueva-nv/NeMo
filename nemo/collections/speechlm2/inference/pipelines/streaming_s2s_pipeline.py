@@ -235,6 +235,11 @@ class StreamingS2SGenerator(S2SPipelineInterface):
 		print(f"   code: {context.code.shape if context.code is not None else None}")
 		print(f"   subword_mask: {context.subword_mask.shape if context.subword_mask is not None else None}")
 
+		if bos_flags[0]:
+			# first step is only used for prefilling the system prompt
+			print(f"🔴 Prefill step, skipping chunk/step inference for stream {stream_ids[0]}")
+			return None
+
 		audio_buffer = buffers[0]
 		if audio_buffer.dim() == 1:
 			audio_buffer = audio_buffer.unsqueeze(0)

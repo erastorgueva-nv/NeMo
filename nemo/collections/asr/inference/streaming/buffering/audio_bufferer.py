@@ -49,7 +49,8 @@ class AudioBufferer:
         """
         if frame.size > self.buffer_size:
             raise RuntimeError(f"Frame size ({frame.size}) exceeds buffer size ({self.buffer_size})")
-
+        if frame.size == 0:
+            return
         shift = frame.size
         self.sample_buffer = torch.roll(self.sample_buffer, -shift)
         self.sample_buffer[-shift:].copy_(frame.samples)

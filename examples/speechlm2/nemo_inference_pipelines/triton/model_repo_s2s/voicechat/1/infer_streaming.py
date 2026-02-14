@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 from typing import List, Iterable, Tuple
+from concurrent.futures import ThreadPoolExecutor
 import os
+import uuid
 import numpy as np
 import torch
 
@@ -120,12 +122,59 @@ class TritonPythonModel:
             )
         logging.info(f"Loading S2S Triton model from config: {config_path}")
         self.load_model(config_path)
-    
+
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        max_streams = int(os.environ.get("S2S_MAX_STREAMS", "16"))
+        self.initialize_free_streams(max_streams)
+
+    def initialize_free_streams(self, max_streams: int):
+        """Pre-initialize a pool of server-side stream slots for stream recycling.
+        """
+        self.free_streams = [uuid.uuid4() for _ in range(max_streams)]
+        self.used_streams = set()
+        self.total_streams = max_streams
+
+        # kick off every stream with an zero chunk size first frame to do sysmtem prompt prefill
+        free_stream_frames = []
+        for stream_id in self.free_streams:
+            free_stream_frames.append(
+                Frame(
+                    samples=torch.zeros(self.chunk_size),
+                    stream_id=stream_id,
+                    is_first=True,
+                    is_last=False,
+                )
+            )
+        self.get_generations(free_stream_frames)
+
+        self.client_stream_id_to_server_stream_id = {}
+
     def finalize(self) -> None:
-        """Finalize the model."""
-        # Close the session, clear state pool, and empty CUDA cache
+        """Called by Triton when the model is unloaded."""
+        self.executor.shutdown(wait=True)
         self.generator.close_session()
         torch.cuda.empty_cache()
+
+    def _release_streams_recover(self, stream_ids: List[int]):
+        """Re-initialize released streams and return them to the free pool.
+
+        Runs on a background thread so that the Triton response path is not
+        blocked by the warm-up ``generate_step`` call.
+        """
+        free_stream_frames = []
+        for stream_id in stream_ids:
+            free_stream_frames.append(
+                Frame(
+                    samples=torch.zeros(self.chunk_size),
+                    stream_id=stream_id,
+                    is_first=True,
+                    is_last=False,
+                )
+            )
+        self.get_generations(free_stream_frames)
+        for stream_id in stream_ids:
+            self.free_streams.append(stream_id)
+            self.used_streams.remove(stream_id)
     
     @staticmethod
     def pad_audio(audio_signal: np.ndarray, chunk_size: int) -> torch.Tensor:
@@ -144,7 +193,7 @@ class TritonPythonModel:
         
         return torch.tensor(audio_signal, dtype=torch.float32)
     
-    def triton_requests_to_frames(self, requests: Iterable) -> List[Frame]:
+    def triton_requests_to_frames(self, requests: Iterable) -> Tuple[List[Frame], List[int]]:
         """
         Convert Triton inference requests into streaming audio Frames.
         
@@ -152,12 +201,15 @@ class TritonPythonModel:
         from each Triton request and wraps them in Frame dataclasses for the
         streaming S2S pipeline.
         
-        Since max_batch_size=0, processes one request at a time.
+        Client stream IDs (from CORRID) are mapped to pre-warmed server stream
+        IDs drawn from the free-stream pool.
         
         Returns:
-            List of Frame objects (one per request)
+            Tuple of (frames, to_release_streams) where *to_release_streams*
+            contains server stream IDs that should be recycled after this step.
         """
         frames = []
+        to_release_streams = []
         
         for request in requests:
             # Get audio input
@@ -167,8 +219,15 @@ class TritonPythonModel:
             # These are automatically populated when client uses sequence_start/end/id
             is_first = False
             is_last = False
-            stream_id = 0
+            client_stream_id = None
             
+            try:
+                corrid_tensor = pb_utils.get_input_tensor_by_name(request, "CORRID")
+                if corrid_tensor is not None:
+                    client_stream_id = int(corrid_tensor.as_numpy()[0])
+            except:
+                pass
+
             try:
                 start_tensor = pb_utils.get_input_tensor_by_name(request, "START")
                 if start_tensor is not None:
@@ -182,22 +241,29 @@ class TritonPythonModel:
                     is_last = bool(end_tensor.as_numpy()[0])
             except:
                 pass
-            
-            try:
-                corrid_tensor = pb_utils.get_input_tensor_by_name(request, "CORRID")
-                if corrid_tensor is not None:
-                    stream_id = int(corrid_tensor.as_numpy()[0])
-            except:
-                pass
+
+            # --- stream-pool mapping ---
+            if is_first:
+                if not self.free_streams:
+                    raise RuntimeError("No free streams available")
+                server_stream_id = self.free_streams.pop()
+                self.used_streams.add(server_stream_id)
+                self.client_stream_id_to_server_stream_id[client_stream_id] = server_stream_id
+            else:
+                server_stream_id = self.client_stream_id_to_server_stream_id[client_stream_id]
+
+            if is_last:
+                to_release_streams.append(server_stream_id)
+                del self.client_stream_id_to_server_stream_id[client_stream_id]
             
             frames.append(Frame(
                 samples=self.pad_audio(audio_signal, self.chunk_size),
-                stream_id=stream_id,
-                is_first=is_first, 
+                stream_id=server_stream_id,
+                is_first=False,
                 is_last=is_last
             ))
         
-        return frames
+        return frames, to_release_streams
     
     def get_generations(self, frames: List[Frame]) -> List[Tuple]:
         """
@@ -279,7 +345,7 @@ class TritonPythonModel:
         start_time = time.time()
         
         _t_to_frames = time.time()
-        frames = self.triton_requests_to_frames(requests)
+        frames, to_release_streams = self.triton_requests_to_frames(requests)
         _t_to_frames_done = time.time()
         
         _t_generations = time.time()
@@ -313,6 +379,11 @@ class TritonPythonModel:
             inference_response = pb_utils.InferenceResponse(output_tensors=[out_audio, out_text, out_asr_text])
             responses.append(inference_response)
         _t_response_build_done = time.time()
+
+        # Asynchronously recycle finished streams so the next request doesn't
+        # have to wait for the warm-up round-trip.
+        if to_release_streams:
+            self.executor.submit(self._release_streams_recover, to_release_streams)
 
         end_time = time.time()
         logging.info(f"TritonPythonModel.execute time: {end_time - start_time:.2f} seconds")
