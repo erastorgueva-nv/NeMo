@@ -184,6 +184,7 @@ def convert(s2s_checkpoint_path: str, outdir: str):
         },
         "custom_input_specs": [{"name": "audio", "dim": input_dim}],
         "custom_outputs": ["acoustic_emb"],
+        "num_output_tokens_per_step": 1,
     }
 
     if adapted_dimension is not None:

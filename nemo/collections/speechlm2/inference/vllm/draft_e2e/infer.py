@@ -41,6 +41,7 @@ async def create_fastconformer_engine(model_path: str, gpu_mem: float, max_model
         skip_tokenizer_init=True,
         enable_prefix_caching=False,
         dtype="float32",
+        compilation_config={"cudagraph_mode": "FULL"},
     )
     engine = AsyncLLM.from_vllm_config(engine_args.create_engine_config())
     sampling = SamplingParams(max_tokens=max_model_len, skip_sampling=True)

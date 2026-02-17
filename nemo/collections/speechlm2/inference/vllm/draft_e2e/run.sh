@@ -18,7 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 NEMO_DIR=/home/vklimkov/NemoDuplexRealtimeInference
 INPUT_AUDIO_PATH="/home/vklimkov/moshi_client_nemo_20251117_151731_input_sf.wav"
-CKPT_PATH="/home/vklimkov/duplex-eartts-2mim_sw_et_eos_dp_eos_dup_fp32_1delay_ind_prompts_12heads_afp_nfisher_h2_david_main_branch-stt-AR3_12556_new_branch_load_fixed"
+CKPT_PATH="/home/vklimkov/duplex-eartts-2mim_sw_et_eos_dp_eos_dup_fp32_1delay_ind_prompts_nfisher_h2_david_16k_steps_main_branch-stt-AR3_12556_new_branch_load_fixed"
 CACHE_DIR="/tmp/cache"
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -77,5 +77,5 @@ python3 ${SCRIPT_DIR}/infer.py \
     --llm ${ENGINES_DIR}/llm \
     --eartts ${ENGINES_DIR}/eartts \
     --s2s-ckpt ${CKPT_PATH} \
-    --gpu-mems 0.28 0.45 0.15 \
+    --gpu-mems 0.25 0.45 0.15 \
     --max-model-len 280
