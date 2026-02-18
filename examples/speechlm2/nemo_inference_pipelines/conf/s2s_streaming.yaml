@@ -54,9 +54,9 @@ s2s:
   # ========================
   # Inference settings
   # ========================
-  codec_token_history_size: 98
-  use_perception_cache: false                  # Enable cache-aware streaming for perception encoder
-  use_perception_cudagraph: false              # Enable CUDA graph-accelerated perception encoder  
+  codec_token_history_size: 60
+  use_perception_cache: true                  # Enable cache-aware streaming for perception encoder
+  use_perception_cudagraph: true              # Enable CUDA graph-accelerated perception encoder  
 
   top_p: 1.0
   repetition_penalty: 1.0

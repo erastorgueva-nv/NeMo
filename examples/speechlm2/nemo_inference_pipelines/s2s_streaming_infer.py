@@ -133,10 +133,10 @@ def main(cfg: DictConfig):
     torch.set_float32_matmul_precision(matmul_precision)
     logging.info(f"Using matmul precision: {matmul_precision}")
 
-    generator = S2SPipelineBuilder.build_pipeline(cfg)
+    pipeline = S2SPipelineBuilder.build_pipeline(cfg)
 
     start = time()
-    output = generator.run(audio_filepaths)
+    output = pipeline.run(audio_filepaths)
     exec_dur = time() - start
     logging.info(f"Generated {len(audio_filepaths)} files in {exec_dur:.2f}s")
 

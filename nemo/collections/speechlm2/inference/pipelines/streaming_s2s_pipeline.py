@@ -30,17 +30,17 @@ from nemo.collections.asr.inference.streaming.buffering.audio_bufferer import Ba
 from nemo.collections.asr.inference.utils.progressbar import ProgressBar
 from nemo.collections.speechlm2.inference.pipelines.s2s_pipeline_interface import S2SPipelineInterface
 from nemo.collections.speechlm2.inference.streaming.state.s2s_state import S2SStreamingState
-from nemo.collections.speechlm2.inference.model_wrappers.realtime_streaming_wrapper import RealtimeStreamingInference
+from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_inference_wrapper import NemotronVoicechatInferenceWrapper
 from nemo.collections.speechlm2.inference.streaming.state.s2s_context_manager import S2SContextManager
 from nemo.collections.speechlm2.inference.utils.pipeline_utils import PipelineOutput
 
 
-class StreamingS2SGenerator(S2SPipelineInterface):
+class StreamingS2SPipeline(S2SPipelineInterface):
 	"""
-	Streaming S2S generator.
+	Streaming S2S pipeline.
 	"""
 
-	def __init__(self, cfg: DictConfig, s2s_model: RealtimeStreamingInference):
+	def __init__(self, cfg: DictConfig, s2s_model: NemotronVoicechatInferenceWrapper):
 		# ------------------------------------------------------------------
 		# Model & device
 		# ------------------------------------------------------------------
@@ -110,7 +110,7 @@ class StreamingS2SGenerator(S2SPipelineInterface):
 
 		#self.window = torch.hamming_window(self.window_size)
 
-		# Output directory for enhanced files
+		# Output directory for generated files
 		self.output_dir = getattr(cfg, "output_dir", "./generated")
 
 		# Parse and validate request type early, with a safe default
@@ -169,7 +169,7 @@ class StreamingS2SGenerator(S2SPipelineInterface):
 
 
 	def inner_generate_step(self, frames: List[Frame], buffers: List[Tensor], left_paddings: List[int], ready_feats: List[bool]):
-		"""Enhance chunks in *batch* using a shared ContextManager."""
+		"""Generate speech for chunks in *batch* using a shared ContextManager."""
 		if len(frames) == 0:
 			return
 
@@ -182,7 +182,7 @@ class StreamingS2SGenerator(S2SPipelineInterface):
 		if len(frames) == 0:
 			return
 		if len(frames) != 1:
-			raise NotImplementedError("RealtimeStreamingInference currently supports batch_size == 1")
+			raise NotImplementedError("NemotronVoicechatInferenceWrapper currently supports batch_size == 1")
 
 		# Retrieve per-stream cache slices
 		# If this is the first frame of a stream, ensure we have a fresh context
@@ -290,7 +290,6 @@ class StreamingS2SGenerator(S2SPipelineInterface):
 	# ------------------------------------------------------------------
 	# Finalization helpers
 	# ------------------------------------------------------------------
-	# TODO - update from enhancement to s2s
 	def _finalize_and_save_finished_streams(
 		self,
 		frames: List[Frame],
@@ -368,7 +367,7 @@ class StreamingS2SGenerator(S2SPipelineInterface):
 
 
 	# ------------------------------------------------------------------
-	# Session helpers (extend BaseGenerator)
+	# Session helpers (extend S2SPipelineInterface)
 	# ------------------------------------------------------------------
 
 	def reset_session(self) -> None:
@@ -388,7 +387,7 @@ class StreamingS2SGenerator(S2SPipelineInterface):
 		audio_filepaths: List[str],
 		progress_bar: Optional[ProgressBar] = None,
 	) -> PipelineOutput:
-		"""Stream all *audio_filepaths* through the generator and save outputs.
+		"""Stream all *audio_filepaths* through the pipeline and save outputs.
 
 		Saves one generated ``.wav`` per input under ``self.output_dir`` and
 		returns their paths in ``PipelineOutput.texts``.

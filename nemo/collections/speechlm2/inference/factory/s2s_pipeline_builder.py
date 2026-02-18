@@ -15,8 +15,8 @@
 from omegaconf.dictconfig import DictConfig
 
 from nemo.utils import logging as logger
-from nemo.collections.speechlm2.inference.pipelines.streaming_s2s_pipeline import StreamingS2SGenerator
-from nemo.collections.speechlm2.inference.model_wrappers.realtime_streaming_wrapper import RealtimeStreamingInference
+from nemo.collections.speechlm2.inference.pipelines.streaming_s2s_pipeline import StreamingS2SPipeline
+from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_inference_wrapper import NemotronVoicechatInferenceWrapper
 
 
 class S2SPipelineBuilder:
@@ -26,23 +26,22 @@ class S2SPipelineBuilder:
     def build_pipeline(
             cls,
             cfg: DictConfig
-    ) -> RealtimeStreamingInference:
+    ) -> StreamingS2SPipeline:
         """
         Build the streaming S2S pipeline based on the config.
         Args:
             cfg: (DictConfig) Config
         Returns:
-            Returns StreamingS2SGenerator object
+            Returns StreamingS2SPipeline object
         """
-        # building enhancement model
-        gen_model = RealtimeStreamingInference(model_cfg=cfg.s2s)
+        s2s_model = NemotronVoicechatInferenceWrapper(model_cfg=cfg.s2s)
 
-        logger.info(f"Duplex model `{cfg.s2s.model_path}` loaded")
+        logger.info(f"S2S model `{cfg.s2s.model_path}` loaded")
 
-        generator = StreamingS2SGenerator(
+        pipeline = StreamingS2SPipeline(
             cfg,
-            gen_model,
+            s2s_model,
         )
-        logger.info(f"`{type(generator).__name__}` generator loaded")
-        return generator
+        logger.info(f"`{type(pipeline).__name__}` pipeline loaded")
+        return pipeline
 

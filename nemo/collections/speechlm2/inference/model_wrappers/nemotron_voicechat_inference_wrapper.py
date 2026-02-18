@@ -173,9 +173,9 @@ class PerceptionCUDAGraphState:
         return self.graph_first is not None and self.graph_subsequent is not None
 
 
-class RealtimeStreamingInference:
+class NemotronVoicechatInferenceWrapper:
     """
-    Realtime streaming inference that simulates microphone data capture.
+    Inference wrapper for NemotronVoiceChat models.
     Uses a sliding window buffer and processes audio frame by frame.
     """
 
@@ -293,7 +293,7 @@ class RealtimeStreamingInference:
         self._initialize_model()
 
 
-        logging.info(f"\n✅ RealtimeStreamingInference initialized successfully.")
+        logging.info(f"\n✅ NemotronVoicechatInferenceWrapper initialized successfully.")
 
         logging.info(f"{self.model.stt_model.perception.encoder._cfg = }")
         logging.info(f"{self.model.stt_model.perception.encoder.streaming_cfg = }")
@@ -2089,7 +2089,7 @@ def main():
 
         model_cfg = OmegaConf.create(model_cfg_dict)
 
-        model = RealtimeStreamingInference(model_cfg=model_cfg)
+        model = NemotronVoicechatInferenceWrapper(model_cfg=model_cfg)
 
         # =========================================
         # BATCH MODE: Process JSON input

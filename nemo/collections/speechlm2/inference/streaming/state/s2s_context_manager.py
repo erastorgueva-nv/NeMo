@@ -20,7 +20,7 @@ import torch
 from transformers import DynamicCache
 
 if TYPE_CHECKING:
-    from nemo.collections.speechlm2.inference.model_wrappers.realtime_streaming_wrapper import PerceptionCacheState
+    from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_inference_wrapper import PerceptionCacheState
 
 
 @dataclass
@@ -51,7 +51,7 @@ class S2SContextManager:
 		
 		# Detect Nemotron models and disable caching (they require NemotronHHybridDynamicCache which isn't supported yet)
 		# Directly access the configuration path used in inference_streaming_realtime.py
-		# self.s2s_model is RealtimeStreamingInference
+		# self.s2s_model is NemotronVoicechatInferenceWrapper
 		# self.s2s_model.model is NemotronVoiceChat
 		# self.s2s_model.model.stt_model is the STT model
 		# Note: using getattr to be safe against structure changes, but aiming for stt_model.cfg.pretrained_llm

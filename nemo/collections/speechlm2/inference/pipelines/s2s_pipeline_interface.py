@@ -16,12 +16,12 @@ from typing import Dict, Any
 
 
 class S2SPipelineInterface:
-    """Base class for all streaming S2S generators.
+    """Base class for all streaming S2S pipelines.
 
     This class is intentionally kept minimal and mirrors the behaviour of
     ``BasePipeline`` that is used for streaming ASR pipelines.  It
     provides a small in-memory *state pool* that stores per-stream objects
-    (cache, running buffers, etc.) required by a concrete generator
+    (cache, running buffers, etc.) required by a concrete pipeline
     implementation.  Sub-classes are expected to implement
     :py:meth:`create_state` to construct a fresh state object.
     """
@@ -45,7 +45,7 @@ class S2SPipelineInterface:
     def create_state(self):  # noqa: D401 (keep same signature as recognizers)
         """Create and return a *new*, *empty* state object.
 
-        Must be implemented by concrete generators.
+        Must be implemented by concrete pipelines.
         """
         raise NotImplementedError("`create_state()` must be implemented in a subclass.")
 
@@ -56,10 +56,10 @@ class S2SPipelineInterface:
         return self._state_pool[stream_id]
 
     # ------------------------------------------------------------------
-    # Session helpers – identical to *BaseRecognizer*
+    # Session helpers – identical to *BasePipeline*
     # ------------------------------------------------------------------
     def reset_session(self) -> None:
-        """Clear the internal *state pool* – effectively resetting the generator."""
+        """Clear the internal *state pool* – effectively resetting the pipeline."""
         self._state_pool.clear()
 
     def open_session(self) -> None:

@@ -75,7 +75,7 @@ class TritonPythonModel:
                 OmegaConf.update(cfg, cfg_key, default, force_add=True)
 
     def load_model(self, config_path: str):
-        """Load the S2S generator model from a YAML config file.
+        """Load the S2S pipeline from a YAML config file.
         
         Args:
             config_path: Path to a shared YAML config file (s2s_streaming.yaml).
@@ -85,11 +85,11 @@ class TritonPythonModel:
         cfg = OmegaConf.load(config_path)
         self._resolve_env_overrides(cfg)
 
-        self.generator = S2SPipelineBuilder.build_pipeline(cfg)
-        self.generator.open_session()
+        self.pipeline = S2SPipelineBuilder.build_pipeline(cfg)
+        self.pipeline.open_session()
         
-        # Compute chunk size in samples from the generator's config
-        self.chunk_size = int(self.generator.chunk_size_in_secs * self.generator.input_sample_rate)
+        # Compute chunk size in samples from the pipeline's config
+        self.chunk_size = int(self.pipeline.chunk_size_in_secs * self.pipeline.input_sample_rate)
         
         # Track text positions to return only incremental updates
         self.text_positions = {}  # stream_id -> last_text_length
@@ -124,7 +124,7 @@ class TritonPythonModel:
     def finalize(self) -> None:
         """Finalize the model."""
         # Close the session, clear state pool, and empty CUDA cache
-        self.generator.close_session()
+        self.pipeline.close_session()
         torch.cuda.empty_cache()
     
     @staticmethod
@@ -203,7 +203,7 @@ class TritonPythonModel:
         """
         Generate speech for the requests.
         
-        Uses StreamingS2SGenerator.generate_step() which updates internal state,
+        Uses StreamingS2SPipeline.generate_step() which updates internal state,
         then extracts results from per-stream S2SStreamingState objects.
         
         Returns a list of tuples, where each tuple contains:
@@ -213,7 +213,7 @@ class TritonPythonModel:
         """
         _t_generate_step = time.time()
         # generate_step updates internal states (no return value)
-        self.generator.generate_step(frames)
+        self.pipeline.generate_step(frames)
         _t_generate_step_done = time.time()
         
         _t_extract = time.time()
@@ -223,7 +223,7 @@ class TritonPythonModel:
             stream_id = frame.stream_id
             
             # Access the per-stream state updated by generate_step
-            state = self.generator.get_or_create_state(stream_id)
+            state = self.pipeline.get_or_create_state(stream_id)
             
             # Extract generated audio (accumulated since last cleanup_after_response)
             audio = state.audio_buffer
@@ -255,7 +255,7 @@ class TritonPythonModel:
             
             # Clean up finished streams
             if frame.is_last:
-                self.generator.delete_state(stream_id)
+                self.pipeline.delete_state(stream_id)
                 # Remove text position tracking for finished stream
                 if stream_id in self.text_positions:
                     del self.text_positions[stream_id]
