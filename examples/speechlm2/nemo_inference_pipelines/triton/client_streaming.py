@@ -53,6 +53,7 @@ parser.add_argument("--num_frames_per_inference", type=int, default=DEFAULT_NUM_
 parser.add_argument("--audio_filename", type=str, required=True, help="Path to input audio file")
 parser.add_argument("--dur_test_audio", type=int, default=DEFAULT_DUR_TEST_AUDIO, help=f"Duration of test audio in seconds; audio will be padded or trimmed to this length (default: {DEFAULT_DUR_TEST_AUDIO})")
 parser.add_argument("--output_dir", type=str, default=".", help="Directory to save output audio files (default: current directory)")
+parser.add_argument("--system_prompt", type=str, default=None, help="System prompt to send to the model on the first request (overrides server default)")
 args = parser.parse_args()
 
 model_name = "voicechat"
@@ -132,6 +133,43 @@ with grpcclient.InferenceServerClient(f"{args.host}:{args.port}") as client:
     sequence_id = random.randint(1, 2**63 - 1)  # Generate random uint64 value
     
     try:
+        # If a system prompt is provided, send a separate prefill request first:
+        # zero-length audio + system_prompt, with sequence_start=True.
+        prefill_sent = False
+        if args.system_prompt is not None:
+            logger.info(f"Sending prefill request with system_prompt ({len(args.system_prompt)} chars)")
+            empty_audio = np.zeros((1, 0), dtype=np.float32)
+            prefill_inputs = [
+                grpcclient.InferInput(
+                    "audio_signal", empty_audio.shape, np_to_triton_dtype(empty_audio.dtype)
+                ),
+            ]
+            prefill_inputs[0].set_data_from_numpy(empty_audio)
+
+            prompt_np = np.array([args.system_prompt.encode("utf-8")], dtype=object)
+            prompt_input = grpcclient.InferInput("system_prompt", prompt_np.shape, "BYTES")
+            prompt_input.set_data_from_numpy(prompt_np)
+            prefill_inputs.append(prompt_input)
+
+            prefill_outputs = [
+                grpcclient.InferRequestedOutput("output_text"),
+                grpcclient.InferRequestedOutput("output_asr_text"),
+                grpcclient.InferRequestedOutput("output_audio"),
+            ]
+
+            prefill_start = time.time()
+            client.infer(
+                model_name,
+                prefill_inputs,
+                request_id=str(uuid.uuid4()),
+                outputs=prefill_outputs,
+                sequence_id=sequence_id,
+                sequence_start=True,
+                sequence_end=False,
+            )
+            logger.info(f"Prefill completed in {time.time() - prefill_start:.3f}s")
+            prefill_sent = True
+
         for idx, audio_chunk in tqdm(enumerate(audio_signal_chunks)):
             inputs = [
                 grpcclient.InferInput(
@@ -154,7 +192,7 @@ with grpcclient.InferenceServerClient(f"{args.host}:{args.port}") as client:
                 request_id=str(uuid.uuid4()),
                 outputs=outputs,
                 sequence_id=sequence_id,
-                sequence_start=idx == 0,
+                sequence_start=(idx == 0 and not prefill_sent),
                 sequence_end=idx == len(audio_signal_chunks) - 1,
             )
             end_time = time.time()

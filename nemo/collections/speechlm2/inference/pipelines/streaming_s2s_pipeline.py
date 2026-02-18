@@ -32,6 +32,7 @@ from nemo.collections.speechlm2.inference.pipelines.s2s_pipeline_interface impor
 from nemo.collections.speechlm2.inference.streaming.state.s2s_state import S2SStreamingState
 from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_inference_wrapper import NemotronVoicechatInferenceWrapper
 from nemo.collections.speechlm2.inference.streaming.state.s2s_context_manager import S2SContextManager
+from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
 from nemo.collections.speechlm2.inference.utils.pipeline_utils import PipelineOutput
 
 
@@ -121,6 +122,8 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 		if self.request_type is not RequestType.FRAME:
 			raise ValueError(f"Request type {self.request_type} is not supported for s2s.")
 
+		self._stream_has_prompt: bool = False
+
 		super().__init__()
 
 	# --------------------------------  ----------------------------------
@@ -184,39 +187,28 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 		if len(frames) != 1:
 			raise NotImplementedError("NemotronVoicechatInferenceWrapper currently supports batch_size == 1")
 
-		# Retrieve per-stream cache slices
-		# If this is the first frame of a stream, ensure we have a fresh context
-		tts_prefill_code = None
+		# If this is the first audio frame and prefill was already done via a
+		# zero-length prefill frame, skip context init -- it's already set up.
+		# Otherwise (no system prompt), create a fresh context_manager.
 		has_prompt = False
 		if bos_flags[0]:
-			print(f"🎬 Starting new stream {stream_ids[0]} - ensuring clean state")
-			# Recreate context_manager entirely to ensure fresh KV cache (BS=1)
-			self.context_manager = S2SContextManager(
-				s2s_model=self.s2s_model,
-				num_slots=self.batch_size,
-				max_len=self.max_len,
-				use_cache=self.use_cache,
-			)
-			
-			# Prefill TTS speaker embedding and system prompt for new stream
-			# Returns TTS prefill output code if vLLM EarTTS prefill happened
-			tts_prefill_code = self._prefill_system_prompt(stream_ids[0])
-			# Track whether a system prompt was prefilled so that infer_one_step
-			# uses pad embedding (not BOS) at frame 0 — matching the standalone pipeline.
-			has_prompt = bool(self.system_prompt)
+			if self._stream_has_prompt:
+				print(f"⏱ inner_generate_step: prefill already done for stream {stream_ids[0]}, skipping context init")
+			else:
+				print(f"⏱ inner_generate_step: no prefill for stream {stream_ids[0]}, creating fresh context_manager")
+				self.context_manager = S2SContextManager(
+					s2s_model=self.s2s_model,
+					num_slots=self.batch_size,
+					max_len=self.max_len,
+					use_cache=self.use_cache,
+				)
+
+		has_prompt = self._stream_has_prompt
+		self._stream_has_prompt = False
 		
 		request_id = self._request_id_for_stream(stream_ids[0])
 		
 		context, _ = self.context_manager.get_context(stream_ids)
-		
-		# NOTE: Do NOT update context.code with tts_prefill_code!
-		# The batch approach (inference_streaming_realtime.py) uses first_tts_code_input
-		# (the INPUT codes from speaker reference), not the prefill OUTPUT codes.
-		# Using prefill output codes causes audio quality degradation (mumbling).
-		# The context.code is already correctly initialized to first_tts_code_input
-		# in context_manager._create_context().
-		if tts_prefill_code is not None:
-			print(f"   TTS prefill generated codes shape: {tts_prefill_code.shape} (not used - using first_tts_code_input instead)")
 
 		# Debug: print context_manager contents and sizes
 		print(f"📊 S2SContextManager state:")
@@ -278,10 +270,64 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 		# Log audio and attach text to state
 		self.log_output(frames, result["decoded_audio_new"], ready_feats, result["predicted_text_strs"], result.get("asr_predicted_text_strs"))
 
+	def prefill_for_new_stream(self, stream_id: int, system_prompt: str | None = None) -> bool:
+		"""Prepare the pipeline for a new stream by resetting context and prefilling the system prompt.
+
+		This is the public API for prefill-only calls (e.g. from the Triton backend)
+		that need to initialize TTS speaker embeddings and/or inject a system prompt
+		into the LLM KV cache *without* processing any audio.
+
+		Args:
+			stream_id: Unique identifier for the new stream.
+			system_prompt: System prompt text. If *None*, falls back to
+				the YAML-configured ``self.system_prompt``.
+
+		Returns:
+			True if a system prompt was prefilled, False otherwise.
+		"""
+		t0 = time.time()
+		if system_prompt is None:
+			system_prompt = self.system_prompt
+
+		self.context_manager = S2SContextManager(
+			s2s_model=self.s2s_model,
+			num_slots=self.batch_size,
+			max_len=self.max_len,
+			use_cache=self.use_cache,
+		)
+		t_ctx = time.time()
+
+		with torch.no_grad(), torch.inference_mode():
+			self._prefill_system_prompt(stream_id, system_prompt)
+		t_prefill = time.time()
+
+		self._stream_has_prompt = bool(system_prompt)
+		print(f"⏱ prefill_for_new_stream: context_manager={1000*(t_ctx-t0):.1f}ms, "
+			  f"_prefill_system_prompt={1000*(t_prefill-t_ctx):.1f}ms, "
+			  f"total={1000*(t_prefill-t0):.1f}ms, has_prompt={self._stream_has_prompt}")
+		return self._stream_has_prompt
+
 	def generate_step(self, frames: List[Frame]):
-		"""Main streaming API similar to *transcribe_step* in recognizers."""
+		"""Main streaming API similar to *transcribe_step* in recognizers.
+
+		If the batch contains a single zero-length first frame with a system
+		prompt in ``options``, this is treated as a **prefill-only** request:
+		the context manager and system prompt are initialized but no audio
+		inference runs.  This is the unified protocol used by both the CLI
+		(``run()``) and the Triton backend.
+		"""
+		# Detect prefill-only frame: is_first + zero-length audio
+		if (len(frames) == 1
+				and frames[0].is_first
+				and frames[0].samples.numel() == 0):
+			opts = frames[0].options
+			prompt = None
+			if opts is not None and hasattr(opts, "system_prompt"):
+				prompt = opts.system_prompt
+			self.prefill_for_new_stream(frames[0].stream_id, prompt)
+			return
+
 		buffers, left_paddings = self.bufferer.update(frames)
-		# For now, treat all buffered features as ready
 		ready_feats = [True] * len(frames)
 
 		with torch.no_grad(), torch.inference_mode():
@@ -385,6 +431,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 	def run(
 		self,
 		audio_filepaths: List[str],
+		options: List[S2SRequestOptions] | None = None,
 		progress_bar: Optional[ProgressBar] = None,
 	) -> PipelineOutput:
 		"""Stream all *audio_filepaths* through the pipeline and save outputs.
@@ -395,6 +442,9 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 		if progress_bar and not isinstance(progress_bar, ProgressBar):
 			raise ValueError("progress_bar must be an instance of ProgressBar.")
 		
+		if options is None:
+			options = [S2SRequestOptions(system_prompt=self.system_prompt) for _ in audio_filepaths]
+
 		streamer = ContinuousBatchedFrameStreamer(
 			n_frames_per_stream=1,
 			frame_size_in_secs=self.chunk_size_in_secs,
@@ -403,7 +453,6 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 			pad_last_frame=True,
 		)
 		
-		options = [None] * len(audio_filepaths)
 		streamer.set_audio_filepaths(audio_filepaths, options)
 		streamer.set_progress_bar(progress_bar)
 
@@ -415,6 +464,22 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
 		self.open_session()
 		for frames in streamer:
+			# Unified prefill protocol: if the first frame of a new stream
+			# carries a system prompt, emit a zero-length prefill frame first.
+			if (len(frames) == 1
+					and frames[0].is_first
+					and frames[0].options is not None
+					and hasattr(frames[0].options, "system_prompt")
+					and frames[0].options.system_prompt):
+				prefill_frame = Frame(
+					samples=torch.empty(0),
+					stream_id=frames[0].stream_id,
+					is_first=True,
+					is_last=False,
+					options=frames[0].options,
+				)
+				self.generate_step([prefill_frame])
+
 			self.generate_step(frames)
 			self._finalize_and_save_finished_streams(frames, audio_filepaths, saved_paths_by_stream)
 		# Build outputs before closing the session
@@ -436,13 +501,19 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
 		return PipelineOutput(texts=texts, words=words, asr_texts=asr_texts)
 
-	def _prefill_system_prompt(self, stream_id: int) -> Optional[torch.Tensor]:
+	def _prefill_system_prompt(self, stream_id: int, system_prompt: str | None = None) -> Optional[torch.Tensor]:
 		"""Prefill the system prompt for a new stream.
 		
 		This prepares the system prompt embeddings and processes them through
 		the LLM to update the KV cache before audio streaming begins.
 		Also prefills the TTS model with speaker embeddings when using vLLM EarTTS.
 		
+		Args:
+			stream_id: The stream identifier.
+			system_prompt: The system prompt text for this stream. If *None*,
+				TTS prefill still runs (for vLLM EarTTS) but no LLM prompt
+				is injected.
+
 		Note on TTS prefill codes:
 			The TTS prefill generates output codes, but these should NOT be used
 			to initialize context.code for inference. The batch approach uses
@@ -485,12 +556,12 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 			else:
 				print(f"   ⚠️  TTS init inputs not available, skipping TTS prefill")
 		
-		if not self.system_prompt:
+		if not system_prompt:
 			return tts_output_code
 		
 		print(f"📝 Prefilling system prompt for stream {stream_id}...")
 		start_get_prompt_embeddings = time.time()
-		prompt_embedded, prompt_len = self.s2s_model._prepare_system_prompt_embeddings(self.system_prompt)
+		prompt_embedded, prompt_len = self.s2s_model._prepare_system_prompt_embeddings(system_prompt)
 		print(f"   Time taken to get prompt embeddings: {time.time() - start_get_prompt_embeddings:.3f}s")
 		
 		if prompt_embedded is None:

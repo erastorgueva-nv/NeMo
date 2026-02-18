@@ -34,42 +34,63 @@ import hydra
 import soundfile as sf
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.collections.speechlm2.inference.factory.s2s_pipeline_builder import S2SPipelineBuilder
+from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
 from nemo.collections.speechlm2.inference.utils.pipeline_utils import PipelineOutput
 from nemo.utils import logging
 from omegaconf import DictConfig
 import torch
 
 
-def get_audio_filepaths(audio_file: str, sort_by_duration: bool = True) -> List[str]:
+def prepare_audio_data(
+    audio_file: str,
+    default_system_prompt: str | None = None,
+    sort_by_duration: bool = True,
+) -> tuple[List[str], List[S2SRequestOptions]]:
     """
-    Get audio filepaths from a folder, a single audio file, or a manifest file.
-    Args:
-        audio_file: Path to the audio file, folder, or manifest file
-        sort_by_duration: If True, sort the audio files by duration from shortest to longest
+    Get audio filepaths and per-stream options from a folder, single file, or manifest.
+
+    When the input is a JSON manifest, each line may contain:
+        {"audio_filepath": "clip.wav", "system_prompt": "You are an AI assistant..."}
+    If ``system_prompt`` is absent on a line, *default_system_prompt* is used.
+
     Returns:
-        List of audio filepaths
+        (filepaths, options) -- parallel lists of audio paths and per-stream options.
     """
     audio_file = audio_file.strip()
     if not os.path.isabs(audio_file):
         audio_file = os.path.abspath(audio_file)
+
+    options: List[S2SRequestOptions] = []
+
     if os.path.isdir(audio_file):
         filepaths = [os.path.join(audio_file, x) for x in os.listdir(audio_file) if x.endswith(".wav")]
+        options = [S2SRequestOptions(system_prompt=default_system_prompt) for _ in filepaths]
     elif audio_file.endswith(".wav"):
         filepaths = [audio_file]
-    elif audio_file.endswith(".json"):
+        options = [S2SRequestOptions(system_prompt=default_system_prompt)]
+    elif audio_file.endswith((".json", ".jsonl")):
         samples = []
         with open(audio_file, 'r') as f:
             for line in f.readlines():
                 if line.strip():
                     samples.append(json.loads(line))
         filepaths = [get_full_path(entry["audio_filepath"], audio_file) for entry in samples]
+        options = [
+            S2SRequestOptions(
+                system_prompt=entry.get("system_prompt", default_system_prompt),
+            )
+            for entry in samples
+        ]
     else:
         raise ValueError(f"audio_file `{audio_file}` needs to be a folder, audio file, or manifest file")
 
     if sort_by_duration:
         durations = [sf.SoundFile(fp).frames for fp in filepaths]
-        filepaths = [fp for fp, _ in sorted(zip(filepaths, durations), key=lambda x: x[1])]
-    return filepaths
+        order = sorted(range(len(filepaths)), key=lambda i: durations[i])
+        filepaths = [filepaths[i] for i in order]
+        options = [options[i] for i in order]
+
+    return filepaths, options
 
 
 def calculate_duration(audio_filepaths: List[str]) -> float:
@@ -125,7 +146,8 @@ def dump_output(
 
 @hydra.main(config_path="./conf", config_name="s2s_streaming", version_base=None)
 def main(cfg: DictConfig):
-    audio_filepaths = get_audio_filepaths(cfg.audio_file)
+    default_system_prompt = cfg.get("s2s", {}).get("system_prompt", None)
+    audio_filepaths, options = prepare_audio_data(cfg.audio_file, default_system_prompt=default_system_prompt)
     logging.info(f"Found {len(audio_filepaths)} audio files to generate")
 
     # Set matmul precision
@@ -136,7 +158,7 @@ def main(cfg: DictConfig):
     pipeline = S2SPipelineBuilder.build_pipeline(cfg)
 
     start = time()
-    output = pipeline.run(audio_filepaths)
+    output = pipeline.run(audio_filepaths, options=options)
     exec_dur = time() - start
     logging.info(f"Generated {len(audio_filepaths)} files in {exec_dur:.2f}s")
 

@@ -20,6 +20,7 @@ import torch
 
 from nemo.collections.asr.inference.streaming.framing.request import Frame
 from nemo.collections.speechlm2.inference.factory.s2s_pipeline_builder import S2SPipelineBuilder
+from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
 
 import triton_python_backend_utils as pb_utils
 
@@ -190,11 +191,33 @@ class TritonPythonModel:
             except:
                 pass
             
+            # Extract optional per-stream system prompt (sent on the first request)
+            frame_options = None
+            if is_first:
+                system_prompt = None
+                try:
+                    prompt_tensor = pb_utils.get_input_tensor_by_name(request, "system_prompt")
+                    if prompt_tensor is not None:
+                        raw = prompt_tensor.as_numpy()[0]
+                        system_prompt = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+                except:
+                    pass
+                if system_prompt is None:
+                    system_prompt = self.pipeline.system_prompt
+                frame_options = S2SRequestOptions(system_prompt=system_prompt)
+
+            # Zero-length audio = prefill-only frame; pass through without padding
+            if audio_signal.size == 0:
+                samples = torch.empty(0, dtype=torch.float32)
+            else:
+                samples = self.pad_audio(audio_signal, self.chunk_size)
+
             frames.append(Frame(
-                samples=self.pad_audio(audio_signal, self.chunk_size),
+                samples=samples,
                 stream_id=stream_id,
                 is_first=is_first, 
-                is_last=is_last
+                is_last=is_last,
+                options=frame_options,
             ))
         
         return frames
@@ -205,6 +228,9 @@ class TritonPythonModel:
         
         Uses StreamingS2SPipeline.generate_step() which updates internal state,
         then extracts results from per-stream S2SStreamingState objects.
+
+        Zero-length first frames are prefill-only: generate_step handles them
+        internally and returns early; this method returns empty results for them.
         
         Returns a list of tuples, where each tuple contains:
         - generated audio tensor
@@ -212,7 +238,6 @@ class TritonPythonModel:
         - generated ASR text string (incremental, only new ASR text since last response)
         """
         _t_generate_step = time.time()
-        # generate_step updates internal states (no return value)
         self.pipeline.generate_step(frames)
         _t_generate_step_done = time.time()
         
@@ -221,42 +246,36 @@ class TritonPythonModel:
         
         for frame in frames:
             stream_id = frame.stream_id
+
+            # Prefill-only frames don't produce audio/text output
+            if frame.is_first and frame.samples.numel() == 0:
+                generations.append((torch.empty(1, 0), "", ""))
+                continue
             
-            # Access the per-stream state updated by generate_step
             state = self.pipeline.get_or_create_state(stream_id)
-            
-            # Extract generated audio (accumulated since last cleanup_after_response)
             audio = state.audio_buffer
             
-            # Extract full accumulated text
             full_text = state.get_output_text()
             full_asr_text = state.get_output_asr_text()
             
-            # Get incremental text (only new text since last response)
             if stream_id not in self.text_positions:
                 self.text_positions[stream_id] = 0
-            
             last_position = self.text_positions[stream_id]
-            incremental_text = full_text[last_position:]  # Only new text
+            incremental_text = full_text[last_position:]
             self.text_positions[stream_id] = len(full_text)
             
-            # Get incremental ASR text (only new ASR text since last response)
             if stream_id not in self.asr_text_positions:
                 self.asr_text_positions[stream_id] = 0
-            
             last_asr_position = self.asr_text_positions[stream_id]
-            incremental_asr_text = full_asr_text[last_asr_position:]  # Only new ASR text
+            incremental_asr_text = full_asr_text[last_asr_position:]
             self.asr_text_positions[stream_id] = len(full_asr_text)
             
             generations.append((audio, incremental_text, incremental_asr_text))
             
-            # Clear transient audio buffer so next step only returns new audio
             state.cleanup_after_response()
             
-            # Clean up finished streams
             if frame.is_last:
                 self.pipeline.delete_state(stream_id)
-                # Remove text position tracking for finished stream
                 if stream_id in self.text_positions:
                     del self.text_positions[stream_id]
                 if stream_id in self.asr_text_positions:
@@ -270,6 +289,10 @@ class TritonPythonModel:
     
     def execute(self, requests: Iterable) -> List[pb_utils.InferenceResponse]:
         """Execute the model and return the responses.
+        
+        Zero-length audio with ``sequence_start=True`` and a ``system_prompt``
+        is treated as a prefill-only request by the pipeline (no fake audio
+        needed).  All other requests are normal audio generation.
         
         Returns:
         - output_audio: float32 array of generated audio samples
@@ -286,38 +309,27 @@ class TritonPythonModel:
         generations = self.get_generations(frames)
         _t_generations_done = time.time()
         
-        _t_response_build = time.time()
         responses = []
-        for generation in generations:
-            audio, text, asr_text = generation
-            
-            # Convert audio tensor to numpy array
-            # Audio shape is typically [1, num_samples]
+        for audio, text, asr_text in generations:
             if isinstance(audio, torch.Tensor):
                 audio_np = audio.detach().cpu().numpy().astype(np.float32)
-                # Ensure 2D shape [1, num_samples] for output
                 if audio_np.ndim == 1:
                     audio_np = audio_np.reshape(1, -1)
             else:
                 audio_np = np.zeros((1, 0), dtype=np.float32)
             
-            # Encode text as UTF-8 bytes
             text_np = np.array([text.encode('utf-8')], dtype=object)
             asr_text_np = np.array([asr_text.encode('utf-8')], dtype=object)
             
-            # Create output tensors with correct names matching config.pbtxt
-            out_audio = pb_utils.Tensor("output_audio", audio_np)
-            out_text = pb_utils.Tensor("output_text", text_np)
-            out_asr_text = pb_utils.Tensor("output_asr_text", asr_text_np)
-            
-            inference_response = pb_utils.InferenceResponse(output_tensors=[out_audio, out_text, out_asr_text])
-            responses.append(inference_response)
-        _t_response_build_done = time.time()
+            responses.append(pb_utils.InferenceResponse(output_tensors=[
+                pb_utils.Tensor("output_audio", audio_np),
+                pb_utils.Tensor("output_text", text_np),
+                pb_utils.Tensor("output_asr_text", asr_text_np),
+            ]))
 
         end_time = time.time()
         logging.info(f"TritonPythonModel.execute time: {end_time - start_time:.2f} seconds")
         logging.info(f"execute() breakdown: triton_requests_to_frames={(_t_to_frames_done - _t_to_frames)*1000:.2f}ms, "
-                     f"get_generations={(_t_generations_done - _t_generations)*1000:.2f}ms, "
-                     f"response_build={(_t_response_build_done - _t_response_build)*1000:.2f}ms")
+                     f"get_generations={(_t_generations_done - _t_generations)*1000:.2f}ms")
             
         return responses
