@@ -15,8 +15,7 @@
 # Runtime args (overridden via CLI)
 # audio_file: "/path/to/your/audio_or_directory"
 audio_file: ???
-output_filename: ./generated/output.json
-output_ctm_dir: ./generated/ctm
+output_dir: ./generated
 
 # Input audio padding (set at most one; null = disabled)
 pad_to_duration_secs: null   # Pad each audio to this fixed duration (seconds)

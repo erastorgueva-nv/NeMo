@@ -138,6 +138,7 @@ def clean_pred_text(text: str) -> str:
     if not text:
         return ""
     text = text.lstrip('^')
+    text = re.sub(r'</?s>', '', text)
     text = re.sub(r'<\$[\d.]+\$>', '', text)
     text = re.sub(r'<\|[\d.]+\|>', '', text)
     text = re.sub(r'<SPECIAL_12>', '', text)
@@ -150,29 +151,29 @@ def clean_pred_text(text: str) -> str:
 def dump_output(
     audio_filepaths: List[str],
     output: PipelineOutput,
-    output_filename: str,
+    output_dir: str,
     options: List[S2SRequestOptions],
-    output_ctm_dir: Optional[str] = None,
+    ground_truths: List[str | None],
 ) -> None:
     """
     Dump the transcriptions to an output file.
     Args:
         audio_filepaths: List of audio file paths
         output: Pipeline output
-        output_filename: Path to the output file
+        output_dir: Directory for all output files
         options: Per-stream request options (carries the system prompt)
-        output_ctm_dir: Path to the output CTM directory
+        ground_truths: Ground-truth texts (None when unavailable)
     """
-    if output_ctm_dir is None:
-        output_ctm_dir = os.path.join(os.path.dirname(output_filename), "ctm")
+    output_filename = os.path.join(output_dir, "output.json")
+    output_ctm_dir = os.path.join(output_dir, "ctm")
 
     os.makedirs(output_ctm_dir, exist_ok=True)
 
     asr_texts = output.asr_texts if output.asr_texts is not None else [None] * len(audio_filepaths)
 
     with open(output_filename, 'w') as fout:
-        for audio_filepath, text, words, asr_text, opts in zip(
-            audio_filepaths, output.texts, output.words, asr_texts, options,
+        for audio_filepath, pred_text, words, pred_src_text, opts, gt in zip(
+            audio_filepaths, output.texts, output.words, asr_texts, options, ground_truths,
         ):
             stem = os.path.splitext(os.path.basename(audio_filepath))[0]
             ctm_filepath = os.path.abspath(os.path.join(output_ctm_dir, f"{stem}.ctm"))
@@ -182,14 +183,15 @@ def dump_output(
                     ctm_fout.write(f"{stem} {ctm_line}\n")
 
             item = {
+                "id": stem,
                 "audio_filepath": audio_filepath,
-                "text": text,
+                "src_text": gt or "",
+                "pred_src_text": pred_src_text or "",
+                "pred_text": pred_text or "",
+                "pred_audio": os.path.join(output_dir, "wav", f"{stem}.wav"),
                 "ctm_filepath": ctm_filepath,
+                "system_prompt": opts.system_prompt or "",
             }
-            if asr_text is not None:
-                item["asr_text"] = asr_text
-            if opts.system_prompt is not None:
-                item["system_prompt"] = opts.system_prompt
             json.dump(item, fout, ensure_ascii=False)
             fout.write('\n')
             fout.flush()
@@ -199,7 +201,7 @@ def dump_output(
 def main(cfg: DictConfig):
     default_system_prompt = cfg.get("s2s", {}).get("system_prompt", None)
     audio_filepaths, options, ground_truths = prepare_audio_data(
-        cfg.audio_file, default_system_prompt=default_system_prompt,
+        cfg.audio_file, default_system_prompt=default_system_prompt, sort_by_duration=False,
     )
     logging.info(f"Found {len(audio_filepaths)} audio files to generate")
 
@@ -243,8 +245,9 @@ def main(cfg: DictConfig):
         )
 
     # Dump the transcriptions and CTMs
-    dump_output(audio_filepaths, output, cfg.output_filename, options, cfg.output_ctm_dir)
-    logging.info(f"Transcriptions written to {cfg.output_filename}")
+    output_dir = cfg.get("output_dir", "./generated")
+    dump_output(audio_filepaths, output, output_dir, options, ground_truths)
+    logging.info(f"Transcriptions written to {output_dir}/output.json")
 
 
 if __name__ == "__main__":

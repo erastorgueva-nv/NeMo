@@ -368,10 +368,18 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 					generated_audio = generated_audio.squeeze(0)
 				generated_audio = generated_audio.to(torch.float32)
 
-				# Build output path mirroring input filename under output_dir
+				# Build output paths in subdirectories under output_dir
 				in_path = audio_filepaths[stream_id]
 				base = os.path.splitext(os.path.basename(in_path))[0]
-				out_path = os.path.join(self.output_dir, f"{base}.wav")
+
+				wav_dir = os.path.join(self.output_dir, "wav")
+				stereo_dir = os.path.join(self.output_dir, "stereo")
+				txt_dir = os.path.join(self.output_dir, "txt")
+				os.makedirs(wav_dir, exist_ok=True)
+				os.makedirs(stereo_dir, exist_ok=True)
+				os.makedirs(txt_dir, exist_ok=True)
+
+				out_path = os.path.join(wav_dir, f"{base}.wav")
 
 				# Write audio to disk
 				if generated_audio.numel() > 0:
@@ -381,7 +389,6 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 				# Load input with librosa (handles mono conversion and resampling)
 				input_np, _ = librosa.load(in_path, sr=self.output_sample_rate, mono=True)
 				input_audio = torch.from_numpy(input_np).to(torch.float32)
-				# Length-match to generated output
 				gen_cpu = generated_audio.detach().cpu().to(input_audio.dtype)
 				gen_len = int(gen_cpu.shape[-1])
 				in_len = int(input_audio.shape[-1])
@@ -390,27 +397,24 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 					input_audio = torch.cat([input_audio, pad], dim=-1)
 				elif in_len > gen_len:
 					input_audio = input_audio[:gen_len]
-				# Assemble stereo [samples, channels] and save
 				stereo = torch.stack([input_audio, gen_cpu], dim=0).transpose(0, 1)
-				stereo_path = os.path.join(self.output_dir, f"{base}_input_output.wav")
+				stereo_path = os.path.join(stereo_dir, f"{base}_input_output.wav")
 				sf.write(stereo_path, stereo.detach().cpu().numpy(), self.output_sample_rate)
 
-				# Also save accumulated text next to audio
+				# Save accumulated text
 				text_out = state.get_output_text() if hasattr(state, "get_output_text") else ""
 				if isinstance(text_out, str):
-					text_path = os.path.join(self.output_dir, f"{base}.txt")
 					try:
-						with open(text_path, "w", encoding="utf-8") as f:
+						with open(os.path.join(txt_dir, f"{base}.txt"), "w", encoding="utf-8") as f:
 							f.write(text_out)
 					except Exception:
 						pass
 
-				# Also save accumulated ASR text
+				# Save accumulated ASR text
 				asr_text_out = state.get_output_asr_text() if hasattr(state, "get_output_asr_text") else ""
 				if isinstance(asr_text_out, str) and asr_text_out:
-					asr_text_path = os.path.join(self.output_dir, f"{base}_asr.txt")
 					try:
-						with open(asr_text_path, "w", encoding="utf-8") as f:
+						with open(os.path.join(txt_dir, f"{base}_asr.txt"), "w", encoding="utf-8") as f:
 							f.write(asr_text_out)
 					except Exception:
 						pass
