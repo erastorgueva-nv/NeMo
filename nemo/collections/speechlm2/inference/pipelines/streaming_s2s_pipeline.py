@@ -124,6 +124,14 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
 		self._stream_has_prompt: bool = False
 
+		# ------------------------------------------------------------------
+		# Input audio padding (silence appended after real audio)
+		# ------------------------------------------------------------------
+		self.pad_to_duration_secs: float | None = cfg.get("pad_to_duration_secs", None)
+		self.pad_silence_ratio: float | None = cfg.get("pad_silence_ratio", None)
+		if self.pad_to_duration_secs and self.pad_silence_ratio:
+			raise ValueError("Set pad_to_duration_secs or pad_silence_ratio, not both")
+
 		super().__init__()
 
 	# --------------------------------  ----------------------------------
@@ -441,7 +449,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 		"""
 		if progress_bar and not isinstance(progress_bar, ProgressBar):
 			raise ValueError("progress_bar must be an instance of ProgressBar.")
-		
+
 		if options is None:
 			options = [S2SRequestOptions(system_prompt=self.system_prompt) for _ in audio_filepaths]
 
@@ -461,6 +469,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
 		# Track saved paths by stream id to preserve input order
 		saved_paths_by_stream: dict[int, str] = {}
+		chunk_samples = int(self.chunk_size_in_secs * self.input_sample_rate)
 
 		self.open_session()
 		for frames in streamer:
@@ -480,8 +489,51 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 				)
 				self.generate_step([prefill_frame])
 
+			# If padding is configured, intercept last frames so the
+			# bufferer/context stay alive for the silence-padding phase.
+			# Padding is generated immediately (same iteration) to avoid
+			# the next stream's setup destroying this stream's context.
+			pad_targets: dict[int, float] = {}
+			if self.pad_to_duration_secs or self.pad_silence_ratio:
+				processed_frames = []
+				for frame in frames:
+					if frame.is_last:
+						elapsed = streamer.elapsed_durations[frame.stream_id]
+						remaining = self._padding_remaining_secs(elapsed)
+						if remaining > 0:
+							processed_frames.append(Frame(
+								samples=frame.samples,
+								stream_id=frame.stream_id,
+								is_first=frame.is_first,
+								is_last=False,
+								length=frame.length,
+								options=frame.options,
+							))
+							pad_targets[frame.stream_id] = remaining
+							continue
+					processed_frames.append(frame)
+				frames = processed_frames
+
 			self.generate_step(frames)
 			self._finalize_and_save_finished_streams(frames, audio_filepaths, saved_paths_by_stream)
+
+			# Generate silence padding before the next iteration adds a new stream
+			for stream_id, remaining_secs in pad_targets.items():
+				num_pad_frames = max(1, round(remaining_secs / self.chunk_size_in_secs))
+				for i in range(num_pad_frames):
+					is_last = (i == num_pad_frames - 1)
+					silence_frame = Frame(
+						samples=torch.zeros(chunk_samples),
+						stream_id=stream_id,
+						is_first=False,
+						is_last=is_last,
+						length=chunk_samples,
+					)
+					self.generate_step([silence_frame])
+					if is_last:
+						self._finalize_and_save_finished_streams(
+							[silence_frame], audio_filepaths, saved_paths_by_stream
+						)
 		# Build outputs before closing the session
 		texts = []
 		words = []
@@ -611,6 +663,14 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 			print(f"   ✅ Added {prompt_len} prompt embeddings to input_embeds_history")
 		
 		return tts_output_code
+
+	def _padding_remaining_secs(self, elapsed_secs: float) -> float:
+		"""Return how many seconds of silence padding are still needed."""
+		if self.pad_to_duration_secs is not None:
+			return max(0.0, self.pad_to_duration_secs - elapsed_secs)
+		if self.pad_silence_ratio is not None:
+			return elapsed_secs * self.pad_silence_ratio
+		return 0.0
 
 	def _request_id_for_stream(self, stream_id: int) -> str:
 		return str(stream_id)

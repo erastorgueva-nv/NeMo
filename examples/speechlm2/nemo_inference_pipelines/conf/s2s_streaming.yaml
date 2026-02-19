@@ -18,6 +18,10 @@ audio_file: ???
 output_filename: ./generated/output.json
 output_ctm_dir: ./generated/ctm
 
+# Input audio padding (set at most one; null = disabled)
+pad_to_duration_secs: null   # Pad each audio to this fixed duration (seconds)
+pad_silence_ratio: null      # Append silence = ratio * original duration (e.g. 0.2 = 20%)
+
 pipeline_type: s2s_streaming
 
 # S2S model block
