@@ -644,27 +644,25 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 			print(f"   Time taken to prefill LLM: {time.time() - start_prefill:.3f}s")
 			print(f"   ✅ System prompt processed ({prompt_len} tokens)")
 		
-		elif self.use_cache:
-			# For native cache mode: process prompt through LLM to update cache
-			context, _ = self.context_manager.get_context([stream_id])
-			with torch.no_grad():
-				llm_cache = context.dynamic_cache
-				ans = self.s2s_model.model_llm_interface(
-					prompt_embedded,
-					cache=llm_cache,
-					generated_tokens=None,
-					current_step=0
-				)
-				# Update context's cache
-				context.dynamic_cache = ans.get("cache", llm_cache)
-			print(f"   ✅ System prompt processed, cache updated ({prompt_len} tokens)")
-		
 		else:
-			# For no-cache mode (Nemotron): add prompt embeddings to history
 			context, _ = self.context_manager.get_context([stream_id])
-			for t in range(prompt_len):
-				context.input_embeds_history.append(prompt_embedded[:, t:t+1, :])
-			print(f"   ✅ Added {prompt_len} prompt embeddings to input_embeds_history")
+			if context.dynamic_cache is not None:
+				# Native cache mode: process prompt through LLM to update KV cache
+				with torch.no_grad():
+					llm_cache = context.dynamic_cache
+					ans = self.s2s_model.model_llm_interface(
+						prompt_embedded,
+						cache=llm_cache,
+						generated_tokens=None,
+						current_step=0
+					)
+					context.dynamic_cache = ans.get("cache", llm_cache)
+				print(f"   ✅ System prompt processed, cache updated ({prompt_len} tokens)")
+			else:
+				# No-cache mode (e.g. Nemotron): add prompt embeddings to history
+				for t in range(prompt_len):
+					context.input_embeds_history.append(prompt_embedded[:, t:t+1, :])
+				print(f"   ✅ Added {prompt_len} prompt embeddings to input_embeds_history")
 		
 		return tts_output_code
 
