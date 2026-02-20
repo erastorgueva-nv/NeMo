@@ -269,7 +269,7 @@ class VllmLLMModel(ModelInterface):
 
         if engine_path is None:
             # convert model to vLLM format if needed
-            dir_name = os.path.dirname(model_path).split("/")[-1]
+            dir_name = os.path.basename(os.path.normpath(model_path))
             engine_path = "/tmp/" + dir_name + f"_vllm_converted_{model_type}"
             if os.path.exists(engine_path):
                 print(f"✓ Found existing vLLM converted model at {engine_path}")
@@ -632,8 +632,9 @@ class VllmEARTTSModel(VllmLLMModel):
     def _convert_ckpt(self, save_path: str):
         """Convert EARTTS checkpoint to vLLM format."""
         from nemo.collections.speechlm2.inference.vllm.scripts.convert_eartts_checkpoint import convert
-        config_file = os.path.join(os.path.dirname(self.model_path), "config.json")
-        model_ckpt = os.path.join(os.path.dirname(self.model_path), "model.safetensors")
+        ckpt_dir = os.path.normpath(self.model_path)
+        config_file = os.path.join(ckpt_dir, "config.json")
+        model_ckpt = os.path.join(ckpt_dir, "model.safetensors")
         convert(save_path, config_file, model_ckpt)
 
     def __call__(
