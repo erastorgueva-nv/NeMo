@@ -2203,10 +2203,16 @@ def main():
                             stereo_path_out = os.path.join(args.output_dir, stereo_filename)
 
                             inp_audio, sr = librosa.load(audio_path, sr=model.target_sample_rate)
-                            # Match lengths by padding the shorter signal
-                            max_len = max(len(inp_audio), len(audio_np))
+
+                            # Prepend silence to output channel to account for
+                            # the one-chunk processing delay: the server can't
+                            # produce output until it has received a full input chunk.
+                            delay_samples = int(args.num_frames_per_inference * FRAME_SIZE_SEC * model.target_sample_rate)
+                            out_audio_delayed = np.concatenate([np.zeros(delay_samples, dtype=audio_np.dtype), audio_np])
+
+                            max_len = max(len(inp_audio), len(out_audio_delayed))
                             inp_audio_padded = np.pad(inp_audio, (0, max_len - len(inp_audio)))
-                            out_audio_padded = np.pad(audio_np, (0, max_len - len(audio_np)))
+                            out_audio_padded = np.pad(out_audio_delayed, (0, max_len - len(out_audio_delayed)))
 
                             # Stereo: channel 0 = input, channel 1 = output
                             stereo_audio = np.stack([inp_audio_padded, out_audio_padded], axis=1)
@@ -2320,11 +2326,16 @@ def main():
                 if args.combine_inp_out_audio:
                     # Load input audio and resample to match the model's target sample rate
                     inp_audio, sr = librosa.load(args.audio_path, sr=model.target_sample_rate)
-                    # Match lengths by padding the shorter signal
-                    max_len = max(len(inp_audio), len(audio_np))
 
+                    # Prepend silence to output channel to account for
+                    # the one-chunk processing delay: the server can't
+                    # produce output until it has received a full input chunk.
+                    delay_samples = int(args.num_frames_per_inference * FRAME_SIZE_SEC * model.target_sample_rate)
+                    out_audio_delayed = np.concatenate([np.zeros(delay_samples, dtype=audio_np.dtype), audio_np])
+
+                    max_len = max(len(inp_audio), len(out_audio_delayed))
                     inp_audio_padded = np.pad(inp_audio, (0, max_len - len(inp_audio)))
-                    out_audio_padded = np.pad(audio_np, (0, max_len - len(audio_np)))
+                    out_audio_padded = np.pad(out_audio_delayed, (0, max_len - len(out_audio_delayed)))
 
                     # Stereo: channel 0 = input, channel 1 = output
                     audio_np = np.stack([inp_audio_padded, out_audio_padded], axis=1)

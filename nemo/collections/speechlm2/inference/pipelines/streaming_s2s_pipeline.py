@@ -403,13 +403,21 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 				input_np, _ = librosa.load(in_path, sr=self.output_sample_rate, mono=True)
 				input_audio = torch.from_numpy(input_np).to(torch.float32)
 				gen_cpu = generated_audio.detach().cpu().to(input_audio.dtype)
+
+				# Prepend silence to output channel to account for
+				# the one-chunk processing delay: the server can't
+				# produce output until it has received a full input chunk.
+				delay_samples = int(self.chunk_size_in_secs * self.output_sample_rate)
+				silence = torch.zeros(delay_samples, dtype=gen_cpu.dtype)
+				gen_cpu = torch.cat([silence, gen_cpu], dim=-1)
+
 				gen_len = int(gen_cpu.shape[-1])
 				in_len = int(input_audio.shape[-1])
-				if in_len < gen_len:
-					pad = torch.zeros(gen_len - in_len, dtype=input_audio.dtype)
-					input_audio = torch.cat([input_audio, pad], dim=-1)
-				elif in_len > gen_len:
-					input_audio = input_audio[:gen_len]
+				max_len = max(gen_len, in_len)
+				if in_len < max_len:
+					input_audio = torch.cat([input_audio, torch.zeros(max_len - in_len, dtype=input_audio.dtype)], dim=-1)
+				if gen_len < max_len:
+					gen_cpu = torch.cat([gen_cpu, torch.zeros(max_len - gen_len, dtype=gen_cpu.dtype)], dim=-1)
 				stereo = torch.stack([input_audio, gen_cpu], dim=0).transpose(0, 1)
 				stereo_path = os.path.join(stereo_dir, f"{base}_input_output.wav")
 				sf.write(stereo_path, stereo.detach().cpu().numpy(), self.output_sample_rate)
