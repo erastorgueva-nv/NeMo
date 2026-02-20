@@ -122,7 +122,8 @@ def convert_nemo_to_hf_format(
     
     # Load config to get pretrained_llm if not provided
     if config_path is None:
-        config_path = os.path.join(os.path.dirname(checkpoint_path), "config.json")
+        ckpt_dir = checkpoint_path if os.path.isdir(checkpoint_path) else os.path.dirname(checkpoint_path)
+        config_path = os.path.join(ckpt_dir, "config.json")
     
     if os.path.exists(config_path):
         print(f"Loading config from {config_path}")
