@@ -27,9 +27,17 @@ class PipelineOutput:
         texts: Optional[List[str]] = None,
         words: Optional[List[List[Word]]] = None,
         asr_texts: Optional[List[str]] = None,
+        texts_with_timestamps: Optional[List[str]] = None,
+        asr_texts_with_timestamps: Optional[List[str]] = None,
+        raw_texts: Optional[List[str]] = None,
+        raw_asr_texts: Optional[List[str]] = None,
     ):
         if texts is None and words is None:
             raise ValueError("At least one of the 'texts' or 'words' should be provided.")
         self.texts = texts
         self.words = words
         self.asr_texts = asr_texts
+        self.texts_with_timestamps = texts_with_timestamps
+        self.asr_texts_with_timestamps = asr_texts_with_timestamps
+        self.raw_texts = raw_texts
+        self.raw_asr_texts = raw_asr_texts

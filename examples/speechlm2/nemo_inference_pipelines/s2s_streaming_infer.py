@@ -156,7 +156,16 @@ def dump_output(
     ground_truths: List[str | None],
 ) -> None:
     """
-    Dump the transcriptions to an output file.
+    Dump inference results to output_processed.json and output_raw.json.
+
+    output_processed.json uses the same schema as the standalone wrapper's
+    output_results_processed.json (timestamps in pred_text via <|t|> / <$t$>).
+
+    output_raw.json preserves all tokens including <SPECIAL_12> (pad tokens),
+    matching the standalone wrapper's output_results_raw.json.
+
+    CTM files are still written for per-word audio-sample-based timing.
+
     Args:
         audio_filepaths: List of audio file paths
         output: Pipeline output
@@ -164,16 +173,21 @@ def dump_output(
         options: Per-stream request options (carries the system prompt)
         ground_truths: Ground-truth texts (None when unavailable)
     """
-    output_filename = os.path.join(output_dir, "output.json")
+    output_processed_path = os.path.join(output_dir, "output_processed.json")
+    output_raw_path = os.path.join(output_dir, "output_raw.json")
     output_ctm_dir = os.path.join(output_dir, "ctm")
 
     os.makedirs(output_ctm_dir, exist_ok=True)
 
-    asr_texts = output.asr_texts if output.asr_texts is not None else [None] * len(audio_filepaths)
+    asr_texts_ts = output.asr_texts_with_timestamps or [None] * len(audio_filepaths)
+    texts_ts = output.texts_with_timestamps or [""] * len(audio_filepaths)
+    raw_texts = output.raw_texts or [""] * len(audio_filepaths)
+    raw_asr_texts = output.raw_asr_texts or [""] * len(audio_filepaths)
 
-    with open(output_filename, 'w') as fout:
-        for audio_filepath, pred_text, words, pred_src_text, opts, gt in zip(
-            audio_filepaths, output.texts, output.words, asr_texts, options, ground_truths,
+    with open(output_processed_path, 'w') as f_proc, open(output_raw_path, 'w') as f_raw:
+        for audio_filepath, words, opts, gt, pred_text_ts, pred_src_text_ts, pred_text_raw, pred_src_text_raw in zip(
+            audio_filepaths, output.words, options, ground_truths,
+            texts_ts, asr_texts_ts, raw_texts, raw_asr_texts,
         ):
             stem = os.path.splitext(os.path.basename(audio_filepath))[0]
             ctm_filepath = os.path.abspath(os.path.join(output_ctm_dir, f"{stem}.ctm"))
@@ -182,19 +196,33 @@ def dump_output(
                     ctm_line = f"A {round(word.start, 2)} {round(word.duration, 2)} {word.text} {word.conf}"
                     ctm_fout.write(f"{stem} {ctm_line}\n")
 
-            item = {
+            pred_audio_path = os.path.join(output_dir, "wav", f"{stem}.wav")
+
+            record_processed = {
                 "id": stem,
-                "audio_filepath": audio_filepath,
+                "target_text": "",
+                "pred_audio": pred_audio_path,
                 "src_text": gt or "",
-                "pred_src_text": pred_src_text or "",
-                "pred_text": pred_text or "",
-                "pred_audio": os.path.join(output_dir, "wav", f"{stem}.wav"),
-                "ctm_filepath": ctm_filepath,
+                "pred_src_text": pred_src_text_ts or "",
+                "pred_text": pred_text_ts or "",
                 "system_prompt": opts.system_prompt or "",
             }
-            json.dump(item, fout, ensure_ascii=False)
-            fout.write('\n')
-            fout.flush()
+            json.dump(record_processed, f_proc, ensure_ascii=False)
+            f_proc.write('\n')
+            f_proc.flush()
+
+            record_raw = {
+                "id": stem,
+                "target_text": "",
+                "pred_audio": pred_audio_path,
+                "src_text": gt or "",
+                "pred_src_text": pred_src_text_raw or "",
+                "pred_text": pred_text_raw or "",
+                "system_prompt": opts.system_prompt or "",
+            }
+            json.dump(record_raw, f_raw, ensure_ascii=False)
+            f_raw.write('\n')
+            f_raw.flush()
 
 
 @hydra.main(config_path="./conf", config_name="s2s_streaming", version_base=None)
@@ -247,7 +275,7 @@ def main(cfg: DictConfig):
     # Dump the transcriptions and CTMs
     output_dir = cfg.get("output_dir", "./generated")
     dump_output(audio_filepaths, output, output_dir, options, ground_truths)
-    logging.info(f"Transcriptions written to {output_dir}/output.json")
+    logging.info(f"Transcriptions written to {output_dir}/output_processed.json and {output_dir}/output_raw.json")
 
 
 if __name__ == "__main__":

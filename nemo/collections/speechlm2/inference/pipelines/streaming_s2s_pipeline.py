@@ -30,7 +30,8 @@ from nemo.collections.asr.inference.streaming.buffering.audio_bufferer import Ba
 from nemo.collections.asr.inference.utils.progressbar import ProgressBar
 from nemo.collections.speechlm2.inference.pipelines.s2s_pipeline_interface import S2SPipelineInterface
 from nemo.collections.speechlm2.inference.streaming.state.s2s_state import S2SStreamingState
-from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_inference_wrapper import NemotronVoicechatInferenceWrapper
+from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_inference_wrapper import NemotronVoicechatInferenceWrapper, tokens_to_str_raw
+from nemo.collections.speechlm2.models.duplex_s2s_model import tokens_to_str
 from nemo.collections.speechlm2.inference.streaming.state.s2s_context_manager import S2SContextManager
 from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
 from nemo.collections.speechlm2.inference.utils.pipeline_utils import PipelineOutput
@@ -264,6 +265,18 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
 		# Persist updated cache & clean finished streams
 		self.context_manager.update_context(stream_ids, result, self.num_chunks_per_inference)
+
+		# Save full token tensors to state before the context is destroyed,
+		# so we can run tokens_to_str / tokens_to_str_raw post-hoc.
+		for stream_id, eos_flag in zip(stream_ids, eos_flags):
+			if eos_flag:
+				ctx = self.context_manager.slot_contexts[
+					self.context_manager.streamidx2slotidx[stream_id]
+				]
+				if ctx is not None:
+					state = self.get_or_create_state(stream_id)
+					state.save_token_tensors(ctx.gen_text, ctx.gen_asr_text, ctx.frame_idx)
+
 		self.context_manager.reset_slots(stream_ids, eos_flags)
 		
 		# Explicitly clean up bufferer and state for finished streams
@@ -542,6 +555,14 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 		texts = []
 		words = []
 		asr_texts = []
+		texts_with_timestamps = []
+		asr_texts_with_timestamps = []
+		raw_texts = []
+		raw_asr_texts = []
+
+		tokenizer = self.s2s_model.tokenizer
+		pad_id = self.s2s_model.model.stt_model.text_pad_id
+
 		for idx in range(len(audio_filepaths)):
 			state = self.get_or_create_state(idx)
 			text_value = state.get_output_text() if hasattr(state, "get_output_text") else ""
@@ -553,9 +574,39 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 			asr_text_value = state.get_output_asr_text() if hasattr(state, "get_output_asr_text") else ""
 			asr_texts.append(asr_text_value)
 
+			token_data = state.get_token_tensors()
+			if token_data is not None:
+				gen_text, gen_asr_text, total_frames = token_data
+				lengths = torch.tensor([total_frames], dtype=torch.long)
+				texts_with_timestamps.append(
+					tokens_to_str(gen_text, lengths, tokenizer=tokenizer, pad_id=pad_id, eval_text_turn_taking=True)[0]
+				)
+				asr_texts_with_timestamps.append(
+					tokens_to_str(gen_asr_text, lengths, tokenizer=tokenizer, pad_id=pad_id, eval_text_turn_taking=True)[0]
+				)
+				raw_texts.append(
+					tokens_to_str_raw(gen_text, lengths, tokenizer=tokenizer, pad_id=pad_id)[0]
+				)
+				raw_asr_texts.append(
+					tokens_to_str_raw(gen_asr_text, lengths, tokenizer=tokenizer, pad_id=pad_id)[0]
+				)
+			else:
+				texts_with_timestamps.append("")
+				asr_texts_with_timestamps.append("")
+				raw_texts.append("")
+				raw_asr_texts.append("")
+
 		self.close_session()
 
-		return PipelineOutput(texts=texts, words=words, asr_texts=asr_texts)
+		return PipelineOutput(
+			texts=texts,
+			words=words,
+			asr_texts=asr_texts,
+			texts_with_timestamps=texts_with_timestamps,
+			asr_texts_with_timestamps=asr_texts_with_timestamps,
+			raw_texts=raw_texts,
+			raw_asr_texts=raw_asr_texts,
+		)
 
 	def _prefill_system_prompt(self, stream_id: int, system_prompt: str | None = None) -> Optional[torch.Tensor]:
 		"""Prefill the system prompt for a new stream.

@@ -52,6 +52,11 @@ class S2SStreamingState:
 	output_asr_text_tokens: List[str] = field(default_factory=list)
 	# Accumulated words with timings
 	output_words: List[Word] = field(default_factory=list)
+	# Final token tensors saved from the context before it is destroyed.
+	# Used for post-hoc tokens_to_str / tokens_to_str_raw conversion.
+	final_gen_text: Optional[torch.Tensor] = None
+	final_gen_asr_text: Optional[torch.Tensor] = None
+	final_total_frames: int = 0
 
 	def __post_init__(self) -> None:
 		"""Allocate tensors lazily based on provided metadata."""
@@ -81,6 +86,9 @@ class S2SStreamingState:
 			self.output_asr_text_str = ""
 			self.output_asr_text_tokens.clear()
 			self.output_words.clear()
+			self.final_gen_text = None
+			self.final_gen_asr_text = None
+			self.final_total_frames = 0
 
 	def update_state(self, processed_frames: torch.Tensor, output_text_tokens: Any = None, output_text: str | None = None, output_asr_text: str | None = None) -> None:
 		"""Append new audio to the right of the buffer; token/text args are accepted for API compatibility."""
@@ -141,6 +149,19 @@ class S2SStreamingState:
 	def get_output_words(self) -> List[Word]:
 		"""Return accumulated words with timings."""
 		return list(self.output_words)
+
+	def save_token_tensors(self, gen_text: torch.Tensor, gen_asr_text: torch.Tensor, total_frames: int) -> None:
+		"""Snapshot the full token-ID tensors from the context before it is destroyed."""
+		with torch.no_grad():
+			self.final_gen_text = gen_text[:, :total_frames].clone().cpu()
+			self.final_gen_asr_text = gen_asr_text[:, :total_frames].clone().cpu()
+			self.final_total_frames = total_frames
+
+	def get_token_tensors(self) -> Optional[tuple]:
+		"""Return (gen_text, gen_asr_text, total_frames) or None if not saved."""
+		if self.final_gen_text is None:
+			return None
+		return self.final_gen_text, self.final_gen_asr_text, self.final_total_frames
 
 	def cleanup_after_response(self) -> None:
 		"""Clear transient audio; keep token workspaces allocated."""
