@@ -201,7 +201,7 @@ class NemotronVoicechatInferenceWrapper:
 
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cuda.matmul.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
+        torch.set_float32_matmul_precision("medium")
 
         logging.info(f"after setting - torch.backends.cudnn.allow_tf32: {torch.backends.cudnn.allow_tf32}")
         logging.info(f"after setting - torch.backends.cuda.matmul.allow_tf32: {torch.backends.cuda.matmul.allow_tf32}")

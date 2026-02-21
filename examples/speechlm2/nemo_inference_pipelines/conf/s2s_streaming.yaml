@@ -77,7 +77,7 @@ s2s:
 # ========================
 # Pipeline settings
 # ========================
-matmul_precision: high                     # Matrix multiplication precision: highest, high, medium
+matmul_precision: medium                     # Matrix multiplication precision: highest, high, medium
 
 streaming:
   input_sample_rate: 16000                          # Audio sample rate in Hz

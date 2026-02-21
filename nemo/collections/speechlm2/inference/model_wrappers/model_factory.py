@@ -742,7 +742,12 @@ class VllmEARTTSModel(VllmLLMModel):
 
         else:
             current_subword_id = input_tensors[1]
-            bos_mask = torch.zeros_like(current_subword_id, dtype=getattr(torch, self._dtype))
+            # Use a tiny epsilon instead of exact 0 so the vLLM model's
+            # (bos_mask == 0) check is False during decoding.  This prevents
+            # use_audio_prompt_frozen_projection from incorrectly applying the
+            # speaker-prompt projection to every decoding step.  The epsilon is
+            # small enough that bos_mask * bos_emb remains negligible.
+            bos_mask = torch.full_like(current_subword_id, 1e-20, dtype=getattr(torch, self._dtype))
             input_tensors.append(bos_mask)
 
         result = await self.engine.generate_next_token(input_tensors, prompt_token_ids=prompt_token_ids, request_id=request_id)

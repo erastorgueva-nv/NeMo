@@ -211,6 +211,7 @@ def convert(outdir, config, model_path):
     flat_config["num_iter"] = 8
     flat_config["noise_scale"] = cfg.model.get("inference_noise_scale", 0.8)
     flat_config["top_p_or_k"] = cfg.model.get("inference_top_p_or_k", 0.8)
+    flat_config["guidance_scale"] = cfg.model.get("inference_guidance_scale", 0.5)
 
     # configuration of the embedding module
     flat_config["emb_backbone_config"] = OmegaConf.to_container(

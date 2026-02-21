@@ -18,6 +18,7 @@ A clean wrapper for streaming speech-to-speech generation with custom embeddings
 """
 
 import os
+import json
 import torch
 import asyncio
 from typing import Optional, Dict, Any, AsyncGenerator, Tuple
@@ -419,23 +420,44 @@ class EARTTSStreamingEngine(LLMStreamingEngine):
     """
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # Default sampling parameters
+        guidance_scale = self._read_guidance_scale_from_config()
         default_sampling = {
             "max_tokens": 100000, # Set very high to prevent stopping - use abort to stop explicitly
             "temperature": 0.0,
             "skip_sampling": True,
             "ignore_eos": True,
-            "guidance_scale": 0.5,
+            "guidance_scale": guidance_scale,
         }
         self.sampling_params = SamplingParams(**default_sampling)
-        logging.info("EARTTSStreamingEngine initialized with EARTTS-specific sampling parameters.")
+        logging.info(f"EARTTSStreamingEngine initialized (guidance_scale={guidance_scale}).")
+
+    def _read_guidance_scale_from_config(self) -> float:
+        """Read guidance_scale from the converted vLLM model's config.json."""
+        config_path = os.path.join(self.model_path, "config.json")
+        if os.path.isfile(config_path):
+            with open(config_path, "r") as f:
+                cfg = json.load(f)
+            value = cfg.get("guidance_scale", None)
+            if value is not None:
+                logging.info(f"Read guidance_scale={value} from {config_path}")
+                return float(value)
+        logging.warning(
+            f"guidance_scale not found in {config_path}, using default 0.5. "
+        )
+        return 0.5
 
     async def initialize(self):
         # Force TRITON_ATTN backend for EarTTS
         os.environ["VLLM_ATTENTION_BACKEND"] = "TRITON_ATTN"
+        # TF32 matmul precision to match TTS training ("medium").
+        # torch.set_float32_matmul_precision is process-local and does NOT
+        # propagate to vLLM's spawned worker processes; this CUDA-level env
+        # var is inherited by child processes.
+        os.environ["NVIDIA_TF32_OVERRIDE"] = "1"
         _cached_get_attn_backend.cache_clear()
         await super().initialize()
         os.environ.pop("VLLM_ATTENTION_BACKEND", None)
+        os.environ.pop("NVIDIA_TF32_OVERRIDE", None)
         _cached_get_attn_backend.cache_clear()
 
 
