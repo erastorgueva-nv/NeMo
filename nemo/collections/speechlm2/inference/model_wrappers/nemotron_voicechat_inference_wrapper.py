@@ -1517,19 +1517,20 @@ class NemotronVoicechatInferenceWrapper:
             time_tts_model = 0
             time_audio_codec = 0
 
-        # convert new text tokens to string that we can show to the user
+        # Convert new text tokens to string via tokens_to_text (convert_tokens_to_string)
+        # so byte-level BPE is decoded properly (e.g. "Ã©" → "é") and leading spaces
+        # from Ġ-prefixed tokens are preserved for correct concatenation of incremental
+        # chunks: " Musée" + " National" → " Musée National".
+        # NOTE: multi-byte UTF-8 characters whose BPE tokens span two frames will show
+        # as replacement chars (�) because each frame is decoded independently. A proper
+        # fix would require an incremental UTF-8 decoder that buffers incomplete trailing
+        # bytes across frames.
         predicted_text_strs = []
-        # loop over batch dimension
         for predicted_tok_ids_b in predicted_tokens:
             predicted_tok_ids_b = predicted_tok_ids_b.tolist()
             predicted_toks_b = self.tokenizer.ids_to_tokens(predicted_tok_ids_b)
-
-            # TODO: make more robust to tokenizer changes
-            # replace "Ġ" with " " to restore proper word boundaries
-            # replace '<SPECIAL_12>' with ""
-            predicted_toks_b = [tok.replace('<SPECIAL_12>', "").replace('Ġ', ' ') for tok in predicted_toks_b]
-
-            predicted_text_strs.append("".join(predicted_toks_b))
+            predicted_toks_b = [tok for tok in predicted_toks_b if tok != '<SPECIAL_12>']
+            predicted_text_strs.append(self.tokenizer.tokens_to_text(predicted_toks_b))
 
         # convert new ASR tokens to string
         asr_predicted_text_strs = []
