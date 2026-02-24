@@ -61,6 +61,8 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
 		# ------------------------------------------------------------------
 		# Chunk & buffer sizes
+		# Terminology: "frame" = 80ms audio unit, "chunk" = 1 or more frames
+		# A chunk is the amount of audio that is processed per inference step.
 		# ------------------------------------------------------------------
 		self.chunk_size_in_secs = getattr(self.streaming_cfg, "chunk_size_in_secs", 0.08)
 		# Check if self.chunk_size_in_secs is a multiple of 0.08.
@@ -70,16 +72,14 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 		if not (math.isclose(remainder, 0, abs_tol=1e-9) or math.isclose(remainder, 0.08, abs_tol=1e-9)):
 			raise ValueError(f"Chunk size must be a multiple of 0.08s, but got {self.chunk_size_in_secs}")
 
-		self.num_chunks_per_inference = int(self.chunk_size_in_secs / 0.08)
+		self.num_frames_per_chunk = int(self.chunk_size_in_secs / 0.08)
 
-		# Buffer size controls how much audio context is kept for inference
-		# (larger buffer helps online results get closer to offline results)
-		# Default: 5.6 seconds (70 * 0.08)
-		self.buffer_size_in_secs = getattr(self.streaming_cfg, "buffer_size_in_secs", 70 * 0.08)
+		# Buffer size determines how much audio is passed to the perception encoder
+		# Default: 5.68 seconds (71 * 0.08). This is the minimum valid buffer size without the perception cache.
+		# i.e. att_context_size[0] + att_context_size[1] + 1 frames = 70+0+1 = 71 frames = 5.68 seconds
+		self.buffer_size_in_secs = getattr(self.streaming_cfg, "buffer_size_in_secs", 71 * 0.08)
 
 		self.att_context_size = getattr(self.streaming_cfg, "att_context_size", [70,0])
-		#self.window_size = getattr(self.streaming_cfg, "window_size", 510)
-		#self.hop_length = self.enh_model.enh_model_cfg.encoder.hop_length
 
 		# ------------------------------------------------------------------
 		# bufferer – reused from ASR utilities
@@ -248,7 +248,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
 		result = self.s2s_model.infer_one_step(
 			audio_input=audio_buffer,
-			num_frames_per_inference=self.num_chunks_per_inference,
+			num_frames_per_chunk=self.num_frames_per_chunk,
 			frame_idx=context.frame_idx,
 			gen_text=context.gen_text,
 			audio_toks_buffer=context.audio_toks_buffer,
@@ -264,7 +264,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 		)
 
 		# Persist updated cache & clean finished streams
-		self.context_manager.update_context(stream_ids, result, self.num_chunks_per_inference)
+		self.context_manager.update_context(stream_ids, result, self.num_frames_per_chunk)
 
 		# Save full token tensors to state before the context is destroyed,
 		# so we can run tokens_to_str / tokens_to_str_raw post-hoc.

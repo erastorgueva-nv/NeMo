@@ -128,21 +128,22 @@ class TritonPythonModel:
         self.pipeline.close_session()
         torch.cuda.empty_cache()
     
-    @staticmethod
-    def pad_audio(audio_signal: np.ndarray, chunk_size: int) -> torch.Tensor:
-        """Pad audio to chunk size. Assumes audio is already normalized float32."""
-        # If audio is 2D [1, T], flatten to 1D
+    def validate_and_convert_audio(self, audio_signal: np.ndarray) -> torch.Tensor:
+        """Validate that the audio chunk matches the expected size and convert to tensor."""
         if audio_signal.ndim == 2:
             audio_signal = audio_signal.flatten()
-        
-        # Pad if needed
-        if len(audio_signal) < chunk_size:
-            audio_signal = np.pad(
-                audio_signal,
-                (0, chunk_size - len(audio_signal)),
-                mode='constant'
+
+        if len(audio_signal) != self.chunk_size:
+            expected_frames = self.pipeline.num_frames_per_chunk
+            actual_secs = len(audio_signal) / self.pipeline.input_sample_rate
+            raise ValueError(
+                f"Audio chunk size mismatch: received {len(audio_signal)} samples ({actual_secs:.3f}s) "
+                f"but server expects {self.chunk_size} samples "
+                f"({self.pipeline.chunk_size_in_secs}s = {expected_frames} frame(s)). "
+                f"Make sure the client's num_frames_per_chunk matches the server's "
+                f"chunk_size_in_secs={self.pipeline.chunk_size_in_secs}."
             )
-        
+
         return torch.tensor(audio_signal, dtype=torch.float32)
     
     def triton_requests_to_frames(self, requests: Iterable) -> List[Frame]:
@@ -206,11 +207,11 @@ class TritonPythonModel:
                     system_prompt = self.pipeline.system_prompt
                 frame_options = S2SRequestOptions(system_prompt=system_prompt)
 
-            # Zero-length audio = prefill-only frame; pass through without padding
+            # Zero-length audio = prefill-only frame; pass through without validation
             if audio_signal.size == 0:
                 samples = torch.empty(0, dtype=torch.float32)
             else:
-                samples = self.pad_audio(audio_signal, self.chunk_size)
+                samples = self.validate_and_convert_audio(audio_signal)
 
             frames.append(Frame(
                 samples=samples,

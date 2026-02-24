@@ -110,8 +110,8 @@ TTS_SAMPLE_RATE = 22050
 
 
 # Default hyper-parameters that can be overridden via `model_cfg`
-DEFAULT_BUFFER_SIZE_FRAMES = 70
-DEFAULT_NUM_FRAMES_PER_INFERENCE = 1
+DEFAULT_BUFFER_SIZE_FRAMES = 71
+DEFAULT_NUM_FRAMES_PER_CHUNK = 1
 DEFAULT_CODEC_TOKEN_HISTORY_SIZE = 600
 
 
@@ -726,7 +726,12 @@ class NemotronVoicechatInferenceWrapper:
             logging.info(f"   ✓ CUDA graphs captured")
 
     def _capture_perception_cudagraphs(self):
-        """Capture CUDA graphs for perception encoder with both chunk sizes."""
+        """Capture CUDA graphs for perception encoder with both chunk sizes.
+
+        Note: "chunk" in the streaming encoder config (chunk_size, shift_size, etc.)
+        follows NeMo's cache-aware streaming encoder API and is measured in
+        mel-spectrogram time-steps, not audio samples or seconds.
+        """
         encoder = self.model.stt_model.perception.encoder
         perception = self.model.stt_model.perception
         streaming_cfg = self.perception_streaming_cfg
@@ -909,11 +914,15 @@ class NemotronVoicechatInferenceWrapper:
         self,
         audio_input: torch.Tensor,
         frame_idx: int,
-        num_frames_per_inference: int,
+        num_frames_per_chunk: int,
         perception_cache: PerceptionCacheState,
     ) -> Tuple[torch.Tensor, PerceptionCacheState]:
         """
         Perform cache-aware perception encoding for streaming inference.
+
+        Note: "chunk" in this method (chunk_size, mel_chunk, etc.) follows NeMo's
+        cache-aware streaming encoder API and is measured in mel-spectrogram time-steps,
+        not audio samples or seconds.
 
         This method computes the full mel spectrogram from the audio buffer, then slices
         it appropriately based on the frame index. It supports processing multiple
@@ -927,18 +936,18 @@ class NemotronVoicechatInferenceWrapper:
           columns from mel spec
 
         The method loops over sub-steps, running the encoder for each and concatenating
-        the outputs. This allows num_frames_per_inference to be a multiple of (lookahead + 1).
+        the outputs. This allows num_frames_per_chunk to be a multiple of (lookahead + 1).
 
         Args:
             audio_input: Audio buffer tensor [B, T] (full buffer with all samples)
             frame_idx: Current frame index in the stream
-            num_frames_per_inference: Number of 80ms frames to process. Must be a multiple
+            num_frames_per_chunk: Number of 80ms frames to process. Must be a multiple
                 of (lookahead + 1), i.e., encoder._cfg.att_context_size[1] + 1
             perception_cache: Current cache state containing encoder caches
 
         Returns:
             Tuple of (encoded_output [B, T_out, D], updated_perception_cache)
-            where T_out = num_frames_per_inference (one output frame per input frame)
+            where T_out = num_frames_per_chunk (one output frame per input frame)
         """
         perception = self.model.stt_model.perception
         encoder = perception.encoder
@@ -982,15 +991,15 @@ class NemotronVoicechatInferenceWrapper:
         cache_last_time = perception_cache.cache_last_time
         cache_last_channel_len = perception_cache.cache_last_channel_len
 
-        # num_frames_per_inference must be a multiple of (lookahead + 1)
+        # num_frames_per_chunk must be a multiple of (lookahead + 1)
         # Each "base step" processes (lookahead + 1) frames
         base_step_size = encoder._cfg.att_context_size[1] + 1
-        if num_frames_per_inference % base_step_size != 0:
+        if num_frames_per_chunk % base_step_size != 0:
             raise ValueError(
-                f"num_frames_per_inference must be a multiple of (lookahead + 1) = {base_step_size}. "
-                f"Got num_frames_per_inference={num_frames_per_inference}"
+                f"num_frames_per_chunk must be a multiple of (lookahead + 1) = {base_step_size}. "
+                f"Got num_frames_per_chunk={num_frames_per_chunk}"
             )
-        num_sub_steps = num_frames_per_inference // base_step_size
+        num_sub_steps = num_frames_per_chunk // base_step_size
 
         # Run the encoder with cache (using CUDA graphs if available)
         start_time = time.time()
@@ -1268,7 +1277,7 @@ class NemotronVoicechatInferenceWrapper:
 
     def infer_one_step(self,
                        audio_input,
-                       num_frames_per_inference,
+                       num_frames_per_chunk,
                        frame_idx,
                        gen_text,
                        audio_toks_buffer,
@@ -1290,8 +1299,8 @@ class NemotronVoicechatInferenceWrapper:
         use_cache = dynamic_cache is not None
         batch_size = gen_text.shape[0]
 
-        predicted_tokens = torch.empty((batch_size, num_frames_per_inference), dtype=gen_text.dtype, device=gen_text.device)
-        asr_predicted_tokens = torch.empty((batch_size, num_frames_per_inference), dtype=gen_text.dtype, device=gen_text.device)
+        predicted_tokens = torch.empty((batch_size, num_frames_per_chunk), dtype=gen_text.dtype, device=gen_text.device)
+        asr_predicted_tokens = torch.empty((batch_size, num_frames_per_chunk), dtype=gen_text.dtype, device=gen_text.device)
 
         # Do "perception" step outside the for-loop
         start_perception = time.time()
@@ -1301,7 +1310,7 @@ class NemotronVoicechatInferenceWrapper:
             source_encoded, perception_cache = self._cache_aware_perception_step(
                 audio_input=audio_input,
                 frame_idx=frame_idx,
-                num_frames_per_inference=num_frames_per_inference,
+                num_frames_per_chunk=num_frames_per_chunk,
                 perception_cache=perception_cache,
             )
         else:
@@ -1321,13 +1330,13 @@ class NemotronVoicechatInferenceWrapper:
 
         # Save source_encoded if dict is provided
         if source_encoded_dict is not None:
-            end_frame_idx = frame_idx + num_frames_per_inference - 1
+            end_frame_idx = frame_idx + num_frames_per_chunk - 1
             key = f"{frame_idx}_{end_frame_idx}"
             source_encoded_dict[key] = source_encoded.detach().cpu().clone()
 
         # Determine embedding position based on whether we're using cache
         if self.use_perception_cache and perception_cache is not None and perception_cache.is_initialized():
-            # With cache: we get exactly num_frames_per_inference output frames
+            # With cache: we get exactly num_frames_per_chunk output frames
             # Use all of them directly
             embedding_position = 0
             newest_frame_index = total_encoded_frames - 1
@@ -1342,13 +1351,13 @@ class NemotronVoicechatInferenceWrapper:
             # => we do not want to use the final embedding due to containing silence padding. We want to use the second-to-last embedding.
             embedding_position = -2
             newest_frame_index = total_encoded_frames + embedding_position
-            base_frame_index = newest_frame_index - (num_frames_per_inference - 1)
+            base_frame_index = newest_frame_index - (num_frames_per_chunk - 1)
             base_frame_index = max(base_frame_index, 0)
 
         new_input_embeds = []
-        for chunk_offset in range(num_frames_per_inference):
-            current_frame_idx = frame_idx + chunk_offset
-            current_frame_index = base_frame_index + chunk_offset
+        for frame_offset in range(num_frames_per_chunk):
+            current_frame_idx = frame_idx + frame_offset
+            current_frame_index = base_frame_index + frame_offset
             current_frame_index = min(current_frame_index, total_encoded_frames - 1)
             current_frame_embedding = source_encoded[:, current_frame_index:current_frame_index + 1, :]
 
@@ -1411,15 +1420,15 @@ class NemotronVoicechatInferenceWrapper:
             asr_predicted_token = ans["asr_predicted_token"]
 
             gen_text[:, current_frame_idx] = predicted_token
-            predicted_tokens[:, chunk_offset] = predicted_token
+            predicted_tokens[:, frame_offset] = predicted_token
 
             gen_asr_text[:, current_frame_idx] = asr_predicted_token
-            asr_predicted_tokens[:, chunk_offset] = asr_predicted_token
+            asr_predicted_tokens[:, frame_offset] = asr_predicted_token
 
             # Apply forced turn taking based on ASR results
             self._maybe_apply_forced_turn_taking(current_frame_idx, gen_text, gen_asr_text)
             # Update predicted_tokens with any changes made by forced turn taking
-            predicted_tokens[:, chunk_offset] = gen_text[:, current_frame_idx]
+            predicted_tokens[:, frame_offset] = gen_text[:, current_frame_idx]
 
             if self.decode_audio:
                 current_subword_id = gen_text[:, current_frame_idx].unsqueeze(-1)
@@ -1478,7 +1487,7 @@ class NemotronVoicechatInferenceWrapper:
         # exit for-loop & do audio decoding non-autoregressively (if decode_audio is True)
         if self.decode_audio:
             samples_per_audio_output_frame = self._samples_per_audio_output_frame()
-            logging.debug(f"\n🔊 Decoding audio for {frame_idx}-th frame  ({num_frames_per_inference=})")
+            logging.debug(f"\n🔊 Decoding audio for {frame_idx}-th frame  ({num_frames_per_chunk=})")
 
             len_audio_toks_buffer = torch.tensor([self.codec_token_history_size], dtype=torch.long, device=self.device)
 
@@ -1496,10 +1505,10 @@ class NemotronVoicechatInferenceWrapper:
             logging.debug(f"   Decoded Audio full shape: {decoded_audio.shape}")
             logging.debug(f"   Decoded Audio length: {decoded_audio_len}")
             logging.debug(f"   samples_per_audio_output_frame={samples_per_audio_output_frame}")
-            logging.debug(f"   num_frames_per_inference={num_frames_per_inference}")
-            logging.debug(f"   Expected new samples to extract: {samples_per_audio_output_frame * num_frames_per_inference}")
+            logging.debug(f"   num_frames_per_chunk={num_frames_per_chunk}")
+            logging.debug(f"   Expected new samples to extract: {samples_per_audio_output_frame * num_frames_per_chunk}")
 
-            decoded_audio_new = decoded_audio[:, :, -samples_per_audio_output_frame * num_frames_per_inference:]
+            decoded_audio_new = decoded_audio[:, :, -samples_per_audio_output_frame * num_frames_per_chunk:]
             logging.debug(f"   Extracted decoded_audio_new shape: {decoded_audio_new.shape}")
 
         else:
@@ -1636,13 +1645,13 @@ class NemotronVoicechatInferenceWrapper:
                     logging.info(f"🤖→🎤 Forced turn-taking at frame {t}: inserted agent EOS (reason: user started speaking)")
 
     @torch.no_grad()
-    def inference_realtime_streaming(self, audio_path: str, num_frames_per_inference: int = None, request_id: Optional[str] = None, pad_audio_to_sec: Optional[float] = None, audio_id: Optional[str] = None, system_prompt: Optional[str] = None):
+    def inference_realtime_streaming(self, audio_path: str, num_frames_per_chunk: int = None, request_id: Optional[str] = None, pad_audio_to_sec: Optional[float] = None, audio_id: Optional[str] = None, system_prompt: Optional[str] = None):
         """
         Perform realtime streaming inference simulating microphone capture.
 
         Args:
             audio_path: Path to input audio file (simulates microphone input)
-            num_frames_per_inference: Number of frames to process per inference step (default: 1)
+            num_frames_per_chunk: Number of frames to process per inference step (default: 1)
             request_id: Optional request ID for vLLM streaming
             pad_audio_to_sec: Optional duration to pad audio to (in seconds)
             audio_id: Optional audio ID for saving source_encoded tensors
@@ -1652,10 +1661,10 @@ class NemotronVoicechatInferenceWrapper:
             Dictionary with 'text', 'tokens_text', 'tokens_audio', 'audio', 'audio_len', 'system_prompt'
         """
         # Use provided value or default
-        if num_frames_per_inference is None:
-            num_frames_per_inference = DEFAULT_NUM_FRAMES_PER_INFERENCE
-        if num_frames_per_inference < 1:
-            raise ValueError("num_frames_per_inference must be at least 1")
+        if num_frames_per_chunk is None:
+            num_frames_per_chunk = DEFAULT_NUM_FRAMES_PER_CHUNK
+        if num_frames_per_chunk < 1:
+            raise ValueError("num_frames_per_chunk must be at least 1")
         start_time = time.time()
 
         logging.info("\n" + "=" * 70)
@@ -1667,19 +1676,39 @@ class NemotronVoicechatInferenceWrapper:
 
         buffer_size_frames = int(self.model_cfg.get("buffer_size_frames", DEFAULT_BUFFER_SIZE_FRAMES))
         buffer_size_samples = buffer_size_frames * FRAME_SIZE_SAMPLES
-        if num_frames_per_inference > buffer_size_frames:
+        if num_frames_per_chunk > buffer_size_frames:
             raise ValueError(
-                f"num_frames_per_inference ({num_frames_per_inference}) must be "
+                f"num_frames_per_chunk ({num_frames_per_chunk}) must be "
                 f"less than or equal to buffer_size_frames ({buffer_size_frames})."
             )
-        if self.decode_audio and num_frames_per_inference > self.codec_token_history_size:
+
+        att_context_size = self.model.stt_model.perception.encoder._cfg.att_context_size
+        if self.use_perception_cache:
+            min_buffer = num_frames_per_chunk * (att_context_size[1] + 1) + 2
+            reason = (
+                f"must be >= num_frames_per_chunk * (att_context_size[1] + 1) + 2 = "
+                f"{num_frames_per_chunk} * ({att_context_size[1]} + 1) + 2 = {min_buffer} "
+                f"when using perception cache (+2 to minimize windowing artifacts)"
+            )
+        else:
+            min_buffer = att_context_size[0] + att_context_size[1] + 1
+            reason = (
+                f"must be >= att_context_size[0] + att_context_size[1] + 1 = "
+                f"{att_context_size[0]} + {att_context_size[1]} + 1 = {min_buffer} "
+                f"without perception cache"
+            )
+        if buffer_size_frames < min_buffer:
             raise ValueError(
-                f"num_frames_per_inference ({num_frames_per_inference}) must be "
+                f"buffer_size_frames ({buffer_size_frames}) is too small: {reason}."
+            )
+        if self.decode_audio and num_frames_per_chunk > self.codec_token_history_size:
+            raise ValueError(
+                f"num_frames_per_chunk ({num_frames_per_chunk}) must be "
                 f"<= codec_token_history_size ({self.codec_token_history_size}) when decode_audio=True. "
-                f"Either reduce num_frames_per_inference or increase codec_token_history_size."
+                f"Either reduce num_frames_per_chunk or increase codec_token_history_size."
             )
         logging.info(f"Buffer size: {buffer_size_frames} frames ({buffer_size_frames * FRAME_SIZE_SEC}s)")
-        logging.info(f"Frames per inference step: {num_frames_per_inference}")
+        logging.info(f"Frames per inference step: {num_frames_per_chunk}")
 
         # Load audio file (simulating microphone stream)
         logging.info(f"\n📁 Loading audio file: {audio_path}")
@@ -1699,17 +1728,17 @@ class NemotronVoicechatInferenceWrapper:
 
         # derive num_inference_steps
         total_frames_maybe = int(np.ceil(total_samples / FRAME_SIZE_SAMPLES)) # "maybe" because we might need to add padding
-        num_inference_steps = (total_frames_maybe // num_frames_per_inference)
-        if total_frames_maybe % num_frames_per_inference != 0:
+        num_inference_steps = (total_frames_maybe // num_frames_per_chunk)
+        if total_frames_maybe % num_frames_per_chunk != 0:
             num_inference_steps += 1
-        total_frames = num_inference_steps * num_frames_per_inference
+        total_frames = num_inference_steps * num_frames_per_chunk
 
         # pad audio signal so that it is divisible by num_inference_steps
-        padded_total_samples = num_inference_steps * num_frames_per_inference * FRAME_SIZE_SAMPLES
+        padded_total_samples = num_inference_steps * num_frames_per_chunk * FRAME_SIZE_SAMPLES
         if padded_total_samples > total_samples:
             audio_signal = np.pad(audio_signal, (0, padded_total_samples - total_samples), mode='constant')
             logging.info(f"   Padded to: {padded_total_samples} samples")
-        logging.info(f" {num_frames_per_inference=} => {total_frames=}, {num_inference_steps=}")
+        logging.info(f" {num_frames_per_chunk=} => {total_frames=}, {num_inference_steps=}")
 
         # convert audio signal to tensor
         audio_signal_tensor = torch.tensor(audio_signal, dtype=self.dtype, device=self.device).unsqueeze(0)
@@ -1840,11 +1869,11 @@ class NemotronVoicechatInferenceWrapper:
         logging.info("=" * 70)
 
         # frame_idx corresponds to index of the first frame passed to infer_one_step
-        # (we need this distinction in the case that num_frames_per_inference > 1)
+        # (we need this distinction in the case that num_frames_per_chunk > 1)
         frame_idx = 0
         while frame_idx < total_frames:
             slice_start = frame_idx * FRAME_SIZE_SAMPLES
-            slice_n_samples = num_frames_per_inference * FRAME_SIZE_SAMPLES
+            slice_n_samples = num_frames_per_chunk * FRAME_SIZE_SAMPLES
             slice_end = slice_start + slice_n_samples
             new_audio = audio_signal_tensor[:, slice_start:slice_end]
 
@@ -1854,7 +1883,7 @@ class NemotronVoicechatInferenceWrapper:
 
             result = self.infer_one_step(
                 audio_input=current_buffer,
-                num_frames_per_inference=num_frames_per_inference,
+                num_frames_per_chunk=num_frames_per_chunk,
                 frame_idx=frame_idx,
                 gen_text=gen_text,
                 audio_toks_buffer=audio_toks_buffer if self.decode_audio else None,
@@ -1905,7 +1934,7 @@ class NemotronVoicechatInferenceWrapper:
                 # total_frames = frame_idx + 1
                 # break
 
-            frame_idx += num_frames_per_inference
+            frame_idx += num_frames_per_chunk
 
         # Prepare results
         elapsed_time = time.time() - start_time
@@ -1980,9 +2009,9 @@ def main():
                        help="Pad audio to this duration in seconds (useful for consistent buffer behavior)")
     parser.add_argument("--speaker_reference", type=str, required=True,
                        help="Path to speaker reference audio file")
-    parser.add_argument("--buffer_size_frames", type=int, default=70,
-                       help="Size of audio buffer in frames (each frame = 80ms)")
-    parser.add_argument("--num_frames_per_inference", type=int, default=DEFAULT_NUM_FRAMES_PER_INFERENCE,
+    parser.add_argument("--buffer_size_frames", type=int, default=DEFAULT_BUFFER_SIZE_FRAMES,
+                       help=f"Size of audio buffer in frames (each frame = 80ms, default: {DEFAULT_BUFFER_SIZE_FRAMES})")
+    parser.add_argument("--num_frames_per_chunk", type=int, default=DEFAULT_NUM_FRAMES_PER_CHUNK,
                        help="Number of frames per inference step (default: 1)")
     parser.add_argument("--output_text", type=str, default="output_text_streaming.txt",
                        help="Output text file path")
@@ -2152,7 +2181,7 @@ def main():
                     # Run inference with unique request_id per record to avoid vLLM race conditions
                     results = model.inference_realtime_streaming(
                         audio_path,
-                        num_frames_per_inference=args.num_frames_per_inference,
+                        num_frames_per_chunk=args.num_frames_per_chunk,
                         pad_audio_to_sec=args.pad_audio_to_sec,
                         request_id=f"streaming_request_{idx}",
                         audio_id=audio_id,
@@ -2207,7 +2236,7 @@ def main():
                             # Prepend silence to output channel to account for
                             # the one-chunk processing delay: the server can't
                             # produce output until it has received a full input chunk.
-                            delay_samples = int(args.num_frames_per_inference * FRAME_SIZE_SEC * model.target_sample_rate)
+                            delay_samples = int(args.num_frames_per_chunk * FRAME_SIZE_SEC * model.target_sample_rate)
                             out_audio_delayed = np.concatenate([np.zeros(delay_samples, dtype=audio_np.dtype), audio_np])
 
                             max_len = max(len(inp_audio), len(out_audio_delayed))
@@ -2298,7 +2327,7 @@ def main():
             # Run inference
             results = model.inference_realtime_streaming(
                 args.audio_path,
-                num_frames_per_inference=args.num_frames_per_inference,
+                num_frames_per_chunk=args.num_frames_per_chunk,
                 pad_audio_to_sec=args.pad_audio_to_sec,
                 system_prompt=args.system_prompt,
             )
@@ -2330,7 +2359,7 @@ def main():
                     # Prepend silence to output channel to account for
                     # the one-chunk processing delay: the server can't
                     # produce output until it has received a full input chunk.
-                    delay_samples = int(args.num_frames_per_inference * FRAME_SIZE_SEC * model.target_sample_rate)
+                    delay_samples = int(args.num_frames_per_chunk * FRAME_SIZE_SEC * model.target_sample_rate)
                     out_audio_delayed = np.concatenate([np.zeros(delay_samples, dtype=audio_np.dtype), audio_np])
 
                     max_len = max(len(inp_audio), len(out_audio_delayed))

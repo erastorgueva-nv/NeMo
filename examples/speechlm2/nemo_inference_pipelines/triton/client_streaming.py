@@ -43,13 +43,13 @@ logger = logging.getLogger(__name__)
 # Default values
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 8001
-DEFAULT_NUM_FRAMES_PER_INFERENCE = 1
+DEFAULT_NUM_FRAMES_PER_CHUNK = 1
 DEFAULT_DUR_TEST_AUDIO = 30
 
 parser = argparse.ArgumentParser(description="Streaming client for voicechat model")
 parser.add_argument("--host", type=str, default=DEFAULT_HOST, help=f"Triton server host (default: {DEFAULT_HOST})")
 parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Triton server port (default: {DEFAULT_PORT})")
-parser.add_argument("--num_frames_per_inference", type=int, default=DEFAULT_NUM_FRAMES_PER_INFERENCE, help=f"Number of frames per inference (default: {DEFAULT_NUM_FRAMES_PER_INFERENCE})")
+parser.add_argument("--num_frames_per_chunk", type=int, default=DEFAULT_NUM_FRAMES_PER_CHUNK, help=f"Number of 80ms frames per inference step (default: {DEFAULT_NUM_FRAMES_PER_CHUNK})")
 parser.add_argument("--audio_filename", type=str, required=True, help="Path to input audio file")
 parser.add_argument("--dur_test_audio", type=int, default=DEFAULT_DUR_TEST_AUDIO, help=f"Duration of test audio in seconds; audio will be padded or trimmed to this length (default: {DEFAULT_DUR_TEST_AUDIO})")
 parser.add_argument("--output_dir", type=str, default=".", help="Directory to save output audio files (default: current directory)")
@@ -59,10 +59,10 @@ args = parser.parse_args()
 model_name = "voicechat"
 audio_file = args.audio_filename
 
-NUM_FRAMES_PER_INFERENCE = args.num_frames_per_inference
+NUM_FRAMES_PER_CHUNK = args.num_frames_per_chunk
 DUR_TEST_AUDIO = args.dur_test_audio
-INPUT_CHUNK_SIZE_SAMPLES = int(16000 * 0.08) * NUM_FRAMES_PER_INFERENCE  # number of samples per input chunk
-NUM_CHUNKS_TEST_AUDIO = int(DUR_TEST_AUDIO / (0.08 * NUM_FRAMES_PER_INFERENCE))
+INPUT_CHUNK_SIZE_SAMPLES = int(16000 * 0.08) * NUM_FRAMES_PER_CHUNK  # number of samples per input chunk
+NUM_CHUNKS_TEST_AUDIO = int(DUR_TEST_AUDIO / (0.08 * NUM_FRAMES_PER_CHUNK))
 print(f"{NUM_CHUNKS_TEST_AUDIO=}")
 
 times_spend_on_inference = []
