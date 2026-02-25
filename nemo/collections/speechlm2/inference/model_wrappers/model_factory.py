@@ -39,6 +39,8 @@ import torch
 from transformers import DynamicCache
 from dataclasses import dataclass
 
+from nemo.utils import logging
+
 class ModelInterface(ABC):
     """
     Base interface for model inference engines with shared sampling utilities.
@@ -272,7 +274,7 @@ class VllmLLMModel(ModelInterface):
             dir_name = os.path.basename(os.path.normpath(model_path))
             engine_path = "/tmp/" + dir_name + f"_vllm_converted_{model_type}"
             if os.path.exists(engine_path):
-                print(f"✓ Found existing vLLM converted model at {engine_path}")
+                logging.info(f"Found existing vLLM converted model at {engine_path}")
             else:
                 self._convert_ckpt(
                     save_path=engine_path
@@ -300,53 +302,35 @@ class VllmLLMModel(ModelInterface):
             asyncio.set_event_loop(self._loop)
 
         # Initialize engine immediately to avoid first-call latency
-        print("Initializing vLLM engine (this may take a moment)...")
+        logging.info("Initializing vLLM engine (this may take a moment)...")
         self._loop.run_until_complete(self.engine.initialize())
 
         if self.engine.engine.tokenizer is not None and not self.special_token_ids:
             self.special_token_ids = self._get_special_token_ids_from_vllm_tokenizer(self.engine.engine.tokenizer)
 
+        logging.debug(f"Special token IDs: {self.special_token_ids}")
+        logging.info("vLLM engine ready!")
 
-        print(f"Special token IDs: {self.special_token_ids}")
-
-        print("vLLM engine ready!")
-
-    def _get_special_token_ids_from_vllm_tokenizer(self, tokenizer) -> Set[int]:
+    @staticmethod
+    def _get_special_token_ids_from_vllm_tokenizer(tokenizer) -> Set[int]:
         """
-        Extract special token IDs from a model or tokenizer.
-        Specifically looks for: '<s>' (bos), '</s>' (eos), '<SPECIAL_12>' (pad)
+        Extract special token IDs from a vLLM tokenizer.
+        Looks for: '<s>' (bos), '</s>' (eos), '<SPECIAL_12>' (pad).
 
         Args:
-            tokenizer: <class 'vllm.transformers_utils.tokenizer.get_cached_tokenizer.<locals>.CachedTokenizer'>
+            tokenizer: A vLLM CachedTokenizer instance.
 
         Returns:
-            Set of special token IDs
+            Set of special token IDs.
         """
-
         special_ids = set()
-
-        # Try to get IDs for the three specific tokens, using direct token to ID conversion
-        try:
-            bos_id = tokenizer.convert_tokens_to_ids('<s>')
-            if isinstance(bos_id, int):
-                special_ids.add(bos_id)
-        except:
-            pass
-
-        try:
-            eos_id = tokenizer.convert_tokens_to_ids('</s>')
-            if isinstance(eos_id, int):
-                special_ids.add(eos_id)
-        except:
-            pass
-
-        try:
-            pad_id = tokenizer.convert_tokens_to_ids('<SPECIAL_12>')
-            if isinstance(pad_id, int):
-                special_ids.add(pad_id)
-        except:
-            pass
-
+        for token in ('<s>', '</s>', '<SPECIAL_12>'):
+            try:
+                tid = tokenizer.convert_tokens_to_ids(token)
+                if isinstance(tid, int):
+                    special_ids.add(tid)
+            except Exception:
+                pass
         return special_ids
 
     def _convert_ckpt(self, save_path: str):
@@ -359,7 +343,7 @@ class VllmLLMModel(ModelInterface):
             pretrained_llm=self.pretrained_llm,
             dtype=self._dtype
         )
-        print(f"✓ Converted model saved to {save_path}")
+        logging.info(f"Converted model saved to {save_path}")
 
     def _generate_request_id(self) -> str:
         """Generate a unique request ID."""
@@ -423,13 +407,15 @@ class VllmLLMModel(ModelInterface):
             # Check if request is finished and needs restart
             request_state = self.engine.requests[request_id]
             if request_state.status in (StreamStatus.FINISHED, StreamStatus.ABORTED):
-                print(f"⚠️ Request {request_id} was {request_state.status.value}. This should not happen with max_tokens=100000.")
-                print(f"   Generated {len(request_state.generated_tokens)} tokens before stopping.")
-                print(f"   Cleaning up and restarting...")
+                logging.warning(
+                    f"Request {request_id} was {request_state.status.value}. "
+                    f"Generated {len(request_state.generated_tokens)} tokens before stopping. "
+                    "Cleaning up and restarting..."
+                )
                 # Try to abort cleanly first
                 try:
                     await self.engine.abort_generation(request_id)
-                except:
+                except Exception:
                     pass
                 # Start fresh
                 await self.engine.start_generation(request_id=request_id)
@@ -595,7 +581,7 @@ class VllmLLMModel(ModelInterface):
         """Cleanup on deletion."""
         try:
             self.shutdown()
-        except:
+        except Exception:
             pass
 
 @dataclass
@@ -627,7 +613,7 @@ class VllmEARTTSModel(VllmLLMModel):
             **kwargs: Arguments passed to the VllmLLMModel constructor
         """
         super().__init__(**kwargs)
-        print("VllmEARTTSModel initialized with EARTTS-specific settings.")
+        logging.info("VllmEARTTSModel initialized with EARTTS-specific settings.")
 
     def _convert_ckpt(self, save_path: str):
         """Convert EARTTS checkpoint to vLLM format."""
@@ -805,7 +791,7 @@ class NativeModel(ModelInterface):
 
         self.model = model
 
-        print(f"Special token IDs: {self.special_token_ids}")
+        logging.debug(f"Special token IDs: {self.special_token_ids}")
 
         # Validate: if sampling is enabled, special_token_ids should be set
         if (top_p < 1.0 or repetition_penalty != 1.0) and not self.special_token_ids:

@@ -35,6 +35,7 @@ from typing import Dict, List, Optional
 import torch
 from safetensors.torch import load_file, save_file
 from transformers import AutoConfig, AutoTokenizer
+from nemo.utils import logging
 
 
 def load_checkpoint(checkpoint_path: str) -> Dict[str, torch.Tensor]:
@@ -51,10 +52,10 @@ def load_checkpoint(checkpoint_path: str) -> Dict[str, torch.Tensor]:
         checkpoint_path = os.path.join(checkpoint_path, "model.safetensors")
 
     if checkpoint_path.endswith('.safetensors'):
-        print(f"Loading safetensors from {checkpoint_path}")
+        logging.info(f"Loading safetensors from {checkpoint_path}")
         return load_file(checkpoint_path)
     else:
-        print(f"Loading PyTorch checkpoint from {checkpoint_path}")
+        logging.info(f"Loading PyTorch checkpoint from {checkpoint_path}")
         ckpt = torch.load(checkpoint_path, map_location='cpu')
         # Handle different checkpoint formats
         if 'state_dict' in ckpt:
@@ -83,11 +84,11 @@ def filter_tensors(
     for name, tensor in state_dict.items():
         if any(name.startswith(prefix) for prefix in prefixes_to_keep):
             filtered_dict[name] = tensor
-            print(f"Keeping: {name} with shape {tensor.shape}")
+            logging.debug(f"Keeping: {name} with shape {tensor.shape}")
         else:
-            print(f"Skipping: {name}")
+            logging.debug(f"Skipping: {name}")
     
-    print(f"\nTotal tensors kept: {len(filtered_dict)}")
+    logging.info(f"Total tensors kept: {len(filtered_dict)}")
     return filtered_dict
 
 
@@ -126,13 +127,13 @@ def convert_nemo_to_hf_format(
         config_path = os.path.join(ckpt_dir, "config.json")
     
     if os.path.exists(config_path):
-        print(f"Loading config from {config_path}")
+        logging.info(f"Loading config from {config_path}")
         with open(config_path, "r") as f:
             config = json.load(f)
         
         try:
             pretrained_llm = config["model"]["stt"]["model"]["pretrained_llm"]
-            print(f"Found pretrained_llm in config: {pretrained_llm}")
+            logging.info(f"Found pretrained_llm in config: {pretrained_llm}")
         except KeyError:
             if pretrained_llm is None:
                 raise ValueError(
@@ -149,7 +150,7 @@ def convert_nemo_to_hf_format(
     output_path.mkdir(parents=True, exist_ok=True)
     
     # Load base config from pretrained model
-    print(f"\nLoading base config from {pretrained_llm}")
+    logging.info(f"Loading base config from {pretrained_llm}")
     base_config = AutoConfig.from_pretrained(pretrained_llm, trust_remote_code=True)
     
     # Modify config for custom inputs/outputs
@@ -167,15 +168,15 @@ def convert_nemo_to_hf_format(
 
 
     # Load tokenizer from pretrained model
-    print(f"Loading tokenizer from {pretrained_llm}")
+    logging.info(f"Loading tokenizer from {pretrained_llm}")
     tokenizer = AutoTokenizer.from_pretrained(pretrained_llm, trust_remote_code=True)
     
     # Load checkpoint
-    print(f"\nLoading checkpoint from {checkpoint_path}")
+    logging.info(f"Loading checkpoint from {checkpoint_path}")
     state_dict = load_checkpoint(checkpoint_path)
     
     # Filter tensors
-    print(f"\nFiltering tensors to keep prefixes: {tensors_to_keep}")
+    logging.info(f"Filtering tensors to keep prefixes: {tensors_to_keep}")
     filtered_state_dict = filter_tensors(state_dict, tensors_to_keep)
     
     if len(filtered_state_dict) == 0:
@@ -184,44 +185,21 @@ def convert_nemo_to_hf_format(
             f"Available prefixes: {set(k.split('.')[0] for k in state_dict.keys())}"
         )
     
-    # Convert dtype if needed
-    dtype_map = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "fp32": torch.float32,
-        "fp16": torch.float16,
-        "bf16": torch.bfloat16,
-    }
-    '''
-    if dtype.lower() in dtype_map:
-        target_dtype = dtype_map[dtype.lower()]
-        print(f"\nConverting tensors to {target_dtype}")
-        filtered_state_dict = {
-            k: v.to(target_dtype) if v.dtype.is_floating_point else v
-            for k, v in filtered_state_dict.items()
-        }
-    '''
-    
     # Save tensors
     output_model_path = output_path / "model.safetensors"
-    print(f"\nSaving tensors to {output_model_path}")
+    logging.info(f"Saving tensors to {output_model_path}")
     save_file(filtered_state_dict, str(output_model_path))
     
     # Save config
     output_config_path = output_path / "config.json"
-    print(f"Saving config to {output_config_path}")
+    logging.info(f"Saving config to {output_config_path}")
     base_config.save_pretrained(str(output_path))
     
     # Save tokenizer
-    print(f"Saving tokenizer to {output_path}")
+    logging.info(f"Saving tokenizer to {output_path}")
     tokenizer.save_pretrained(str(output_path))
     
-    
-    print(f"\n{'='*60}")
-    print("Conversion completed successfully!")
-    print(f"Output saved to: {output_path}")
-    print(f"{'='*60}\n")
+    logging.info(f"Conversion completed successfully! Output saved to: {output_path}")
 
 
 def main():
@@ -280,7 +258,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()   
-
-
-
+    main()

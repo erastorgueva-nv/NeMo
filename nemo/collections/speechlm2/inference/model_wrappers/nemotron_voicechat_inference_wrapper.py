@@ -34,9 +34,6 @@ import gc
 import types
 
 
-# NOTE: sys.path is configured via PYTHONPATH in the shell script (run_streaming_realtime_json_mode.sh)
-# Do NOT hardcode paths here as they may conflict with the correct paths set in the shell script
-
 # Set environment variables (use existing env vars if set, otherwise use defaults)
 _default_cache = "/tmp/cache"
 os.environ.setdefault("HF_HOME", _default_cache)
@@ -50,6 +47,11 @@ from nemo.collections.speechlm2.models.duplex_s2s_model import tokens_to_str
 from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.audio.parts.utils.transforms import resample
 from nemo.collections.speechlm2.inference.model_wrappers.model_factory import create_model
+from nemo.collections.speechlm2.inference.model_wrappers.perception_cache import (
+    PerceptionCacheState,
+    PerceptionCacheManager,
+)
+from nemo.collections.speechlm2.inference.utils.pipeline_utils import clean_pred_text
 
 
 def tokens_to_str_raw(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer, pad_id: int) -> list:
@@ -84,19 +86,6 @@ def tokens_to_str_raw(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer, pa
     return ans
 
 
-def clean_pred_text(text: str) -> str:
-    """Clean prediction text by removing special markers, timestamps, punctuation, and lowercasing."""
-    if not text:
-        return ""
-    text = text.lstrip('^')
-    text = re.sub(r'<\$[\d.]+\$>', '', text)
-    text = re.sub(r'<\|[\d.]+\|>', '', text)
-    text = re.sub(r'<SPECIAL_12>', '', text)
-    text = text.replace('Ġ', ' ')
-    # Lowercase and remove punctuation for fair WER comparison
-    text = text.lower()
-    text = re.sub(r'[^\w\s]', '', text)  # Remove punctuation
-    return ' '.join(text.split())
 
 # --- Configuration ---
 DEFAULT_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -115,64 +104,6 @@ DEFAULT_NUM_FRAMES_PER_CHUNK = 1
 # Only used when use_codec_cache=False (sliding-window fallback).
 # Ignored when the codec streaming cache is enabled.
 DEFAULT_CODEC_TOKEN_HISTORY_SIZE = 600
-
-
-@dataclass
-class PerceptionCacheState:
-    """Cache state for streaming perception inference.
-
-    Holds the cache tensors for the ASR encoder used in the perception module.
-    This enables cache-aware streaming inference without needing the full audio buffer.
-    """
-    cache_last_channel: Optional[torch.Tensor] = None
-    cache_last_time: Optional[torch.Tensor] = None
-    cache_last_channel_len: Optional[torch.Tensor] = None
-
-    def is_initialized(self) -> bool:
-        """Check if the cache has been initialized."""
-        return self.cache_last_channel is not None
-
-
-@dataclass
-class PerceptionCUDAGraphState:
-    """State for CUDA graph-accelerated perception encoder.
-    
-    Holds separate graphs for first chunk (different size) and subsequent chunks.
-    Also holds static buffers for inputs/outputs to enable graph replay.
-    """
-    # CUDA graphs
-    graph_first: Optional[torch.cuda.CUDAGraph] = None
-    graph_subsequent: Optional[torch.cuda.CUDAGraph] = None
-    
-    # Static input buffers (for copying data before graph replay)
-    static_mel_first: Optional[torch.Tensor] = None
-    static_mel_subsequent: Optional[torch.Tensor] = None
-    static_mel_len_first: Optional[torch.Tensor] = None
-    static_mel_len_subsequent: Optional[torch.Tensor] = None
-    
-    # Static cache input buffers
-    static_cache_channel_in: Optional[torch.Tensor] = None
-    static_cache_time_in: Optional[torch.Tensor] = None
-    static_cache_channel_len_in: Optional[torch.Tensor] = None
-    
-    # Static output buffers (results are written here during replay)
-    static_encoded_first: Optional[torch.Tensor] = None
-    static_encoded_subsequent: Optional[torch.Tensor] = None
-    static_encoded_len_first: Optional[torch.Tensor] = None
-    static_encoded_len_subsequent: Optional[torch.Tensor] = None
-    
-    # Static cache output buffers - SEPARATE for first and subsequent graphs
-    # (each graph writes to its own output tensors during replay)
-    static_cache_channel_out_first: Optional[torch.Tensor] = None
-    static_cache_time_out_first: Optional[torch.Tensor] = None
-    static_cache_channel_len_out_first: Optional[torch.Tensor] = None
-    static_cache_channel_out_subsequent: Optional[torch.Tensor] = None
-    static_cache_time_out_subsequent: Optional[torch.Tensor] = None
-    static_cache_channel_len_out_subsequent: Optional[torch.Tensor] = None
-    
-    def is_captured(self) -> bool:
-        """Check if graphs have been captured."""
-        return self.graph_first is not None and self.graph_subsequent is not None
 
 
 class NemotronVoicechatInferenceWrapper:
@@ -244,8 +175,6 @@ class NemotronVoicechatInferenceWrapper:
             device_id=model_cfg.get("device_id"),
         )
 
-        #logging.setLevel(logging.DEBUG)
-
         logging.info("=" * 70)
         logging.info("INITIALIZING REALTIME STREAMING INFERENCE")
         logging.info("=" * 70)
@@ -297,24 +226,18 @@ class NemotronVoicechatInferenceWrapper:
 
         # Perception cache configuration
         self.use_perception_cache = bool(model_cfg.get("use_perception_cache", False))
-        self.perception_streaming_cfg = None  # Will be populated after model init if cache is used
-        self.perception_preprocessor = None  # Separate preprocessor for cache-aware streaming
-        
-        # CUDA graph configuration for perception encoder
-        self.use_perception_cudagraph = bool(model_cfg.get("use_perception_cudagraph", False))
-        self.perception_cudagraph_state: Optional[PerceptionCUDAGraphState] = None
-        
-        # CUDA graphs require perception cache to be enabled
-        if self.use_perception_cudagraph and not self.use_perception_cache:
+        use_perception_cudagraph = bool(model_cfg.get("use_perception_cudagraph", False))
+        if use_perception_cudagraph and not self.use_perception_cache:
             raise ValueError(
                 "use_perception_cudagraph requires use_perception_cache to be enabled. "
                 "Please also set use_perception_cache=True."
             )
+        self.perception_cache_mgr: Optional[PerceptionCacheManager] = None
+        self._use_perception_cudagraph = use_perception_cudagraph
 
         self._initialize_model()
 
-
-        logging.info(f"\n✅ NemotronVoicechatInferenceWrapper initialized successfully.")
+        logging.info("NemotronVoicechatInferenceWrapper initialized successfully.")
 
         logging.info(f"{self.model.stt_model.perception.encoder._cfg = }")
         logging.info(f"{self.model.stt_model.perception.encoder.streaming_cfg = }")
@@ -378,7 +301,7 @@ class NemotronVoicechatInferenceWrapper:
 
     def _load_and_merge_configs(self):
         """Load and merge configurations from both nano and eartts checkpoints."""
-        logging.info("\n📋 Loading and merging configurations...")
+        logging.info("Loading and merging configurations...")
 
         # Load nano's config (for LLM, perception)
         nano_config_file = os.path.join(self.llm_checkpoint_path, "config.json")
@@ -402,7 +325,7 @@ class NemotronVoicechatInferenceWrapper:
         logging.info("  Merging: Using nano's config for LLM/perception, eartts's for TTS")
         if 'model' in eartts_cfg and 'speech_generation' in eartts_cfg.model:
             merged_cfg.model.speech_generation = eartts_cfg.model.speech_generation
-            logging.info("    ✓ TTS config from eartts")
+            logging.info("    TTS config from eartts")
 
         # Set speaker reference
         if 'model' not in merged_cfg:
@@ -425,7 +348,7 @@ class NemotronVoicechatInferenceWrapper:
         from safetensors.torch import load_file
         from nemo.collections.speechlm2.parts.pretrained import set_model_dict_for_partial_init
 
-        logging.info("\n🚀 Initializing model with hybrid loading strategy...")
+        logging.info("Initializing model with hybrid loading strategy...")
 
 
         # Step 1: Load and merge configs
@@ -439,15 +362,15 @@ class NemotronVoicechatInferenceWrapper:
         cfg_dict = OmegaConf.to_container(cfg, resolve=True)
 
         # Step 3: Initialize model structure
-        logging.info("\n🏗️  Initializing model structure...")
+        logging.info("Initializing model structure...")
         start_DuplexS2S_init = time.time()
         self.model = NemotronVoiceChat(cfg_dict)
-        logging.info(f"🕒 Time taken to initialize NemotronVoiceChat: {time.time() - start_DuplexS2S_init} seconds")
-        logging.info("  ✓ Model structure initialized")
+        logging.info(f"Time taken to initialize NemotronVoiceChat: {time.time() - start_DuplexS2S_init} seconds")
+        logging.info("  Model structure initialized")
 
         # Step 4: Load nano's checkpoint (LLM + perception)
         if self.llm_checkpoint_path is not None:
-            logging.info(f"\n📦 Loading LLM + perception:")
+            logging.info("Loading LLM + perception:")
             logging.info(f"  Path: {self.llm_checkpoint_path}")
 
             nano_state_dict = load_file(os.path.join(self.llm_checkpoint_path, "model.safetensors"))
@@ -484,13 +407,13 @@ class NemotronVoicechatInferenceWrapper:
             unexpected_non_excluded = [k for k in unexpected if not any(k.startswith(prefix) for prefix in exclude_keys)]
 
             if missing_non_excluded:
-                logging.info(f"  ⚠️  {len(missing_non_excluded)} keys missing (might be OK)")
+                logging.info(f"  {len(missing_non_excluded)} keys missing (might be OK)")
             if unexpected_non_excluded:
-                logging.info(f"  ⚠️  {len(unexpected_non_excluded)} unexpected keys")
+                logging.info(f"  {len(unexpected_non_excluded)} unexpected keys")
 
         # Step 5: Load eartts's checkpoint (TTS only)
         if self.model_path is not None:
-            logging.info(f"\n📦 Loading TTS checkpoint:")
+            logging.info("Loading TTS checkpoint:")
             logging.info(f"  Path: {self.model_path}")
 
             eartts_state_dict = load_file(os.path.join(self.model_path, "model.safetensors"))
@@ -504,15 +427,15 @@ class NemotronVoicechatInferenceWrapper:
 
             start_tts_load_state_dict = time.time()
             missing, unexpected = self.model.load_state_dict(eartts_tts_only, strict=False)
-            logging.info(f"🕒 Time taken to load TTS state dict: {time.time() - start_tts_load_state_dict} seconds")
+            logging.info(f"Time taken to load TTS state dict: {time.time() - start_tts_load_state_dict} seconds")
 
             missing_tts = [k for k in missing if any(k.startswith(prefix) for prefix in tts_keys_filter)]
             unexpected_tts = [k for k in unexpected if any(k.startswith(prefix) for prefix in tts_keys_filter)]
 
             if missing_tts:
-                logging.info(f"  ⚠️  {len(missing_tts)} TTS keys missing")
+                logging.info(f"  {len(missing_tts)} TTS keys missing")
             if unexpected_tts:
-                logging.info(f"  ⚠️  {len(unexpected_tts)} unexpected TTS keys")
+                logging.info(f"  {len(unexpected_tts)} unexpected TTS keys")
 
             if self.use_vllm_eartts:
                 # gonna convert and load vllm eartts engine
@@ -533,13 +456,13 @@ class NemotronVoicechatInferenceWrapper:
                 from nemo.collections.speechlm2.inference.vllm.vllm_patch import patched_infer_codes_one_step
                 self.model.tts_model.infer_codes_one_step = types.MethodType(patched_infer_codes_one_step, self.model.tts_model)
 
-            logging.info(f"  ✓ eartts checkpoint loaded (TTS only)")
+            logging.info(f"  eartts checkpoint loaded (TTS only)")
 
-        logging.info("\n✅ Hybrid loading completed!")
+        logging.info("\nHybrid loading completed!")
 
         # If using vLLM for LLM, delete native LLM BEFORE moving to device to save memory
         if self.use_vllm_llm:
-            logging.info("\n🔧 Deleting native LLM before GPU transfer (will use vLLM instead)...")
+            logging.info("\nDeleting native LLM before GPU transfer (will use vLLM instead)...")
             if hasattr(self.model.stt_model, 'llm') and self.model.stt_model.llm is not None:
                 # Delete all submodules of LLM to free memory
                 for name, child in list(self.model.stt_model.llm.named_children()):
@@ -548,7 +471,7 @@ class NemotronVoicechatInferenceWrapper:
                 self.model.stt_model.llm = None
             gc.collect()
             torch.cuda.empty_cache()
-            logging.info("  ✓ Native LLM deleted")
+            logging.info("  Native LLM deleted")
 
         # Setup model
         self.model.to(self.device)
@@ -563,7 +486,7 @@ class NemotronVoicechatInferenceWrapper:
         self.model.stt_model.asr_head = self.model.stt_model.asr_head.to(self.dtype)
         self.model.stt_model.embed_asr_tokens = self.model.stt_model.embed_asr_tokens.to(self.dtype)
         #self.model.stt_model.perception = self.model.stt_model.perception.to(self.dtype)
-        logging.info("✓ S2S components converted, TTS kept in float32")
+        logging.info("S2S components converted, TTS kept in float32")
         logging.info("new update, perception also is kept in float32")
 
         # commenting this out to avoid error when try vllm tts
@@ -579,7 +502,7 @@ class NemotronVoicechatInferenceWrapper:
 
         # Wrap model with appropriate interface (Native or vLLM)
         if self.use_vllm_llm:
-            logging.info("\n🔧 Wrapping model with VllmLLMModel interface...")
+            logging.info("\nWrapping model with VllmLLMModel interface...")
             if self.vllm_llm_config is None:
                 raise ValueError("vllm_llm_config must be provided when engine_type contains'vllm_llm'")
 
@@ -596,16 +519,16 @@ class NemotronVoicechatInferenceWrapper:
                 repetition_penalty=self.repetition_penalty
             )
 
-            logging.info("✓ VllmLLMModel interface created")
+            logging.info("VllmLLMModel interface created")
         else:
-            logging.info("\n🔧 Wrapping model with NativeModel interface...")
+            logging.info("\nWrapping model with NativeModel interface...")
             self.model_llm_interface = create_model(
                 model=self.model,
                 engine_type="native",
                 top_p=self.top_p,
                 repetition_penalty=self.repetition_penalty
             )
-            logging.info("✓ NativeModel interface created")
+            logging.info("NativeModel interface created")
 
         # Get TTS info
         if hasattr(self.model, 'tts_model'):
@@ -619,7 +542,15 @@ class NemotronVoicechatInferenceWrapper:
 
         # Setup perception cache if enabled
         if self.use_perception_cache:
-            self._setup_perception_cache()
+            self.perception_cache_mgr = PerceptionCacheManager(
+                model=self.model,
+                device=self.device,
+                dtype=self.dtype,
+                use_cudagraph=self._use_perception_cudagraph,
+            )
+            if not self.perception_cache_mgr.setup():
+                self.use_perception_cache = False
+                self.perception_cache_mgr = None
 
     def _get_bos_embedding(self):
         """Get beginning of sequence embedding."""
@@ -655,7 +586,7 @@ class NemotronVoicechatInferenceWrapper:
         if not system_prompt or not system_prompt.strip():
             return None, 0
 
-        logging.info(f"\n📝 Preparing system prompt: {system_prompt[:100]}...")
+        logging.info(f"Preparing system prompt: {system_prompt[:100]}...")
 
         # Step 1: Tokenize the prompt
         # Format: [bos] + text_tokens + [eos] (consistent with collate_system_prompt)
@@ -691,495 +622,9 @@ class NemotronVoicechatInferenceWrapper:
         prompt_embedded[:, 0, :] += bos_emb.squeeze(0)
         prompt_embedded[:, 0, :] += asr_bos_emb.squeeze(0)
 
-        logging.info(f"   ✅ System prompt embeddings prepared: shape {prompt_embedded.shape}")
+        logging.info(f"   System prompt embeddings prepared: shape {prompt_embedded.shape}")
 
         return prompt_embedded, prompt_len
-
-    def _setup_perception_cache(self):
-        """Setup cache-aware streaming for the perception encoder."""
-        import copy
-        from nemo.collections.asr.parts.mixins.streaming import StreamingEncoder
-
-        perception = self.model.stt_model.perception
-        encoder = perception.encoder
-
-        # Check if encoder supports streaming
-        if not isinstance(encoder, StreamingEncoder):
-            logging.warning("Perception encoder does not support streaming. Disabling perception cache.")
-            self.use_perception_cache = False
-            return
-
-        # Setup streaming params if not already done
-        if encoder.streaming_cfg is None:
-            encoder.setup_streaming_params()
-
-        self.perception_streaming_cfg = encoder.streaming_cfg
-
-        # Create a separate preprocessor for cache-aware streaming (no dither, no normalization padding)
-        cfg = copy.deepcopy(perception.cfg)
-        OmegaConf.set_struct(cfg.preprocessor, False)
-        cfg.preprocessor.dither = 0.0
-        cfg.preprocessor.pad_to = 0
-
-        self.perception_preprocessor = perception.from_config_dict(cfg.preprocessor)
-        self.perception_preprocessor.to(self.device)
-
-        # Get subsampling factor and input features
-        self.perception_subsampling_factor = encoder.subsampling_factor
-        self.perception_input_features = encoder._feat_in
-
-        # Get sampling frames for checking minimum chunk size
-        if hasattr(encoder, "pre_encode") and hasattr(encoder.pre_encode, "get_sampling_frames"):
-            self.perception_sampling_frames = encoder.pre_encode.get_sampling_frames()
-        else:
-            self.perception_sampling_frames = None
-
-        logging.info(f"✅ Perception cache setup complete:")
-        logging.info(f"   Streaming config: chunk_size={self.perception_streaming_cfg.chunk_size}, "
-                     f"shift_size={self.perception_streaming_cfg.shift_size}")
-        logging.info(f"   Pre-encode cache size: {self.perception_streaming_cfg.pre_encode_cache_size}")
-        logging.info(f"   Subsampling factor: {self.perception_subsampling_factor}")
-        
-        # Setup CUDA graphs if enabled
-        if self.use_perception_cudagraph:
-            logging.info(f"   Setting up CUDA graphs for perception encoder...")
-            self._capture_perception_cudagraphs()
-            logging.info(f"   ✓ CUDA graphs captured")
-
-    def _capture_perception_cudagraphs(self):
-        """Capture CUDA graphs for perception encoder with both chunk sizes.
-
-        Note: "chunk" in the streaming encoder config (chunk_size, shift_size, etc.)
-        follows NeMo's cache-aware streaming encoder API and is measured in
-        mel-spectrogram time-steps, not audio samples or seconds.
-        """
-        encoder = self.model.stt_model.perception.encoder
-        perception = self.model.stt_model.perception
-        streaming_cfg = self.perception_streaming_cfg
-        
-        # Get chunk sizes
-        if isinstance(streaming_cfg.chunk_size, list):
-            chunk_size_first = streaming_cfg.chunk_size[0]
-            chunk_size_subsequent = streaming_cfg.chunk_size[1]
-        else:
-            chunk_size_first = streaming_cfg.chunk_size
-            chunk_size_subsequent = streaming_cfg.chunk_size
-            
-        if isinstance(streaming_cfg.pre_encode_cache_size, list):
-            pre_encode_cache_first = streaming_cfg.pre_encode_cache_size[0]
-            pre_encode_cache_subsequent = streaming_cfg.pre_encode_cache_size[1]
-        else:
-            pre_encode_cache_first = streaming_cfg.pre_encode_cache_size
-            pre_encode_cache_subsequent = streaming_cfg.pre_encode_cache_size
-        
-        # Total mel lengths for each chunk type
-        mel_len_first = chunk_size_first + pre_encode_cache_first
-        mel_len_subsequent = chunk_size_subsequent + pre_encode_cache_subsequent
-        
-        logging.info(f"   CUDA graph mel lengths: first={mel_len_first}, subsequent={mel_len_subsequent}")
-        
-        # Get initial cache state for warmup
-        cache_last_channel, cache_last_time, cache_last_channel_len = encoder.get_initial_cache_state(
-            batch_size=1
-        )
-
-        
-        # Create static buffers (use float32 since perception stays in float32)
-        state = PerceptionCUDAGraphState()
-        
-        # Static mel input buffers
-        state.static_mel_first = torch.zeros(
-            (1, self.perception_input_features, mel_len_first),
-            dtype=torch.float32, device=self.device
-        )
-        state.static_mel_subsequent = torch.zeros(
-            (1, self.perception_input_features, mel_len_subsequent),
-            dtype=torch.float32, device=self.device
-        )
-        state.static_mel_len_first = torch.tensor([mel_len_first], dtype=torch.long, device=self.device)
-        state.static_mel_len_subsequent = torch.tensor([mel_len_subsequent], dtype=torch.long, device=self.device)
-        
-        # Static cache input buffers (clone from initial state)
-        if cache_last_channel is not None:
-            state.static_cache_channel_in = cache_last_channel.clone()
-        if cache_last_time is not None:
-            state.static_cache_time_in = cache_last_time.clone()
-        if cache_last_channel_len is not None:
-            state.static_cache_channel_len_in = cache_last_channel_len.clone()
-        
-        # Warmup runs (required before graph capture)
-        logging.info(f"   Warming up encoder for CUDA graph capture...")
-        for _ in range(3):
-            with torch.no_grad():
-                # Warmup first chunk
-                _ = encoder.cache_aware_stream_step(
-                    processed_signal=state.static_mel_first,
-                    processed_signal_length=state.static_mel_len_first,
-                    cache_last_channel=state.static_cache_channel_in.clone() if state.static_cache_channel_in is not None else None,
-                    cache_last_time=state.static_cache_time_in.clone() if state.static_cache_time_in is not None else None,
-                    cache_last_channel_len=state.static_cache_channel_len_in.clone() if state.static_cache_channel_len_in is not None else None,
-                    keep_all_outputs=True,
-                    drop_extra_pre_encoded=0,
-                )
-                # Warmup subsequent chunk
-                _ = encoder.cache_aware_stream_step(
-                    processed_signal=state.static_mel_subsequent,
-                    processed_signal_length=state.static_mel_len_subsequent,
-                    cache_last_channel=state.static_cache_channel_in.clone() if state.static_cache_channel_in is not None else None,
-                    cache_last_time=state.static_cache_time_in.clone() if state.static_cache_time_in is not None else None,
-                    cache_last_channel_len=state.static_cache_channel_len_in.clone() if state.static_cache_channel_len_in is not None else None,
-                    keep_all_outputs=True,
-                    drop_extra_pre_encoded=streaming_cfg.drop_extra_pre_encoded,
-                )
-        torch.cuda.synchronize()
-        
-        # Capture graph for FIRST chunk
-        logging.info(f"   Capturing CUDA graph for first chunk (mel_len={mel_len_first})...")
-        state.graph_first = torch.cuda.CUDAGraph()
-        
-        # Reset cache to initial state before capture
-        if state.static_cache_channel_in is not None:
-            state.static_cache_channel_in.copy_(cache_last_channel)
-        if state.static_cache_time_in is not None:
-            state.static_cache_time_in.copy_(cache_last_time)
-        if state.static_cache_channel_len_in is not None:
-            state.static_cache_channel_len_in.copy_(cache_last_channel_len)
-        
-        with torch.cuda.graph(state.graph_first):
-            (
-                encoded_first,
-                encoded_len_first,
-                cache_channel_out_first,
-                cache_time_out_first,
-                cache_channel_len_out_first,
-            ) = encoder.cache_aware_stream_step(
-                processed_signal=state.static_mel_first,
-                processed_signal_length=state.static_mel_len_first,
-                cache_last_channel=state.static_cache_channel_in,
-                cache_last_time=state.static_cache_time_in,
-                cache_last_channel_len=state.static_cache_channel_len_in,
-                keep_all_outputs=True,
-                drop_extra_pre_encoded=0,
-            )
-            # Apply modality adapter and projection inside graph
-            encoded_adapted_first, _ = perception.modality_adapter(audio_signal=encoded_first, length=encoded_len_first)
-            encoded_chunk_first = perception.proj(encoded_adapted_first.transpose(1, 2))
-        
-        # Store output buffer references for first graph
-        state.static_encoded_first = encoded_chunk_first
-        state.static_encoded_len_first = encoded_len_first
-        state.static_cache_channel_out_first = cache_channel_out_first
-        state.static_cache_time_out_first = cache_time_out_first
-        state.static_cache_channel_len_out_first = cache_channel_len_out_first
-        
-        # Capture graph for SUBSEQUENT chunks
-        logging.info(f"   Capturing CUDA graph for subsequent chunks (mel_len={mel_len_subsequent})...")
-        state.graph_subsequent = torch.cuda.CUDAGraph()
-        
-        # Reset cache to initial state before capture (for consistent graph)
-        if state.static_cache_channel_in is not None:
-            state.static_cache_channel_in.copy_(cache_last_channel)
-        if state.static_cache_time_in is not None:
-            state.static_cache_time_in.copy_(cache_last_time)
-        if state.static_cache_channel_len_in is not None:
-            state.static_cache_channel_len_in.copy_(cache_last_channel_len)
-        
-        with torch.cuda.graph(state.graph_subsequent):
-            (
-                encoded_subsequent,
-                encoded_len_subsequent,
-                cache_channel_out_subsequent,
-                cache_time_out_subsequent,
-                cache_channel_len_out_subsequent,
-            ) = encoder.cache_aware_stream_step(
-                processed_signal=state.static_mel_subsequent,
-                processed_signal_length=state.static_mel_len_subsequent,
-                cache_last_channel=state.static_cache_channel_in,
-                cache_last_time=state.static_cache_time_in,
-                cache_last_channel_len=state.static_cache_channel_len_in,
-                keep_all_outputs=True,
-                drop_extra_pre_encoded=streaming_cfg.drop_extra_pre_encoded,
-            )
-            # Apply modality adapter and projection inside graph
-            encoded_adapted_subsequent, _ = perception.modality_adapter(audio_signal=encoded_subsequent, length=encoded_len_subsequent)
-            encoded_chunk_subsequent = perception.proj(encoded_adapted_subsequent.transpose(1, 2))
-        
-        # Store output buffer references for subsequent graph
-        state.static_encoded_subsequent = encoded_chunk_subsequent
-        state.static_encoded_len_subsequent = encoded_len_subsequent
-        state.static_cache_channel_out_subsequent = cache_channel_out_subsequent
-        state.static_cache_time_out_subsequent = cache_time_out_subsequent
-        state.static_cache_channel_len_out_subsequent = cache_channel_len_out_subsequent
-        
-        self.perception_cudagraph_state = state
-        logging.info(f"   ✓ CUDA graphs captured successfully")
-
-    def _get_initial_perception_cache_state(self, batch_size: int = 1) -> PerceptionCacheState:
-        """Get initial cache state for perception encoder."""
-        if not self.use_perception_cache:
-            return PerceptionCacheState()
-
-        encoder = self.model.stt_model.perception.encoder
-        cache_last_channel, cache_last_time, cache_last_channel_len = encoder.get_initial_cache_state(
-            batch_size=batch_size
-        )
-        
-        
-        return PerceptionCacheState(
-            cache_last_channel=cache_last_channel,
-            cache_last_time=cache_last_time,
-            cache_last_channel_len=cache_last_channel_len,
-        )
-
-    def _cache_aware_perception_step(
-        self,
-        audio_input: torch.Tensor,
-        frame_idx: int,
-        num_frames_per_chunk: int,
-        perception_cache: PerceptionCacheState,
-    ) -> Tuple[torch.Tensor, PerceptionCacheState]:
-        """
-        Perform cache-aware perception encoding for streaming inference.
-
-        Note: "chunk" in this method (chunk_size, mel_chunk, etc.) follows NeMo's
-        cache-aware streaming encoder API and is measured in mel-spectrogram time-steps,
-        not audio samples or seconds.
-
-        This method computes the full mel spectrogram from the audio buffer, then slices
-        it appropriately based on the frame index. It supports processing multiple
-        "base steps" in a single call, where each base step processes (lookahead + 1) frames.
-
-        Processing logic per sub-step:
-        - First sub-step (sub_frame_idx == 0): take first chunk_size_first columns, 
-          prepend zeros for pre_encode_cache
-        - Subsequent sub-steps (sub_frame_idx > 0): take chunk_size columns starting from
-          (shift_size_first + (step_number-1)*shift_size), prepend pre_encode_cache_size 
-          columns from mel spec
-
-        The method loops over sub-steps, running the encoder for each and concatenating
-        the outputs. This allows num_frames_per_chunk to be a multiple of (lookahead + 1).
-
-        Args:
-            audio_input: Audio buffer tensor [B, T] (full buffer with all samples)
-            frame_idx: Current frame index in the stream
-            num_frames_per_chunk: Number of 80ms frames to process. Must be a multiple
-                of (lookahead + 1), i.e., encoder._cfg.att_context_size[1] + 1
-            perception_cache: Current cache state containing encoder caches
-
-        Returns:
-            Tuple of (encoded_output [B, T_out, D], updated_perception_cache)
-            where T_out = num_frames_per_chunk (one output frame per input frame)
-        """
-        perception = self.model.stt_model.perception
-        encoder = perception.encoder
-        streaming_cfg = self.perception_streaming_cfg
-
-        # Extract mel spectrogram from the full audio buffer
-        audio_len = torch.tensor([audio_input.shape[1]], dtype=torch.long, device=self.device)
-        _t_start_preprocessor = time.time()
-        processed_signal, _ = self.perception_preprocessor(
-            input_signal=audio_input,
-            length=audio_len,
-        ) # returns processed_signal, processed_signal_length
-        # processed_signal shape: [B, n_mels, T_mel]
-        logging.info(f"preprocessor time: {time.time() - _t_start_preprocessor:.3f}s")
-
-
-        # Get streaming config values
-        if isinstance(streaming_cfg.chunk_size, list):
-            chunk_size_first = streaming_cfg.chunk_size[0]
-            chunk_size = streaming_cfg.chunk_size[1]
-        else:
-            chunk_size_first = streaming_cfg.chunk_size
-            chunk_size = streaming_cfg.chunk_size
-
-        if isinstance(streaming_cfg.shift_size, list):
-            shift_size_first = streaming_cfg.shift_size[0]
-            shift_size = streaming_cfg.shift_size[1]
-        else:
-            shift_size_first = streaming_cfg.shift_size
-            shift_size = streaming_cfg.shift_size
-
-        if isinstance(streaming_cfg.pre_encode_cache_size, list):
-            pre_encode_cache_size_first = streaming_cfg.pre_encode_cache_size[0]
-            pre_encode_cache_size = streaming_cfg.pre_encode_cache_size[1]
-        else:
-            pre_encode_cache_size_first = streaming_cfg.pre_encode_cache_size
-            pre_encode_cache_size = streaming_cfg.pre_encode_cache_size
-
-        # Initialize current cache state
-        cache_last_channel = perception_cache.cache_last_channel
-        cache_last_time = perception_cache.cache_last_time
-        cache_last_channel_len = perception_cache.cache_last_channel_len
-
-        # num_frames_per_chunk must be a multiple of (lookahead + 1)
-        # Each "base step" processes (lookahead + 1) frames
-        base_step_size = encoder._cfg.att_context_size[1] + 1
-        if num_frames_per_chunk % base_step_size != 0:
-            raise ValueError(
-                f"num_frames_per_chunk must be a multiple of (lookahead + 1) = {base_step_size}. "
-                f"Got num_frames_per_chunk={num_frames_per_chunk}"
-            )
-        num_sub_steps = num_frames_per_chunk // base_step_size
-
-        # Run the encoder with cache (using CUDA graphs if available)
-        start_time = time.time()
-        
-        # Collect encoded chunks from all sub-steps
-        encoded_chunks = []
-        
-        for sub_step in range(num_sub_steps):
-            sub_step_start_time = time.time()
-            
-            # Compute the effective frame index for this sub-step
-            sub_frame_idx = frame_idx + (sub_step * base_step_size)
-            is_first_sub_step = (sub_frame_idx == 0)
-
-            if is_first_sub_step:
-                # First frame: take first chunk_size_first columns from mel spectrogram
-                cur_chunk_size = chunk_size_first
-                cur_pre_encode_cache_size = pre_encode_cache_size_first
-                drop_extra_pre_encoded = 0
-
-                # Slice the main chunk: [0 : chunk_size_first]
-                mel_chunk = processed_signal[:, :, :cur_chunk_size]
-
-                # Prepend zeros for pre_encode_cache on the left
-                if cur_pre_encode_cache_size > 0:
-                    zeros_pad = torch.zeros(
-                        (processed_signal.size(0), self.perception_input_features, cur_pre_encode_cache_size),
-                        device=self.device,
-                        dtype=processed_signal.dtype,
-                    )
-                    mel_chunk = torch.cat([zeros_pad, mel_chunk], dim=-1)
-            else:
-                # N-th sub-step (sub_frame_idx > 0):
-                # Compute step_number based on sub_frame_idx and base_step_size
-                cur_chunk_size = chunk_size
-                cur_pre_encode_cache_size = pre_encode_cache_size
-                drop_extra_pre_encoded = streaming_cfg.drop_extra_pre_encoded
-
-                mel_T = processed_signal.shape[-1]
-
-                # Calculate start position for the main chunk
-                # step_number counts how many base_step_size chunks have been processed before this one
-                step_number = sub_frame_idx // base_step_size
-                chunk_start = shift_size_first + (step_number - 1) * shift_size
-                chunk_end = chunk_start + cur_chunk_size
-
-                # Check if we've exceeded the mel spectrogram length (buffer is full and sliding)
-                # When buffer is full, we take from the end but shifted back by (chunk_size - shift_size_first)
-                # to account for the different sizing of the first chunk vs subsequent chunks
-                offset = chunk_size - shift_size_first
-                if chunk_end > mel_T - offset:
-                    # Buffer is full - take from the end of the mel spectrogram, staggered by sub_step
-                    # sub_step 0 should be furthest from end (oldest of the new chunks)
-                    # last sub_step should be closest to end (newest chunk)
-                    sub_steps_remaining = num_sub_steps - 1 - sub_step
-                    chunk_end = mel_T - offset - sub_steps_remaining * shift_size
-                    chunk_start = chunk_end - cur_chunk_size
-
-                # Get the main chunk
-                main_chunk = processed_signal[:, :, chunk_start:chunk_end]
-
-                # Get the pre-encode cache (columns before chunk_start)
-                cache_start = max(0, chunk_start - cur_pre_encode_cache_size)
-                cache_mel = processed_signal[:, :, cache_start:chunk_start]
-
-                # Pad with zeros on the left if we don't have enough cache
-                if cache_mel.shape[-1] < cur_pre_encode_cache_size:
-                    zeros_pad = torch.zeros(
-                        (cache_mel.size(0), cache_mel.size(1), cur_pre_encode_cache_size - cache_mel.shape[-1]),
-                        device=self.device,
-                        dtype=cache_mel.dtype,
-                    )
-                    cache_mel = torch.cat([zeros_pad, cache_mel], dim=-1)
-
-                # Combine: pre_encode_cache + main chunk
-                mel_chunk = torch.cat([cache_mel, main_chunk], dim=-1)
-
-            chunk_lengths = torch.tensor([mel_chunk.shape[-1]], dtype=torch.long, device=self.device)
-            
-            if self.use_perception_cudagraph and self.perception_cudagraph_state is not None and self.perception_cudagraph_state.is_captured():
-                # Use CUDA graph path
-                graph_state = self.perception_cudagraph_state
-                
-                # Copy inputs to static buffers
-                if is_first_sub_step:
-                    graph_state.static_mel_first.copy_(mel_chunk)
-                else:
-                    graph_state.static_mel_subsequent.copy_(mel_chunk)
-                
-                # Copy cache inputs
-                if graph_state.static_cache_channel_in is not None and cache_last_channel is not None:
-                    graph_state.static_cache_channel_in.copy_(cache_last_channel)
-                if graph_state.static_cache_time_in is not None and cache_last_time is not None:
-                    graph_state.static_cache_time_in.copy_(cache_last_time)
-                if graph_state.static_cache_channel_len_in is not None and cache_last_channel_len is not None:
-                    graph_state.static_cache_channel_len_in.copy_(cache_last_channel_len)
-                
-                # Replay the appropriate graph and read from the corresponding output buffers
-                if is_first_sub_step:
-                    graph_state.graph_first.replay()
-                    encoded_chunk = graph_state.static_encoded_first.clone()
-                    # Read cache from FIRST graph's output buffers
-                    cache_last_channel = graph_state.static_cache_channel_out_first.clone() if graph_state.static_cache_channel_out_first is not None else None
-                    cache_last_time = graph_state.static_cache_time_out_first.clone() if graph_state.static_cache_time_out_first is not None else None
-                    cache_last_channel_len = graph_state.static_cache_channel_len_out_first.clone() if graph_state.static_cache_channel_len_out_first is not None else None
-                else:
-                    graph_state.graph_subsequent.replay()
-                    encoded_chunk = graph_state.static_encoded_subsequent.clone()
-                    # Read cache from SUBSEQUENT graph's output buffers
-                    cache_last_channel = graph_state.static_cache_channel_out_subsequent.clone() if graph_state.static_cache_channel_out_subsequent is not None else None
-                    cache_last_time = graph_state.static_cache_time_out_subsequent.clone() if graph_state.static_cache_time_out_subsequent is not None else None
-                    cache_last_channel_len = graph_state.static_cache_channel_len_out_subsequent.clone() if graph_state.static_cache_channel_len_out_subsequent is not None else None
-                
-            else:
-                # Standard path (no CUDA graphs)
-                (
-                    encoded,
-                    encoded_len,
-                    cache_last_channel,
-                    cache_last_time,
-                    cache_last_channel_len,
-                ) = encoder.cache_aware_stream_step(
-                    processed_signal=mel_chunk,
-                    processed_signal_length=chunk_lengths,
-                    cache_last_channel=cache_last_channel,
-                    cache_last_time=cache_last_time,
-                    cache_last_channel_len=cache_last_channel_len,
-                    keep_all_outputs=True,
-                    drop_extra_pre_encoded=drop_extra_pre_encoded,
-                )
-
-                # Apply modality adapter
-                modality_adapter = perception.modality_adapter
-                encoded_adapted, _ = modality_adapter(audio_signal=encoded, length=encoded_len)
-                
-                # Apply projection: encoded_adapted is [B, C, T], proj expects [B, T, C]
-                encoded_chunk = perception.proj(encoded_adapted.transpose(1, 2))  # [B, T, D]
-            
-            torch.cuda.synchronize()
-            logging.info(f"  Sub-step {sub_step}/{num_sub_steps} (sub_frame_idx={sub_frame_idx}, first={is_first_sub_step}): {time.time() - sub_step_start_time:.4f}s")
-            encoded_chunks.append(encoded_chunk)
-        
-        # Concatenate all encoded chunks along the time dimension
-        if len(encoded_chunks) > 1:
-            encoded_chunk = torch.cat(encoded_chunks, dim=1)  # [B, num_sub_steps * T_per_step, D]
-        else:
-            encoded_chunk = encoded_chunks[0]
-        
-        torch.cuda.synchronize()
-        logging.info(f"Time taken for encoder ({num_sub_steps} sub-steps): {time.time() - start_time}")
-
-        # Update cache state (no mel_buffer needed - we recompute each time)
-        new_perception_cache = PerceptionCacheState(
-            cache_last_channel=cache_last_channel,
-            cache_last_time=cache_last_time,
-            cache_last_channel_len=cache_last_channel_len,
-        )
-
-        return encoded_chunk, new_perception_cache
 
     def _clone_cache(self, cache):
         """Deep clone cache structures to ensure complete isolation between streams."""
@@ -1204,7 +649,7 @@ class NemotronVoicechatInferenceWrapper:
         if not hasattr(self.model, 'tts_model'):
             return
 
-        logging.info("\n🎯 Preparing TTS warmup state...")
+        logging.info("Preparing TTS warmup state...")
 
         with fp32_precision():
             speaker_audio, speaker_sr = torchaudio.load(self.speaker_reference)
@@ -1248,7 +693,7 @@ class NemotronVoicechatInferenceWrapper:
         self.first_tts_past_key_values_input = self._clone_cache(outputs.past_key_values)
 
 
-        logging.info("✅ TTS warmup state prepared")
+        logging.info("TTS warmup state prepared")
 
     def _update_audio_buffer(self, audio_buffer, buffer_fill_level, new_audio, buffer_size_samples):
         """
@@ -1310,7 +755,6 @@ class NemotronVoicechatInferenceWrapper:
                        gen_asr_text=None,
                        request_id: Optional[str] = None,
                        perception_cache: Optional[PerceptionCacheState] = None,
-                       source_encoded_dict: Optional[dict] = None,
                        has_prompt: bool = False,
                        codec_cache=None):
 
@@ -1329,7 +773,7 @@ class NemotronVoicechatInferenceWrapper:
 
         if self.use_perception_cache and perception_cache is not None and perception_cache.is_initialized():
             # Cache-aware perception
-            source_encoded, perception_cache = self._cache_aware_perception_step(
+            source_encoded, perception_cache = self.perception_cache_mgr.step(
                 audio_input=audio_input,
                 frame_idx=frame_idx,
                 num_frames_per_chunk=num_frames_per_chunk,
@@ -1349,12 +793,6 @@ class NemotronVoicechatInferenceWrapper:
         logging.info(f"Time taken for perception: {time_perception:.3f}s")
         source_encoded = source_encoded.to(self.dtype)
         total_encoded_frames = source_encoded.shape[1]
-
-        # Save source_encoded if dict is provided
-        if source_encoded_dict is not None:
-            end_frame_idx = frame_idx + num_frames_per_chunk - 1
-            key = f"{frame_idx}_{end_frame_idx}"
-            source_encoded_dict[key] = source_encoded.detach().cpu().clone()
 
         # Determine embedding position based on whether we're using cache
         if self.use_perception_cache and perception_cache is not None and perception_cache.is_initialized():
@@ -1510,7 +948,7 @@ class NemotronVoicechatInferenceWrapper:
         # exit for-loop & do audio decoding non-autoregressively (if decode_audio is True)
         if self.decode_audio:
             samples_per_audio_output_frame = self._samples_per_audio_output_frame()
-            logging.debug(f"\n🔊 Decoding audio for {frame_idx}-th frame  ({num_frames_per_chunk=})")
+            logging.debug(f"\nDecoding audio for {frame_idx}-th frame  ({num_frames_per_chunk=})")
 
             start_time_decode = time.time()
             with fp32_precision(), torch.no_grad():
@@ -1575,13 +1013,8 @@ class NemotronVoicechatInferenceWrapper:
         for asr_predicted_tok_ids_b in asr_predicted_tokens:
             asr_predicted_tok_ids_b = asr_predicted_tok_ids_b.tolist()
             asr_predicted_toks_b = self.tokenizer.ids_to_tokens(asr_predicted_tok_ids_b)
-
-            # TODO: make more robust to tokenizer changes
-            # replace "Ġ" with " " to restore proper word boundaries
-            # replace '<SPECIAL_12>' with ""
-            asr_predicted_toks_b = [tok.replace('<SPECIAL_12>', "").replace('Ġ', ' ') for tok in asr_predicted_toks_b]
-
-            asr_predicted_text_strs.append("".join(asr_predicted_toks_b))
+            asr_predicted_toks_b = [tok for tok in asr_predicted_toks_b if tok != '<SPECIAL_12>']
+            asr_predicted_text_strs.append(self.tokenizer.tokens_to_text(asr_predicted_toks_b))
 
         logging.info(f'frame {frame_idx}: USER\'s asr_predicted_text_strs: {asr_predicted_text_strs}')
         logging.info(f'frame {frame_idx}: --------------------------------AGENT\'s predicted_text_strs: {predicted_text_strs}')
@@ -1603,7 +1036,6 @@ class NemotronVoicechatInferenceWrapper:
             'past_key_values': past_key_values,
             'code': code,
             'perception_cache': perception_cache,
-            'source_encoded_dict': source_encoded_dict,
             'codec_cache': codec_cache,
         }
 
@@ -1676,16 +1108,16 @@ class NemotronVoicechatInferenceWrapper:
             if has_pad_window:
                 if not (agent_text_window == self.model.stt_model.text_bos_id).any():
                     gen_text[batch_idx, t] = self.model.stt_model.text_bos_id
-                    logging.info(f"🎤→🤖 Forced turn-taking at frame {t}: inserted agent BOS (reason: pad window)")
+                    logging.info(f"Forced turn-taking at frame {t}: inserted agent BOS (reason: pad window)")
 
             # ASR BOS → insert agent EOS if not present in window
             elif current_asr_token == self.model.stt_model.user_bos_id:
                 if not (agent_text_window == self.model.stt_model.text_eos_id).any():
                     gen_text[batch_idx, t] = self.model.stt_model.text_eos_id
-                    logging.info(f"🤖→🎤 Forced turn-taking at frame {t}: inserted agent EOS (reason: user started speaking)")
+                    logging.info(f"Forced turn-taking at frame {t}: inserted agent EOS (reason: user started speaking)")
 
     @torch.no_grad()
-    def inference_realtime_streaming(self, audio_path: str, num_frames_per_chunk: int = None, request_id: Optional[str] = None, pad_audio_to_sec: Optional[float] = None, audio_id: Optional[str] = None, system_prompt: Optional[str] = None):
+    def inference_realtime_streaming(self, audio_path: str, num_frames_per_chunk: int = None, request_id: Optional[str] = None, pad_audio_to_sec: Optional[float] = None, system_prompt: Optional[str] = None):
         """
         Perform realtime streaming inference simulating microphone capture.
 
@@ -1694,7 +1126,6 @@ class NemotronVoicechatInferenceWrapper:
             num_frames_per_chunk: Number of frames to process per inference step (default: 1)
             request_id: Optional request ID for vLLM streaming
             pad_audio_to_sec: Optional duration to pad audio to (in seconds)
-            audio_id: Optional audio ID for saving source_encoded tensors
             system_prompt: Optional system prompt to provide context to the model
 
         Returns:
@@ -1752,7 +1183,7 @@ class NemotronVoicechatInferenceWrapper:
         logging.info(f"Frames per inference step: {num_frames_per_chunk}")
 
         # Load audio file (simulating microphone stream)
-        logging.info(f"\n📁 Loading audio file: {audio_path}")
+        logging.info(f"Loading audio file: {audio_path}")
         audio_signal, sr = librosa.load(audio_path, sr=SAMPLE_RATE)
         total_samples = len(audio_signal)
         total_duration = total_samples / SAMPLE_RATE
@@ -1786,7 +1217,7 @@ class NemotronVoicechatInferenceWrapper:
 
         # Check if Nemotron (no cache support)
         use_cache = 'Nemotron' not in self.model.stt_model.cfg.pretrained_llm
-        logging.info(f"\n⚙️  Model: {self.model.stt_model.cfg.pretrained_llm}")
+        logging.info(f"Model: {self.model.stt_model.cfg.pretrained_llm}")
         logging.info(f"   Use cache: {use_cache}")
 
         # Initialize buffer and state
@@ -1842,7 +1273,7 @@ class NemotronVoicechatInferenceWrapper:
                 with torch.no_grad():
                     ans = self.model.stt_model(prompt_embedded, cache=llm_cache)
                     llm_cache = ans.get("cache", llm_cache)
-                logging.info(f"   ✅ System prompt processed, cache updated")
+                logging.info(f"   System prompt processed, cache updated")
 
         # Initialize TTS
         code = None
@@ -1877,26 +1308,25 @@ class NemotronVoicechatInferenceWrapper:
                     request_id=stream_request_id,
                     prompt_token_ids=self.tts_prompt_token_ids
                 )
-                #code, past_key_values = tts_result['codes'], tts_result['past_key_values']
                 code = self.first_tts_code_input.detach().clone()
                 past_key_values = None
                 logging.info(f"Time taken to batch prefill tts model: {time.time() - start_batch_prefill:.3f}s")
                 # Initialize subword_mask for vLLM path as well
             subword_mask = torch.ones(1, total_frames, device=self.device, dtype=torch.bool)
-            logging.info(f"✅ TTS initialized")
+            logging.info(f"TTS initialized")
 
         # Initialize perception cache if enabled
         perception_cache = None
         if self.use_perception_cache:
-            perception_cache = self._get_initial_perception_cache_state(batch_size=1)
-            logging.info(f"✅ Perception cache initialized")
+            perception_cache = self.perception_cache_mgr.get_initial_state(batch_size=1)
+            logging.info(f"Perception cache initialized")
 
         # Initialize codec streaming cache to remove clicking sounds and wasted inference computation
         codec_cache = None
         if self.decode_audio and self.use_codec_cache:
             from nemo.collections.speechlm2.modules.ear_tts_vae_codec import CausalConv1dCache
             codec_cache = CausalConv1dCache()
-            logging.info(f"✅ Codec streaming cache initialized")
+            logging.info(f"Codec streaming cache initialized")
 
         gen_text = torch.full((1, total_frames), self.model.stt_model.text_pad_id, device=self.device, dtype=torch.long)
         gen_asr_text = torch.full((1, total_frames), self.model.stt_model.text_pad_id, device=self.device, dtype=torch.long)
@@ -1904,17 +1334,8 @@ class NemotronVoicechatInferenceWrapper:
         # initialize list to which we will append generated audio segments
         audio_segments = []
 
-        # Initialize dict to store source_encoded tensors if directory is specified
-        # path_to_enc_save is a directory; each audio's encodings are saved as {audio_id}_source_encoded.pt
-        path_to_enc_save = self.model_cfg.get("path_to_enc_save", None)
-        source_encoded_dict = {} if path_to_enc_save else None
-
-        # Derive audio_id from audio_path if not provided
-        if audio_id is None:
-            audio_id = os.path.splitext(os.path.basename(audio_path))[0]
-
         logging.info("\n" + "=" * 70)
-        logging.info("🎤 STARTING FRAME-BY-FRAME PROCESSING")
+        logging.info("STARTING FRAME-BY-FRAME PROCESSING")
         logging.info("=" * 70)
 
         # frame_idx corresponds to index of the first frame passed to infer_one_step
@@ -1944,7 +1365,6 @@ class NemotronVoicechatInferenceWrapper:
                 gen_asr_text=gen_asr_text,
                 request_id=stream_request_id,
                 perception_cache=perception_cache,
-                source_encoded_dict=source_encoded_dict,
                 has_prompt=(prompt_len > 0),
                 codec_cache=codec_cache,
             )
@@ -1954,8 +1374,6 @@ class NemotronVoicechatInferenceWrapper:
             llm_cache = result['dynamic_cache']
             if self.use_perception_cache:
                 perception_cache = result.get('perception_cache', perception_cache)
-            if source_encoded_dict is not None:
-                source_encoded_dict = result.get('source_encoded_dict', source_encoded_dict)
             if self.decode_audio:
                 audio_toks_buffer = result['audio_toks_buffer']
                 decoded_audio_new = result['decoded_audio_new']
@@ -1980,17 +1398,12 @@ class NemotronVoicechatInferenceWrapper:
                     special_label = " [PAD]"
                 logging.info(f"Frame {frame_idx:3d}/{total_frames} | Buffer: {buffer_status:20s} | Token: {gen_text[0, frame_idx].item():5d}{special_label} | '{token_str}'")
 
-            # if gen_text[:, frame_idx].item() == self.model.stt_model.text_eos_id:
-                # gen_text[:, frame_idx+1:] = self.model.stt_model.text_pad_id
-                # total_frames = frame_idx + 1
-                # break
-
             frame_idx += num_frames_per_chunk
 
         # Prepare results
         elapsed_time = time.time() - start_time
         logging.info("\n" + "=" * 70)
-        logging.info("✅ STREAMING INFERENCE COMPLETED")
+        logging.info("STREAMING INFERENCE COMPLETED")
         logging.info("=" * 70)
         logging.info(f"Total time: {elapsed_time:.2f}s")
         logging.info(f"Audio duration: {total_duration:.2f}s")
@@ -2013,16 +1426,8 @@ class NemotronVoicechatInferenceWrapper:
         text_output_raw = tokens_to_str_raw(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.model.stt_model.text_pad_id)
         asr_text_output_raw = tokens_to_str_raw(gen_asr_text, lengths, tokenizer=self.tokenizer, pad_id=self.model.stt_model.text_pad_id)
 
-        logging.info(f"\n📝 Generated text: {text_output[0]}")
-        logging.info(f"\n🎤 Generated ASR text: {asr_text_output[0]}")
-
-        # Save source_encoded tensors if directory is specified
-        # Saves to {path_to_enc_save}/{audio_id}_source_encoded.pt
-        if path_to_enc_save and source_encoded_dict:
-            os.makedirs(path_to_enc_save, exist_ok=True)
-            enc_save_path = os.path.join(path_to_enc_save, f"{audio_id}_source_encoded.pt")
-            torch.save(source_encoded_dict, enc_save_path)
-            logging.info(f"✅ Saved source_encoded tensors ({len(source_encoded_dict)} entries) to: {enc_save_path}")
+        logging.info(f"Generated text: {text_output[0]}")
+        logging.info(f"Generated ASR text: {asr_text_output[0]}")
 
         ans = {
             "text": text_output,
@@ -2053,9 +1458,9 @@ def main():
     parser.add_argument("--input_json", type=str, default=None,
                        help="Path to input JSON file containing list of records with audio_filepath and text fields (for batch mode)")
     parser.add_argument("--output_json", type=str, default=None,
-                       help="Path to output JSON file with predictions (for batch mode)")
+                       help="Path to output JSON file with predictions")
     parser.add_argument("--output_dir", type=str, default="output_streaming",
-                       help="Output directory for audio files (for batch mode)")
+                       help="Output directory for audio files and JSON results")
     parser.add_argument("--pad_audio_to_sec", type=float, default=None,
                        help="Pad audio to this duration in seconds (useful for consistent buffer behavior)")
     parser.add_argument("--speaker_reference", type=str, required=True,
@@ -2064,16 +1469,10 @@ def main():
                        help=f"Size of audio buffer in frames (each frame = 80ms, default: {DEFAULT_BUFFER_SIZE_FRAMES})")
     parser.add_argument("--num_frames_per_chunk", type=int, default=DEFAULT_NUM_FRAMES_PER_CHUNK,
                        help="Number of frames per inference step (default: 1)")
-    parser.add_argument("--output_text", type=str, default="output_text_streaming.txt",
-                       help="Output text file path")
-    parser.add_argument("--output_asr_text", type=str, default="output_asr_text_streaming.txt",
-                       help="Output ASR text file path")
-    parser.add_argument("--output_audio", type=str, default="generated_audio_streaming.wav",
-                       help="Output audio file path")
     parser.add_argument("--decode_audio", action="store_true",
                        help="Whether to decode audio")
     parser.add_argument("--combine_inp_out_audio", action="store_true",
-                    help="Whether to decode audio")
+                       help="Whether to combine input and output audio into a stereo file")
 
     # Perception cache argument
     parser.add_argument("--use_perception_cache", action="store_true",
@@ -2083,9 +1482,6 @@ def main():
     # Codec streaming cache argument
     parser.add_argument("--use_codec_cache", action="store_true",
                        help="Enable incremental codec decode to remove clicking sounds and wasted inference computation (recommended)")
-    parser.add_argument("--path_to_enc_save", type=str, default=None,
-                       help="Directory to save source_encoded tensors. Each audio file's encodings "
-                            "are saved as {audio_id}_source_encoded.pt (dict with frame idx keys)")
 
     # vLLM arguments
     parser.add_argument("--engine_type", type=str, default="native", choices=["native", "vllm_llm", "vllm_eartts", "vllm_llm_vllm_eartts"],
@@ -2138,7 +1534,6 @@ def main():
             "use_perception_cache": bool(args.use_perception_cache),
             "use_perception_cudagraph": bool(args.use_perception_cudagraph),
             "use_codec_cache": bool(args.use_codec_cache),
-            "path_to_enc_save": args.path_to_enc_save,
             "top_p": args.top_p,
             "repetition_penalty": args.repetition_penalty,
             "tts_system_prompt": args.tts_system_prompt,
@@ -2176,269 +1571,177 @@ def main():
         model = NemotronVoicechatInferenceWrapper(model_cfg=model_cfg)
 
         # =========================================
-        # BATCH MODE: Process JSON input
+        # Load input records (from JSON manifest or single audio file)
         # =========================================
         if args.input_json is not None:
-            logging.info(f"📖 Loading input JSON: {args.input_json}")
+            logging.info(f"Loading input JSON: {args.input_json}")
             with open(args.input_json, 'r') as f:
                 input_records = [json.loads(line) for line in f]
-
-            logging.info(f"Found {len(input_records)} records to process")
-
-            # Create output directory if it doesn't exist
-            os.makedirs(args.output_dir, exist_ok=True)
-
-            # Set default output_json paths - create both processed and raw versions
-            if args.output_json:
-                base_path = args.output_json.rsplit('.', 1)[0] if '.' in args.output_json else args.output_json
-                output_json_processed = f"{base_path}_processed.json"
-                output_json_raw = f"{base_path}_raw.json"
-            else:
-                output_json_processed = os.path.join(args.output_dir, "output_results_processed.json")
-                output_json_raw = os.path.join(args.output_dir, "output_results_raw.json")
-
-            # Open both output files for incremental writing
-            logging.info(f"📝 Output will be saved incrementally to:")
-            logging.info(f"   Processed: {output_json_processed}")
-            logging.info(f"   Raw: {output_json_raw}")
-            output_file_processed = open(output_json_processed, 'w', encoding='utf-8')
-            output_file_raw = open(output_json_raw, 'w', encoding='utf-8')
-
-            # Process each record
-            output_records = []
-            wer_scores = []  # Store WER for each utterance
-
-            try:
-                for idx, record in enumerate(input_records):
-                    logging.info("\n" + "=" * 70)
-                    logging.info(f"📝 Processing record {idx + 1}/{len(input_records)}")
-                    logging.info("=" * 70)
-
-                    audio_path = record.get('audio_filepath')
-                    ground_truth_text = record.get('text', '')
-                    # Get system_prompt from record, fallback to command line arg
-                    record_system_prompt = record.get('system_prompt', args.system_prompt)
-
-                    if not audio_path:
-                        logging.warning(f"⚠️  Record {idx} missing audio_filepath, skipping...")
-                        continue
-
-                    if not os.path.exists(audio_path):
-                        logging.warning(f"⚠️  Audio file not found: {audio_path}, skipping...")
-                        continue
-
-                    logging.info(f"   Audio: {audio_path}")
-                    logging.info(f"   Ground truth: {ground_truth_text}")
-
-                    # Extract ID from audio filename (without extension)
-                    audio_id = os.path.splitext(os.path.basename(audio_path))[0]
-
-                    # Run inference with unique request_id per record to avoid vLLM race conditions
-                    results = model.inference_realtime_streaming(
-                        audio_path,
-                        num_frames_per_chunk=args.num_frames_per_chunk,
-                        pad_audio_to_sec=args.pad_audio_to_sec,
-                        request_id=f"streaming_request_{idx}",
-                        audio_id=audio_id,
-                        system_prompt=record_system_prompt,
-                    )
-
-                    # Extract predictions
-                    pred_asr_text = results['asr_text'][0] if 'asr_text' in results else ''
-                    pred_asr_text_raw = results['asr_text_raw'][0] if 'asr_text_raw' in results else ''
-                    pred_text = results['text'][0] if 'text' in results else ''
-                    pred_text_raw = results['text_raw'][0] if 'text_raw' in results else ''
-
-                    # Calculate WER between predicted ASR and ground truth
-                    try:
-                        cleaned_pred = clean_pred_text(pred_asr_text)
-                        cleaned_gt = clean_pred_text(ground_truth_text)
-                        if cleaned_gt.strip() and cleaned_pred.strip():
-                            utterance_wer = wer(cleaned_gt, cleaned_pred)
-                            wer_scores.append(utterance_wer)
-                        else:
-                            utterance_wer = None
-                            logging.warning(f"⚠️  Empty text for WER calculation (ground truth or prediction)")
-                    except Exception as e:
-                        utterance_wer = None
-                        logging.warning(f"⚠️  Error calculating WER: {e}")
-
-                    # Log WER for this utterance
-                    if utterance_wer is not None:
-                        # Print WER in green color in the terminal
-                        print(f"\033[92m📊 WER for utterance {idx + 1}: {utterance_wer:.4f} ({utterance_wer * 100:.2f}%)\033[0m")
-
-                    # Save audio if available and get pred_audio path
-                    pred_audio_path = None
-                    if args.decode_audio and 'audio' in results and results['audio'] is not None:
-                        # Derive output filename from input audio filepath
-                        input_basename = os.path.splitext(os.path.basename(audio_path))[0]
-                        audio_filename = f"{idx:04d}_{input_basename}_output.wav"
-                        pred_audio_path = os.path.join(args.output_dir, audio_filename)
-
-                        audio_np = results['audio'].float().cpu().numpy().flatten()
-
-                        sf.write(pred_audio_path, audio_np, model.target_sample_rate)
-                        logging.info(f"✅ Audio saved: {pred_audio_path}")
-
-                        # Save stereo audio (input + output) if requested
-                        if args.combine_inp_out_audio:
-                            stereo_filename = f"{idx:04d}_{input_basename}_combined.wav"
-                            stereo_path_out = os.path.join(args.output_dir, stereo_filename)
-
-                            inp_audio, sr = librosa.load(audio_path, sr=model.target_sample_rate)
-
-                            # Prepend silence to output channel to account for
-                            # the one-chunk processing delay: the server can't
-                            # produce output until it has received a full input chunk.
-                            delay_samples = int(args.num_frames_per_chunk * FRAME_SIZE_SEC * model.target_sample_rate)
-                            out_audio_delayed = np.concatenate([np.zeros(delay_samples, dtype=audio_np.dtype), audio_np])
-
-                            max_len = max(len(inp_audio), len(out_audio_delayed))
-                            inp_audio_padded = np.pad(inp_audio, (0, max_len - len(inp_audio)))
-                            out_audio_padded = np.pad(out_audio_delayed, (0, max_len - len(out_audio_delayed)))
-
-                            # Stereo: channel 0 = input, channel 1 = output
-                            stereo_audio = np.stack([inp_audio_padded, out_audio_padded], axis=1)
-                            sf.write(stereo_path_out, stereo_audio, model.target_sample_rate)
-                            logging.info(f"✅ Stereo audio saved: {stereo_path_out}")
-
-                    # Prepare output records with specific key order for easy diff comparison
-                    # Keys: id, target_text, pred_text, pred_audio, src_text, pred_src_text, system_prompt
-
-                    # Get system_prompt from results
-                    result_system_prompt = results.get('system_prompt', '')
-
-                    # Processed version (SPECIAL_12 removed)
-                    output_record_processed = {
-                        'id': audio_id,
-                        'target_text': '',
-                        'pred_audio': pred_audio_path,
-                        'src_text': ground_truth_text,
-                        'pred_src_text': pred_asr_text,
-                        'pred_text': pred_text,
-                        'system_prompt': result_system_prompt,
-                    }
-
-                    # Raw version (SPECIAL_12 kept)
-                    output_record_raw = {
-                        'id': audio_id,
-                        'target_text': '',
-                        'pred_audio': pred_audio_path,
-                        'src_text': ground_truth_text,
-                        'pred_src_text': pred_asr_text_raw,
-                        'pred_text': pred_text_raw,
-                        'system_prompt': result_system_prompt,
-                    }
-
-                    output_records.append(output_record_processed)
-
-                    # Write records immediately to both files
-                    json.dump(output_record_processed, output_file_processed, ensure_ascii=False)
-                    output_file_processed.write('\n')
-                    output_file_processed.flush()
-
-                    json.dump(output_record_raw, output_file_raw, ensure_ascii=False)
-                    output_file_raw.write('\n')
-                    output_file_raw.flush()
-
-                    logging.info(f"✅ Record {idx + 1} completed and saved")
-
-            finally:
-                # Always close output files, even if there's an error
-                output_file_processed.close()
-                output_file_raw.close()
-
-            # Summary
-            logging.info("\n" + "=" * 70)
-            logging.info("💾 ALL RESULTS SAVED")
-            logging.info("=" * 70)
-            logging.info(f"✅ Results saved to:")
-            logging.info(f"   Processed: {output_json_processed}")
-            logging.info(f"   Raw: {output_json_raw}")
-            logging.info(f"   Processed {len(output_records)}/{len(input_records)} records successfully")
-
-            # Calculate and display average WER
-            if wer_scores:
-                avg_wer = np.mean(wer_scores)
-                logging.info("\n" + "=" * 70)
-                logging.info("📊 WER STATISTICS")
-                logging.info("=" * 70)
-                logging.info(f"   Total utterances with WER: {len(wer_scores)}")
-                logging.info(f"   Average WER: {avg_wer:.4f} ({avg_wer * 100:.2f}%)")
-                logging.info(f"   Min WER: {np.min(wer_scores):.4f} ({np.min(wer_scores) * 100:.2f}%)")
-                logging.info(f"   Max WER: {np.max(wer_scores):.4f} ({np.max(wer_scores) * 100:.2f}%)")
-            else:
-                logging.warning("⚠️  No WER scores calculated")
-
-            logging.info("=" * 70)
-            logging.info("✅ ALL DONE!")
-            logging.info("=" * 70)
-
-        # =========================================
-        # SINGLE-FILE MODE: Process single audio file
-        # =========================================
         else:
-            # Run inference
-            results = model.inference_realtime_streaming(
-                args.audio_path,
-                num_frames_per_chunk=args.num_frames_per_chunk,
-                pad_audio_to_sec=args.pad_audio_to_sec,
-                system_prompt=args.system_prompt,
-            )
+            input_records = [{"audio_filepath": args.audio_path, "text": ""}]
 
-            # Save outputs
+        logging.info(f"Found {len(input_records)} records to process")
+
+        os.makedirs(args.output_dir, exist_ok=True)
+
+        if args.output_json:
+            base_path = args.output_json.rsplit('.', 1)[0] if '.' in args.output_json else args.output_json
+            output_json_processed = f"{base_path}_processed.json"
+            output_json_raw = f"{base_path}_raw.json"
+        else:
+            output_json_processed = os.path.join(args.output_dir, "output_results_processed.json")
+            output_json_raw = os.path.join(args.output_dir, "output_results_raw.json")
+
+        logging.info(f"Output will be saved incrementally to:")
+        logging.info(f"   Processed: {output_json_processed}")
+        logging.info(f"   Raw: {output_json_raw}")
+        output_file_processed = open(output_json_processed, 'w', encoding='utf-8')
+        output_file_raw = open(output_json_raw, 'w', encoding='utf-8')
+
+        output_records = []
+        wer_scores = []
+
+        try:
+            for idx, record in enumerate(input_records):
+                logging.info("\n" + "=" * 70)
+                logging.info(f"Processing record {idx + 1}/{len(input_records)}")
+                logging.info("=" * 70)
+
+                audio_path = record.get('audio_filepath')
+                ground_truth_text = record.get('text', '')
+                record_system_prompt = record.get('system_prompt', args.system_prompt)
+
+                if not audio_path:
+                    logging.warning(f"Record {idx} missing audio_filepath, skipping...")
+                    continue
+
+                if not os.path.exists(audio_path):
+                    logging.warning(f"Audio file not found: {audio_path}, skipping...")
+                    continue
+
+                logging.info(f"   Audio: {audio_path}")
+                logging.info(f"   Ground truth: {ground_truth_text}")
+
+                audio_id = os.path.splitext(os.path.basename(audio_path))[0]
+
+                results = model.inference_realtime_streaming(
+                    audio_path,
+                    num_frames_per_chunk=args.num_frames_per_chunk,
+                    pad_audio_to_sec=args.pad_audio_to_sec,
+                    request_id=f"streaming_request_{idx}",
+                    system_prompt=record_system_prompt,
+                )
+
+                pred_asr_text = results['asr_text'][0] if 'asr_text' in results else ''
+                pred_asr_text_raw = results['asr_text_raw'][0] if 'asr_text_raw' in results else ''
+                pred_text = results['text'][0] if 'text' in results else ''
+                pred_text_raw = results['text_raw'][0] if 'text_raw' in results else ''
+
+                try:
+                    cleaned_pred = clean_pred_text(pred_asr_text)
+                    cleaned_gt = clean_pred_text(ground_truth_text)
+                    if cleaned_gt.strip() and cleaned_pred.strip():
+                        utterance_wer = wer(cleaned_gt, cleaned_pred)
+                        wer_scores.append(utterance_wer)
+                    else:
+                        utterance_wer = None
+                except Exception as e:
+                    utterance_wer = None
+                    logging.warning(f"Error calculating WER: {e}")
+
+                if utterance_wer is not None:
+                    logging.info(f"WER for utterance {idx + 1}: {utterance_wer:.4f} ({utterance_wer * 100:.2f}%)")
+
+                pred_audio_path = None
+                if args.decode_audio and 'audio' in results and results['audio'] is not None:
+                    input_basename = os.path.splitext(os.path.basename(audio_path))[0]
+                    audio_filename = f"{idx:04d}_{input_basename}_output.wav"
+                    pred_audio_path = os.path.join(args.output_dir, audio_filename)
+
+                    audio_np = results['audio'].float().cpu().numpy().flatten()
+
+                    sf.write(pred_audio_path, audio_np, model.target_sample_rate)
+                    logging.info(f"Audio saved: {pred_audio_path}")
+
+                    if args.combine_inp_out_audio:
+                        stereo_filename = f"{idx:04d}_{input_basename}_combined.wav"
+                        stereo_path_out = os.path.join(args.output_dir, stereo_filename)
+
+                        inp_audio, sr = librosa.load(audio_path, sr=model.target_sample_rate)
+
+                        delay_samples = int(args.num_frames_per_chunk * FRAME_SIZE_SEC * model.target_sample_rate)
+                        out_audio_delayed = np.concatenate([np.zeros(delay_samples, dtype=audio_np.dtype), audio_np])
+
+                        max_len = max(len(inp_audio), len(out_audio_delayed))
+                        inp_audio_padded = np.pad(inp_audio, (0, max_len - len(inp_audio)))
+                        out_audio_padded = np.pad(out_audio_delayed, (0, max_len - len(out_audio_delayed)))
+
+                        stereo_audio = np.stack([inp_audio_padded, out_audio_padded], axis=1)
+                        sf.write(stereo_path_out, stereo_audio, model.target_sample_rate)
+                        logging.info(f"Stereo audio saved: {stereo_path_out}")
+
+                result_system_prompt = results.get('system_prompt', '')
+
+                output_record_processed = {
+                    'id': audio_id,
+                    'target_text': '',
+                    'pred_audio': pred_audio_path,
+                    'src_text': ground_truth_text,
+                    'pred_src_text': pred_asr_text,
+                    'pred_text': pred_text,
+                    'system_prompt': result_system_prompt,
+                }
+
+                output_record_raw = {
+                    'id': audio_id,
+                    'target_text': '',
+                    'pred_audio': pred_audio_path,
+                    'src_text': ground_truth_text,
+                    'pred_src_text': pred_asr_text_raw,
+                    'pred_text': pred_text_raw,
+                    'system_prompt': result_system_prompt,
+                }
+
+                output_records.append(output_record_processed)
+
+                json.dump(output_record_processed, output_file_processed, ensure_ascii=False)
+                output_file_processed.write('\n')
+                output_file_processed.flush()
+
+                json.dump(output_record_raw, output_file_raw, ensure_ascii=False)
+                output_file_raw.write('\n')
+                output_file_raw.flush()
+
+                logging.info(f"Record {idx + 1} completed and saved")
+
+        finally:
+            output_file_processed.close()
+            output_file_raw.close()
+
+        logging.info("\n" + "=" * 70)
+        logging.info("ALL RESULTS SAVED")
+        logging.info("=" * 70)
+        logging.info(f"Results saved to:")
+        logging.info(f"   Processed: {output_json_processed}")
+        logging.info(f"   Raw: {output_json_raw}")
+        logging.info(f"   Processed {len(output_records)}/{len(input_records)} records successfully")
+
+        if wer_scores:
+            avg_wer = np.mean(wer_scores)
             logging.info("\n" + "=" * 70)
-            logging.info("💾 SAVING OUTPUTS")
+            logging.info("WER STATISTICS")
             logging.info("=" * 70)
+            logging.info(f"   Total utterances with WER: {len(wer_scores)}")
+            logging.info(f"   Average WER: {avg_wer:.4f} ({avg_wer * 100:.2f}%)")
+            logging.info(f"   Min WER: {np.min(wer_scores):.4f} ({np.min(wer_scores) * 100:.2f}%)")
+            logging.info(f"   Max WER: {np.max(wer_scores):.4f} ({np.max(wer_scores) * 100:.2f}%)")
 
-            # Save text
-            with open(args.output_text, 'w') as f:
-                f.write(results['text'][0].replace("<|", "\n<|"))
-            logging.info(f"✅ Text output saved: {args.output_text}")
-
-            # Save ASR text
-            if 'asr_text' in results:
-                with open(args.output_asr_text, 'w') as f:
-                    f.write(results['asr_text'][0])
-                logging.info(f"✅ ASR text output saved: {args.output_asr_text}")
-
-            # Save audio if available
-            if args.decode_audio and 'audio' in results:
-                audio_np = results['audio'].float().cpu().numpy().flatten()
-
-                if args.combine_inp_out_audio:
-                    # Load input audio and resample to match the model's target sample rate
-                    inp_audio, sr = librosa.load(args.audio_path, sr=model.target_sample_rate)
-
-                    # Prepend silence to output channel to account for
-                    # the one-chunk processing delay: the server can't
-                    # produce output until it has received a full input chunk.
-                    delay_samples = int(args.num_frames_per_chunk * FRAME_SIZE_SEC * model.target_sample_rate)
-                    out_audio_delayed = np.concatenate([np.zeros(delay_samples, dtype=audio_np.dtype), audio_np])
-
-                    max_len = max(len(inp_audio), len(out_audio_delayed))
-                    inp_audio_padded = np.pad(inp_audio, (0, max_len - len(inp_audio)))
-                    out_audio_padded = np.pad(out_audio_delayed, (0, max_len - len(out_audio_delayed)))
-
-                    # Stereo: channel 0 = input, channel 1 = output
-                    audio_np = np.stack([inp_audio_padded, out_audio_padded], axis=1)
-
-                import soundfile as sf
-                sf.write(args.output_audio, audio_np, model.target_sample_rate)
-                logging.info(f"✅ Audio output saved: {args.output_audio}")
-
-                # Verify
-                import subprocess
-                size_output = subprocess.check_output(['du', '-h', args.output_audio]).decode().split()[0]
-                logging.info(f"   File size: {size_output}")
-
-            logging.info("=" * 70)
-            logging.info("✅ ALL DONE!")
+        logging.info("=" * 70)
+        logging.info("ALL DONE!")
         logging.info("=" * 70)
 
     except Exception as e:
-        logging.error(f"❌ ERROR during inference: {e}")
+        logging.error(f"ERROR during inference: {e}")
         import traceback
         traceback.print_exc()
         return 1

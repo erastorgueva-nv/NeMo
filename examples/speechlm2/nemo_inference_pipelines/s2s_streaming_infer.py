@@ -37,7 +37,7 @@ from jiwer import wer as compute_wer
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.collections.speechlm2.inference.factory.s2s_pipeline_builder import S2SPipelineBuilder
 from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
-from nemo.collections.speechlm2.inference.utils.pipeline_utils import PipelineOutput
+from nemo.collections.speechlm2.inference.utils.pipeline_utils import PipelineOutput, clean_pred_text
 from nemo.utils import logging
 from omegaconf import DictConfig
 import torch
@@ -127,25 +127,6 @@ def calculate_padded_duration(
         else:
             total += orig
     return total
-
-
-def clean_pred_text(text: str) -> str:
-    """Clean prediction text by removing special markers, timestamps, punctuation, and lowercasing.
-
-    Mirrors the normalization in nemotron_voicechat_inference_wrapper.py for
-    fair WER comparison.
-    """
-    if not text:
-        return ""
-    text = text.lstrip('^')
-    text = re.sub(r'</?s>', '', text)
-    text = re.sub(r'<\$[\d.]+\$>', '', text)
-    text = re.sub(r'<\|[\d.]+\|>', '', text)
-    text = re.sub(r'<SPECIAL_12>', '', text)
-    text = text.replace('\u0120', ' ')
-    text = text.lower()
-    text = re.sub(r'[^\w\s]', '', text)
-    return ' '.join(text.split())
 
 
 def dump_output(
@@ -255,8 +236,9 @@ def main(cfg: DictConfig):
     rtfx = data_dur / exec_dur if exec_dur > 0 else float('inf')
     logging.info(f"RTFX: {rtfx:.2f} ({data_dur:.2f}s / {exec_dur:.2f}s)")
 
-    # Compute WER when ground-truth texts are available
-    asr_texts = output.asr_texts or [None] * len(audio_filepaths)
+    # Compute WER when ground-truth texts are available.
+    # Use asr_texts_with_timestamps (from tokens_to_str with full post-processing)
+    asr_texts = output.asr_texts_with_timestamps or [None] * len(audio_filepaths)
     wer_scores = []
     for gt, asr_text in zip(ground_truths, asr_texts):
         if gt and asr_text:

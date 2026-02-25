@@ -20,9 +20,10 @@ import torch
 from transformers import DynamicCache
 
 from nemo.collections.speechlm2.modules.ear_tts_vae_codec import CausalConv1dCache
+from nemo.utils import logging
 
 if TYPE_CHECKING:
-    from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_inference_wrapper import PerceptionCacheState
+    from nemo.collections.speechlm2.inference.model_wrappers.perception_cache import PerceptionCacheState
 
 
 @dataclass
@@ -47,25 +48,22 @@ class S2SContextManager:
 		s2s_model,
 		num_slots: int,
 		max_len: int,
-		use_cache: bool = True,
 	):
 		self.s2s_model = s2s_model
 		self.num_slots = num_slots
 		
-		# Detect Nemotron models and disable caching (they require NemotronHHybridDynamicCache which isn't supported yet)
-		# Directly access the configuration path used in inference_streaming_realtime.py
-		# self.s2s_model is NemotronVoicechatInferenceWrapper
-		# self.s2s_model.model is NemotronVoiceChat
-		# self.s2s_model.model.stt_model is the STT model
-		# Note: using getattr to be safe against structure changes, but aiming for stt_model.cfg.pretrained_llm
+		# Detect Nemotron models and disable DynamicCache
+		# (they require NemotronHHybridDynamicCache which isn't supported yet)
+		self.cache_disabled = False
 		stt_model = getattr(self.s2s_model.model, "stt_model", None)
 		if stt_model is not None:
 			pretrained_llm = stt_model.cfg.get("pretrained_llm", "")
 			if "Nemotron" in pretrained_llm:
-				print(f"⚠️  Detected Nemotron model ({pretrained_llm}). Disabling cache (Nemotron requires NemotronHHybridDynamicCache which is not yet supported).")
-				use_cache = False
-		
-		self.cache_disabled = not use_cache
+				logging.warning(
+					f"Detected Nemotron model ({pretrained_llm}). "
+					"Disabling DynamicCache (Nemotron requires NemotronHHybridDynamicCache which is not yet supported)."
+				)
+				self.cache_disabled = True
 		self.max_len = max_len
 		self.device = getattr(self.s2s_model, "device", torch.device("cpu"))
 		self.dtype = getattr(self.s2s_model, "dtype", torch.float32)
@@ -134,9 +132,9 @@ class S2SContextManager:
 
 		# Initialize perception cache if enabled
 		if self.use_perception_cache:
-			get_initial_perception_cache = getattr(self.s2s_model, "_get_initial_perception_cache_state", None)
-			if callable(get_initial_perception_cache):
-				perception_cache = get_initial_perception_cache(batch_size=1)
+			mgr = getattr(self.s2s_model, "perception_cache_mgr", None)
+			if mgr is not None:
+				perception_cache = mgr.get_initial_state(batch_size=1)
 
 		return StreamingRealtimeContext(
 			frame_idx=0,
@@ -158,16 +156,16 @@ class S2SContextManager:
 				# Emergency cleanup: force-release all slots for a fresh start
 				# This handles cases where previous streams didn't end properly
 				# (e.g., exceptions, client disconnects, missing is_last=True)
-				print(f"⚠️  No free slots available - forcing cleanup of all {self.num_slots} slots")
+				logging.warning(f"No free slots available - forcing cleanup of all {self.num_slots} slots")
 				orphaned_streams = list(self.slotidx2streamidx.values())
 				if orphaned_streams:
-					print(f"   Orphaned streams being cleaned up: {orphaned_streams}")
+					logging.warning(f"Orphaned streams being cleaned up: {orphaned_streams}")
 				for slot_idx in range(self.num_slots):
 					self.reset_slot(slot_idx)
 			slot_idx = self.free_slots.get()
 			# Ensure the slot is completely clean before assigning to new stream
 			if self.slot_contexts[slot_idx] is not None:
-				print(f"⚠️  WARNING: Slot {slot_idx} was not properly cleaned. Forcing cleanup.")
+				logging.warning(f"Slot {slot_idx} was not properly cleaned. Forcing cleanup.")
 				self.slot_contexts[slot_idx] = None
 			self.streamidx2slotidx[stream_id] = slot_idx
 			self.slotidx2streamidx[slot_idx] = stream_id

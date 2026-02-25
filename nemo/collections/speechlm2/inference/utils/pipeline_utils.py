@@ -12,9 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from typing import List, Optional
 
 from nemo.collections.asr.inference.utils.text_segment import Word
+
+
+def clean_pred_text(text: str) -> str:
+    """Clean prediction text by removing special markers, timestamps, punctuation, and lowercasing.
+
+    Useful for fair WER comparison between predicted and ground-truth text.
+    """
+    if not text:
+        return ""
+    text = text.lstrip('^')
+    text = re.sub(r'</?s>', '', text)
+    text = re.sub(r'<\$[\d.]+\$>', '', text)
+    text = re.sub(r'<\|[\d.]+\|>', '', text)
+    text = re.sub(r'<SPECIAL_12>', '', text)
+    text = text.replace('\u0120', ' ')
+    text = text.lower()
+    text = re.sub(r'[^\w\s]', '', text)
+    return ' '.join(text.split())
 
 
 class PipelineOutput:

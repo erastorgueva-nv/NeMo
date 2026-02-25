@@ -37,13 +37,7 @@ class S2SStreamingState:
 
 	# Runtime tensors (initialized in __post_init__)
 	audio_buffer: torch.Tensor = field(init=False)
-	generated_text_tokens: torch.Tensor = field(init=False)
-	generated_audio_tokens: torch.Tensor = field(init=False)
-	speech_state: torch.Tensor = field(init=False)
 
-	# Counters
-	counter: int = 0
-	context_length: int = 1 # TODO - make this variable
 	# Accumulated text output
 	output_text_str: str = ""
 	output_text_tokens: List[str] = field(default_factory=list)
@@ -63,24 +57,11 @@ class S2SStreamingState:
 		with torch.no_grad():
 			# Empty 2D buffer: shape (1, 0). Will be appended over time.
 			self.audio_buffer = torch.empty((1, 0), device=self.device, dtype=self.dtype)
-			# Token tensors as fixed-size workspaces
-			self.generated_text_tokens = torch.empty(
-				1, self.max_len, device=self.device, dtype=torch.long
-			)
-			self.generated_audio_tokens = torch.empty(
-				1, self.max_len, self.num_audio_codebooks, device=self.device, dtype=torch.long
-			)
-			self.speech_state = torch.zeros(1, device=self.device, dtype=torch.long)
 
 	def reset(self) -> None:
 		"""Reset all tensors and counters to their initial state."""
 		with torch.no_grad():
 			self.audio_buffer = torch.empty((1, 0), device=self.device, dtype=self.dtype)
-			self.generated_text_tokens.zero_()
-			self.generated_audio_tokens.zero_()
-			self.speech_state.zero_()
-			self.counter = 0
-			self.context_length = 1
 			self.output_text_str = ""
 			self.output_text_tokens.clear()
 			self.output_asr_text_str = ""
@@ -106,11 +87,10 @@ class S2SStreamingState:
 			prior_samples = int(self.audio_buffer.shape[-1])
 			appended_samples = int(append_tensor.shape[-1])
 			self.audio_buffer = torch.cat([self.audio_buffer, append_tensor.to(self.device, dtype=self.dtype)], dim=-1)
-			self.counter += 1
 
 		# Accumulate text output if provided and create a Word with naive timing
 		if isinstance(output_text, str) and output_text:
-			self.output_text_tokens.append(output_text) # TODO - append token ids instead of strings?
+			self.output_text_tokens.append(output_text)
 			# Directly concatenate - spacing is already handled by tokenizer (Ġ → space)
 			self.output_text_str += output_text
 			try:
@@ -129,14 +109,6 @@ class S2SStreamingState:
 	def speech_frames(self) -> List[torch.Tensor]:
 		"""Backward-compatible view for code expecting a list of chunks."""
 		return [self.audio_buffer]
-
-	def get_processed_frames(self) -> List[torch.Tensor]:
-		"""Return a copy-like view of accumulated audio."""
-		return [self.audio_buffer.clone()]
-
-	def get_output_text_tokens(self) -> List[Any]:
-		"""Return accumulated text tokens (strings)."""
-		return list(self.output_text_tokens)
 
 	def get_output_text(self) -> str:
 		"""Return accumulated text as a single string."""

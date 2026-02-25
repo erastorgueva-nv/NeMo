@@ -147,9 +147,9 @@ class LLMStreamingEngine:
         # Initialize the engine
         self.engine = AsyncLLM.from_vllm_config(vllm_config)
 
-        print("****** Engine initialized with custom input specs: ******")
+        logging.info("Engine initialized with custom input specs:")
         for spec in self.custom_input_specs:
-            print(f"  - {spec}")
+            logging.info(f"  - {spec}")
 
     def _get_safe_prompt_tokens(self, length: int = 10) -> list[int]:
         """Generate safe prompt tokens that won't cause immediate EOS."""

@@ -86,10 +86,7 @@ streaming:
   output_sample_rate: 22050                          # Audio sample rate in Hz
   batch_size: 1                               # Number of audio frames per batch
   att_context_size: [70,0]                    # Attention context size: [70,13],[70,6],[70,2],[70,0]
-  #use_cache: true                             # Whether to use cache for streaming
-  #use_feat_cache: true                        # Whether to cache mel-spec features, set false to re-calculate all mel-spec features in audio buffer
-  #window_size: 510                            # FFT window length
   chunk_size_in_secs: ???                    # Needs to be multiple of 80ms
   buffer_size_in_secs: ???                    # Audio buffer size in seconds (larger = more context, better quality)
   request_type: frame                         # Type of request: frame, only frame is supported for cache-aware streaming
-  max_len: 8192                               # 
+  max_len: 8192

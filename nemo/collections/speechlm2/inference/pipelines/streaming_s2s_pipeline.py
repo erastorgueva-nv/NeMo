@@ -35,6 +35,7 @@ from nemo.collections.speechlm2.models.duplex_s2s_model import tokens_to_str
 from nemo.collections.speechlm2.inference.streaming.state.s2s_context_manager import S2SContextManager
 from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
 from nemo.collections.speechlm2.inference.utils.pipeline_utils import PipelineOutput
+from nemo.utils import logging
 
 
 class StreamingS2SPipeline(S2SPipelineInterface):
@@ -89,28 +90,20 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 			buffer_size_in_secs=self.buffer_size_in_secs,
 		)
 
-		# --------------------------------------------------------------
-		# Cache handling helpers
-		# --------------------------------------------------------------
-		self.use_cache: bool = getattr(self.streaming_cfg, "use_cache", True)
-
 		# ------------------------------------------------------------------
 		# System prompt configuration
 		# ------------------------------------------------------------------
 		s2s_cfg = cfg.get("s2s", {})
 		self.system_prompt: Optional[str] = getattr(s2s_cfg, "system_prompt", None)
 		if self.system_prompt:
-			print(f"📝 System prompt configured: {self.system_prompt[:100]}{'...' if len(self.system_prompt) > 100 else ''}")
+			logging.info(f"System prompt configured: {self.system_prompt[:100]}{'...' if len(self.system_prompt) > 100 else ''}")
 
 		# Context manager
 		self.context_manager = S2SContextManager(
 			s2s_model=self.s2s_model,
 			num_slots=self.batch_size,
 			max_len=self.max_len,
-			use_cache=self.use_cache,
 		)
-
-		#self.window = torch.hamming_window(self.window_size)
 
 		# Output directory for generated files
 		self.output_dir = getattr(cfg, "output_dir", "./generated")
@@ -189,10 +182,8 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 		eos_flags = [f.is_last for f in frames]
 		bos_flags = [f.is_first for f in frames]
 
-		print(f"{stream_ids=} {bos_flags=} {eos_flags=}")
+		logging.debug(f"stream_ids={stream_ids} bos_flags={bos_flags} eos_flags={eos_flags}")
 
-		if len(frames) == 0:
-			return
 		if len(frames) != 1:
 			raise NotImplementedError("NemotronVoicechatInferenceWrapper currently supports batch_size == 1")
 
@@ -202,14 +193,13 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 		has_prompt = False
 		if bos_flags[0]:
 			if self._stream_has_prompt:
-				print(f"⏱ inner_generate_step: prefill already done for stream {stream_ids[0]}, skipping context init")
+				logging.debug(f"Prefill already done for stream {stream_ids[0]}, skipping context init")
 			else:
-				print(f"⏱ inner_generate_step: no prefill for stream {stream_ids[0]}, creating fresh context_manager")
+				logging.debug(f"No prefill for stream {stream_ids[0]}, creating fresh context_manager")
 				self.context_manager = S2SContextManager(
 					s2s_model=self.s2s_model,
 					num_slots=self.batch_size,
 					max_len=self.max_len,
-					use_cache=self.use_cache,
 				)
 
 		has_prompt = self._stream_has_prompt
@@ -218,23 +208,6 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 		request_id = self._request_id_for_stream(stream_ids[0])
 		
 		context, _ = self.context_manager.get_context(stream_ids)
-
-		# Debug: print context_manager contents and sizes
-		print(f"📊 S2SContextManager state:")
-		print(f"   streamidx2slotidx: {self.context_manager.streamidx2slotidx}")
-		print(f"   slotidx2streamidx: {self.context_manager.slotidx2streamidx}")
-		print(f"   free_slots qsize: {self.context_manager.free_slots.qsize()}")
-		print(f"   slot_contexts: {[c is not None for c in self.context_manager.slot_contexts]}")
-		print(f"📊 Current context for stream {stream_ids[0]}:")
-		print(f"   frame_idx: {context.frame_idx}")
-		print(f"   gen_text: {context.gen_text.shape if context.gen_text is not None else None}")
-		print(f"   gen_asr_text: {context.gen_asr_text.shape if context.gen_asr_text is not None else None}")
-		print(f"   audio_toks_buffer: {context.audio_toks_buffer.shape if context.audio_toks_buffer is not None else None}")
-		print(f"   input_embeds_history: {len(context.input_embeds_history)} items, shapes: {[e.shape for e in context.input_embeds_history[:3]]}{'...' if len(context.input_embeds_history) > 3 else ''}")
-		print(f"   dynamic_cache: {type(context.dynamic_cache).__name__ if context.dynamic_cache is not None else None}, len={len(context.dynamic_cache) if context.dynamic_cache is not None else 0}")
-		print(f"   past_key_values: {type(context.past_key_values).__name__ if context.past_key_values is not None else None}")
-		print(f"   code: {context.code.shape if context.code is not None else None}")
-		print(f"   subword_mask: {context.subword_mask.shape if context.subword_mask is not None else None}")
 
 		audio_buffer = buffers[0]
 		if audio_buffer.dim() == 1:
@@ -283,7 +256,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 		# Explicitly clean up bufferer and state for finished streams
 		for stream_id, eos_flag in zip(stream_ids, eos_flags):
 			if eos_flag:
-				print(f"🏁 Ending stream {stream_id} - cleaning up bufferer and context")
+				logging.debug(f"Ending stream {stream_id} - cleaning up bufferer and context")
 				self.bufferer.rm_bufferer(stream_id)
 				self._abort_stream_request(stream_id)
 				# Note: We keep the state in _state_pool until finalization to save audio
@@ -315,7 +288,6 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 			s2s_model=self.s2s_model,
 			num_slots=self.batch_size,
 			max_len=self.max_len,
-			use_cache=self.use_cache,
 		)
 		t_ctx = time.time()
 
@@ -324,7 +296,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 		t_prefill = time.time()
 
 		self._stream_has_prompt = bool(system_prompt)
-		print(f"⏱ prefill_for_new_stream: context_manager={1000*(t_ctx-t0):.1f}ms, "
+		logging.debug(f"prefill_for_new_stream: context_manager={1000*(t_ctx-t0):.1f}ms, "
 			  f"_prefill_system_prompt={1000*(t_prefill-t_ctx):.1f}ms, "
 			  f"total={1000*(t_prefill-t0):.1f}ms, has_prompt={self._stream_has_prompt}")
 		return self._stream_has_prompt
@@ -652,7 +624,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 			tts_init_inputs = getattr(self.s2s_model, "tts_init_inputs", None)
 			tts_prompt_token_ids = getattr(self.s2s_model, "tts_prompt_token_ids", None)
 			if tts_init_inputs is not None and tts_prompt_token_ids is not None:
-				print(f"🔊 Prefilling TTS speaker embedding for stream {stream_id}...")
+				logging.info(f"Prefilling TTS speaker embedding for stream {stream_id}...")
 				start_tts_prefill = time.time()
 				with torch.no_grad():
 					# Clone tts_init_inputs to avoid any tensor sharing issues
@@ -666,22 +638,21 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 					# Capture the generated codes to sync context with vLLM state
 					if hasattr(tts_result, 'codes') and tts_result.codes is not None:
 						tts_output_code = tts_result.codes.detach().clone()
-						print(f"   TTS prefill generated codes shape: {tts_output_code.shape}")
-				print(f"   Time taken to prefill TTS speaker embedding: {time.time() - start_tts_prefill:.3f}s")
-				print(f"   ✅ TTS speaker embedding prefilled")
+						logging.debug(f"TTS prefill generated codes shape: {tts_output_code.shape}")
+				logging.info(f"TTS speaker embedding prefilled in {time.time() - start_tts_prefill:.3f}s")
 			else:
-				print(f"   ⚠️  TTS init inputs not available, skipping TTS prefill")
+				logging.warning("TTS init inputs not available, skipping TTS prefill")
 		
 		if not system_prompt:
 			return tts_output_code
 		
-		print(f"📝 Prefilling system prompt for stream {stream_id}...")
+		logging.info(f"Prefilling system prompt for stream {stream_id}...")
 		start_get_prompt_embeddings = time.time()
 		prompt_embedded, prompt_len = self.s2s_model._prepare_system_prompt_embeddings(system_prompt)
-		print(f"   Time taken to get prompt embeddings: {time.time() - start_get_prompt_embeddings:.3f}s")
+		logging.debug(f"Time taken to get prompt embeddings: {time.time() - start_get_prompt_embeddings:.3f}s")
 		
 		if prompt_embedded is None:
-			print(f"   ⚠️  System prompt embedding returned None, skipping prefill")
+			logging.warning("System prompt embedding returned None, skipping prefill")
 			return tts_output_code
 		
 		# Check if using vLLM for LLM (matches vllm_llm, vllm_llm_vllm_eartts, etc.)
@@ -690,7 +661,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 		if use_vllm_llm:
 			# For vLLM LLM: process prompt embeddings sequentially
 			# vLLM manages its own KV cache internally
-			print(f"   Processing {prompt_len} prompt embeddings for vLLM LLM...")
+			logging.info(f"Processing {prompt_len} prompt embeddings for vLLM LLM...")
 			start_prefill = time.time()
 			with torch.no_grad():
 				for t in range(prompt_len):
@@ -701,8 +672,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 						generated_tokens=None,
 						current_step=t
 					)
-			print(f"   Time taken to prefill LLM: {time.time() - start_prefill:.3f}s")
-			print(f"   ✅ System prompt processed ({prompt_len} tokens)")
+			logging.info(f"System prompt processed ({prompt_len} tokens) in {time.time() - start_prefill:.3f}s")
 		
 		else:
 			context, _ = self.context_manager.get_context([stream_id])
@@ -717,12 +687,12 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 						current_step=0
 					)
 					context.dynamic_cache = ans.get("cache", llm_cache)
-				print(f"   ✅ System prompt processed, cache updated ({prompt_len} tokens)")
+				logging.info(f"System prompt processed, cache updated ({prompt_len} tokens)")
 			else:
 				# No-cache mode (e.g. Nemotron): add prompt embeddings to history
 				for t in range(prompt_len):
 					context.input_embeds_history.append(prompt_embedded[:, t:t+1, :])
-				print(f"   ✅ Added {prompt_len} prompt embeddings to input_embeds_history")
+				logging.info(f"Added {prompt_len} prompt embeddings to input_embeds_history")
 		
 		return tts_output_code
 
@@ -744,4 +714,4 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 			try:
 				abort_fn(request_id)
 			except Exception as exc:
-				print(f"⚠️  Failed to abort request {request_id} for stream {stream_id}: {exc}")
+				logging.warning(f"Failed to abort request {request_id} for stream {stream_id}: {exc}")

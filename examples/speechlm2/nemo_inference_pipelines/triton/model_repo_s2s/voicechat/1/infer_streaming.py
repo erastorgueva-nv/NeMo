@@ -180,21 +180,21 @@ class TritonPythonModel:
                 start_tensor = pb_utils.get_input_tensor_by_name(request, "START")
                 if start_tensor is not None:
                     is_first = bool(start_tensor.as_numpy()[0])
-            except:
+            except Exception:
                 pass
             
             try:
                 end_tensor = pb_utils.get_input_tensor_by_name(request, "END")
                 if end_tensor is not None:
                     is_last = bool(end_tensor.as_numpy()[0])
-            except:
+            except Exception:
                 pass
             
             try:
                 corrid_tensor = pb_utils.get_input_tensor_by_name(request, "CORRID")
                 if corrid_tensor is not None:
                     stream_id = int(corrid_tensor.as_numpy()[0])
-            except:
+            except Exception:
                 pass
             
             # Extract optional per-stream system prompt (sent on the first request)
@@ -206,7 +206,7 @@ class TritonPythonModel:
                     if prompt_tensor is not None:
                         raw = prompt_tensor.as_numpy()[0]
                         system_prompt = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
-                except:
+                except Exception:
                     pass
                 if system_prompt is None:
                     system_prompt = self.pipeline.system_prompt

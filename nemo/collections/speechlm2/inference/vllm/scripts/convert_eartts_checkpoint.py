@@ -20,6 +20,7 @@ import torch
 from omegaconf import OmegaConf, DictConfig
 from safetensors.torch import save_file, load_file
 from transformers import AutoConfig
+from nemo.utils import logging
 
 from nemo.collections.speechlm2.models.duplex_ear_tts import DuplexEARTTS
 
@@ -149,7 +150,7 @@ def convert(outdir, config, model_path):
     # save weights
     safetensors_path = os.path.join(outdir, "model.safetensors")
     save_file(weights, safetensors_path)
-    print(f"Saved weights for vllm model")
+    logging.info("Saved weights for vllm model")
     weight_map = {name: "model.safetensors" for name in weights.keys()}
     index = {
         "metadata": {
@@ -160,7 +161,7 @@ def convert(outdir, config, model_path):
     index_path = os.path.join(outdir, "model.safetensors.index.json")
     with open(index_path, "w") as f:
         json.dump(index, f, indent=2)
-    print(f"Saved model index")
+    logging.info("Saved model index")
 
     # save config.json
     flat_config = {"architectures": ["EarTTSForCausalLM"], "model_type": "eartts"}
@@ -247,7 +248,7 @@ def convert(outdir, config, model_path):
 
     with open(os.path.join(outdir, "config.json"), "w") as f:
         json.dump(flat_config, f, indent=2)
-    print("Saved vllm config")
+    logging.info("Saved vllm config")
 
 
 if __name__ == "__main__":
