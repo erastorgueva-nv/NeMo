@@ -112,6 +112,8 @@ TTS_SAMPLE_RATE = 22050
 # Default hyper-parameters that can be overridden via `model_cfg`
 DEFAULT_BUFFER_SIZE_FRAMES = 71
 DEFAULT_NUM_FRAMES_PER_CHUNK = 1
+# Only used when use_codec_cache=False (sliding-window fallback).
+# Ignored when the codec streaming cache is enabled.
 DEFAULT_CODEC_TOKEN_HISTORY_SIZE = 600
 
 
@@ -219,6 +221,10 @@ class NemotronVoicechatInferenceWrapper:
             raise ValueError("`model_cfg.llm_checkpoint_path` must be provided.")
 
         self.decode_audio = bool(model_cfg.get("decode_audio", True))
+        # Number of past codec tokens kept in the sliding-window decode buffer.
+        # Only used when use_codec_cache=False (the fallback path). When the
+        # codec cache is enabled, context is maintained incrementally inside
+        # CausalConv1dCache and this value is ignored.
         self.codec_token_history_size = int(
             model_cfg.get("codec_token_history_size", DEFAULT_CODEC_TOKEN_HISTORY_SIZE)
         )
@@ -273,6 +279,21 @@ class NemotronVoicechatInferenceWrapper:
         # Sampling parameters
         self.top_p = float(model_cfg.get("top_p", 1.0))
         self.repetition_penalty = float(model_cfg.get("repetition_penalty", 1.0))
+
+        # Codec streaming cache: decode only new tokens each step using the
+        # codec's CausalConv1dCache, which maintains ConvNeXt and ISTFT state
+        # across calls for sample-continuous audio. When enabled, the
+        # codec_token_history_size parameter and audio_toks_buffer are unused.
+        # When disabled, falls back to the sliding-window decode that re-decodes
+        # codec_token_history_size tokens each step and extracts the tail.
+        self.use_codec_cache = bool(model_cfg.get("use_codec_cache", True))
+        if self.use_codec_cache and self.decode_audio:
+            configured_history = model_cfg.get("codec_token_history_size", None)
+            if configured_history is not None:
+                logging.info(
+                    f"use_codec_cache is enabled — codec_token_history_size ({configured_history}) "
+                    f"will be ignored (context is maintained incrementally by the codec cache)."
+                )
 
         # Perception cache configuration
         self.use_perception_cache = bool(model_cfg.get("use_perception_cache", False))
@@ -1290,7 +1311,8 @@ class NemotronVoicechatInferenceWrapper:
                        request_id: Optional[str] = None,
                        perception_cache: Optional[PerceptionCacheState] = None,
                        source_encoded_dict: Optional[dict] = None,
-                       has_prompt: bool = False):
+                       has_prompt: bool = False,
+                       codec_cache=None):
 
         # Set up effective request ID for vLLM streaming
         effective_request_id = request_id or self.request_id
@@ -1355,6 +1377,7 @@ class NemotronVoicechatInferenceWrapper:
             base_frame_index = max(base_frame_index, 0)
 
         new_input_embeds = []
+        new_codes_for_decode = []
         for frame_offset in range(num_frames_per_chunk):
             current_frame_idx = frame_idx + frame_offset
             current_frame_index = base_frame_index + frame_offset
@@ -1469,10 +1492,10 @@ class NemotronVoicechatInferenceWrapper:
                 time_tts_model = time.time() - start_tts_model
                 logging.info(f"Time taken for tts_model: {time_tts_model:.3f}s")
 
-                # update audio_toks_buffer with new code
-                # * we do this still inside the for-loop, and update one frame at a time
-                # * note: audio_toks_buffer will be fed to the audio decoder
-                audio_toks_buffer = torch.cat([audio_toks_buffer[:, 1:], code], dim=1)
+                new_codes_for_decode.append(code.clone())
+                # Update sliding-window buffer (only needed for fallback decode when codec_cache is off)
+                if audio_toks_buffer is not None:
+                    audio_toks_buffer = torch.cat([audio_toks_buffer[:, 1:], code], dim=1)
 
                 # now that we've saved audio_toks_buffer for audio decoding purposes,
                 # we can potentially overwrite the audio token with silence tokens (for feeding to the audio token predictor)
@@ -1489,27 +1512,42 @@ class NemotronVoicechatInferenceWrapper:
             samples_per_audio_output_frame = self._samples_per_audio_output_frame()
             logging.debug(f"\n🔊 Decoding audio for {frame_idx}-th frame  ({num_frames_per_chunk=})")
 
-            len_audio_toks_buffer = torch.tensor([self.codec_token_history_size], dtype=torch.long, device=self.device)
-
             start_time_decode = time.time()
             with fp32_precision(), torch.no_grad():
-                decoded_audio, decoded_audio_len = self.model.tts_model.audio_codec.decode(
-                    audio_toks_buffer,
-                    len_audio_toks_buffer
-                )
+                if codec_cache is not None and new_codes_for_decode:
+                    # Incremental decode: feed only the num_frames_per_chunk new tokens
+                    # to the codec. CausalConv1dCache maintains all necessary ConvNeXt
+                    # and ISTFT overlap state from prior calls, so no history buffer
+                    # is needed — this replaces the sliding-window approach entirely.
+                    new_codes_tensor = torch.cat(new_codes_for_decode, dim=1)
+                    if hasattr(self.model.tts_model, '_control_codes'):
+                        from nemo.collections.speechlm2.models.duplex_ear_tts import replace_control_speech_codes
+                        new_codes_tensor = replace_control_speech_codes(
+                            new_codes_tensor,
+                            self.model.tts_model._control_codes,
+                            getattr(self.model.tts_model, 'codec_silence_tokens', None),
+                        )
+                    new_code_len = torch.tensor(
+                        [new_codes_tensor.shape[1]], dtype=torch.long, device=self.device
+                    )
+                    decoded_audio_new, _ = self.model.tts_model.audio_codec.decode(
+                        new_codes_tensor, new_code_len, cache=codec_cache,
+                    )
+                    logging.debug(f"   Incremental decode: {new_codes_tensor.shape[1]} new tokens -> {decoded_audio_new.shape}")
+                else:
+                    # Fallback: full-buffer sliding-window decode (original behavior)
+                    len_audio_toks_buffer = torch.tensor(
+                        [self.codec_token_history_size], dtype=torch.long, device=self.device
+                    )
+                    decoded_audio, decoded_audio_len = self.model.tts_model.audio_codec.decode(
+                        audio_toks_buffer, len_audio_toks_buffer,
+                    )
+                    decoded_audio_new = decoded_audio[:, :, -samples_per_audio_output_frame * num_frames_per_chunk:]
+                    logging.debug(f"   Sliding-window decode: extracted {decoded_audio_new.shape} from {decoded_audio.shape}")
 
             torch.cuda.synchronize()
             time_audio_codec = time.time() - start_time_decode
             logging.info(f"Time taken for audio_codec: {time_audio_codec:.3f}s")
-
-            logging.debug(f"   Decoded Audio full shape: {decoded_audio.shape}")
-            logging.debug(f"   Decoded Audio length: {decoded_audio_len}")
-            logging.debug(f"   samples_per_audio_output_frame={samples_per_audio_output_frame}")
-            logging.debug(f"   num_frames_per_chunk={num_frames_per_chunk}")
-            logging.debug(f"   Expected new samples to extract: {samples_per_audio_output_frame * num_frames_per_chunk}")
-
-            decoded_audio_new = decoded_audio[:, :, -samples_per_audio_output_frame * num_frames_per_chunk:]
-            logging.debug(f"   Extracted decoded_audio_new shape: {decoded_audio_new.shape}")
 
         else:
             audio_toks_buffer = None
@@ -1566,6 +1604,7 @@ class NemotronVoicechatInferenceWrapper:
             'code': code,
             'perception_cache': perception_cache,
             'source_encoded_dict': source_encoded_dict,
+            'codec_cache': codec_cache,
         }
 
     def abort_request(self, request_id: Optional[str]) -> bool:
@@ -1702,11 +1741,12 @@ class NemotronVoicechatInferenceWrapper:
             raise ValueError(
                 f"buffer_size_frames ({buffer_size_frames}) is too small: {reason}."
             )
-        if self.decode_audio and num_frames_per_chunk > self.codec_token_history_size:
+        if self.decode_audio and not self.use_codec_cache and num_frames_per_chunk > self.codec_token_history_size:
             raise ValueError(
                 f"num_frames_per_chunk ({num_frames_per_chunk}) must be "
-                f"<= codec_token_history_size ({self.codec_token_history_size}) when decode_audio=True. "
-                f"Either reduce num_frames_per_chunk or increase codec_token_history_size."
+                f"<= codec_token_history_size ({self.codec_token_history_size}) when decode_audio=True "
+                f"and use_codec_cache=False. "
+                f"Either reduce num_frames_per_chunk, increase codec_token_history_size, or enable use_codec_cache."
             )
         logging.info(f"Buffer size: {buffer_size_frames} frames ({buffer_size_frames * FRAME_SIZE_SEC}s)")
         logging.info(f"Frames per inference step: {num_frames_per_chunk}")
@@ -1808,13 +1848,14 @@ class NemotronVoicechatInferenceWrapper:
         code = None
         past_key_values = None
         subword_mask = None
+        audio_toks_buffer = None
         if self.decode_audio and hasattr(self.model, 'tts_model'):
 
-            # init audio toks buffer with codec_token_history_size number of silence tokens
-            # shape of audio_toks_buffer is: [1, codec_token_history_size, num_codes] (batch size = 1)
-            audio_toks_buffer = self.model.tts_model.codec_silence_tokens.view(1, 1, -1).expand(
-                -1, self.codec_token_history_size, -1
-            ).to(self.device)
+            # Sliding-window buffer is only needed when codec_cache is off
+            if not self.use_codec_cache:
+                audio_toks_buffer = self.model.tts_model.codec_silence_tokens.view(1, 1, -1).expand(
+                    -1, self.codec_token_history_size, -1
+                ).to(self.device)
 
             if (
                 self.first_context_subword_id is None
@@ -1849,6 +1890,13 @@ class NemotronVoicechatInferenceWrapper:
         if self.use_perception_cache:
             perception_cache = self._get_initial_perception_cache_state(batch_size=1)
             logging.info(f"✅ Perception cache initialized")
+
+        # Initialize codec streaming cache to remove clicking sounds and wasted inference computation
+        codec_cache = None
+        if self.decode_audio and self.use_codec_cache:
+            from nemo.collections.speechlm2.modules.ear_tts_vae_codec import CausalConv1dCache
+            codec_cache = CausalConv1dCache()
+            logging.info(f"✅ Codec streaming cache initialized")
 
         gen_text = torch.full((1, total_frames), self.model.stt_model.text_pad_id, device=self.device, dtype=torch.long)
         gen_asr_text = torch.full((1, total_frames), self.model.stt_model.text_pad_id, device=self.device, dtype=torch.long)
@@ -1898,6 +1946,7 @@ class NemotronVoicechatInferenceWrapper:
                 perception_cache=perception_cache,
                 source_encoded_dict=source_encoded_dict,
                 has_prompt=(prompt_len > 0),
+                codec_cache=codec_cache,
             )
 
             # handle results from infer_one_step
@@ -1915,6 +1964,7 @@ class NemotronVoicechatInferenceWrapper:
 
                 past_key_values = result['past_key_values']
                 code = result['code']
+                codec_cache = result.get('codec_cache', codec_cache)
             else:
                 decoded_audio_new = None
 
@@ -2030,6 +2080,9 @@ def main():
                        help="Enable cache-aware streaming for perception encoder")
     parser.add_argument("--use_perception_cudagraph", action="store_true",
                        help="Use CUDA graphs for perception encoder (requires --use_perception_cache)")
+    # Codec streaming cache argument
+    parser.add_argument("--use_codec_cache", action="store_true",
+                       help="Enable incremental codec decode to remove clicking sounds and wasted inference computation (recommended)")
     parser.add_argument("--path_to_enc_save", type=str, default=None,
                        help="Directory to save source_encoded tensors. Each audio file's encodings "
                             "are saved as {audio_id}_source_encoded.pt (dict with frame idx keys)")
@@ -2084,6 +2137,7 @@ def main():
             "engine_type": args.engine_type,
             "use_perception_cache": bool(args.use_perception_cache),
             "use_perception_cudagraph": bool(args.use_perception_cudagraph),
+            "use_codec_cache": bool(args.use_codec_cache),
             "path_to_enc_save": args.path_to_enc_save,
             "top_p": args.top_p,
             "repetition_penalty": args.repetition_penalty,

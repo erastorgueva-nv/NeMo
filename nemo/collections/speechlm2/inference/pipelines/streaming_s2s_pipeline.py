@@ -261,6 +261,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 			request_id=request_id,
 			perception_cache=context.perception_cache,
 			has_prompt=has_prompt,
+			codec_cache=context.codec_cache,
 		)
 
 		# Persist updated cache & clean finished streams

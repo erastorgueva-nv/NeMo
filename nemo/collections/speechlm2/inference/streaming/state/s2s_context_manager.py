@@ -19,6 +19,8 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 import torch
 from transformers import DynamicCache
 
+from nemo.collections.speechlm2.modules.ear_tts_vae_codec import CausalConv1dCache
+
 if TYPE_CHECKING:
     from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_inference_wrapper import PerceptionCacheState
 
@@ -35,6 +37,7 @@ class StreamingRealtimeContext:
 	code: Optional[torch.Tensor]
 	subword_mask: Optional[torch.Tensor]
 	perception_cache: Optional["PerceptionCacheState"] = None
+	codec_cache: Optional[CausalConv1dCache] = None
 
 
 class S2SContextManager:
@@ -70,6 +73,7 @@ class S2SContextManager:
 		self.codec_token_history_size = int(getattr(self.s2s_model, "codec_token_history_size", 0))
 		self.decode_audio = bool(getattr(self.s2s_model, "decode_audio", False))
 		self.use_perception_cache = bool(getattr(self.s2s_model, "use_perception_cache", False))
+		self.use_codec_cache = bool(getattr(self.s2s_model, "use_codec_cache", True))
 
 		self.reset()
 
@@ -104,11 +108,18 @@ class S2SContextManager:
 		code: Optional[torch.Tensor] = None
 		subword_mask: Optional[torch.Tensor] = None
 		perception_cache = None
+		codec_cache = None
 
 		if self.decode_audio and hasattr(getattr(self.s2s_model, "model", None), "tts_model"):
 			tts_model = self.s2s_model.model.tts_model
-			if self.codec_token_history_size > 0:
-				# Create a completely independent copy of silence tokens to prevent any sharing
+			if self.use_codec_cache:
+				# Incremental decode path: CausalConv1dCache maintains all codec
+				# context internally, so no audio_toks_buffer is needed and
+				# codec_token_history_size is irrelevant.
+				codec_cache = CausalConv1dCache()
+			elif self.codec_token_history_size > 0:
+				# Sliding-window fallback: allocate silence buffer of
+				# codec_token_history_size tokens that is re-decoded every step.
 				silence_tokens_base = tts_model.codec_silence_tokens.detach().clone()
 				silence_tokens = silence_tokens_base.view(1, 1, -1).expand(
 					-1, self.codec_token_history_size, -1
@@ -138,6 +149,7 @@ class S2SContextManager:
 			code=code,
 			subword_mask=subword_mask,
 			perception_cache=perception_cache,
+			codec_cache=codec_cache,
 		)
 
 	def _ensure_slot(self, stream_id: int) -> int:
@@ -234,6 +246,8 @@ class S2SContextManager:
 			context.subword_mask[:, start_idx:end_idx] = True
 		if "perception_cache" in step_result and step_result["perception_cache"] is not None:
 			context.perception_cache = step_result["perception_cache"]
+		if "codec_cache" in step_result and step_result["codec_cache"] is not None:
+			context.codec_cache = step_result["codec_cache"]
 
 	def reset_slots(self, stream_ids: List[int], eos_flags: List[bool]) -> None:
 		"""Release contexts for streams that signalled end-of-stream."""
