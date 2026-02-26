@@ -126,6 +126,10 @@ class TritonPythonModel:
             )
         logging.info(f"Loading S2S Triton model from config: {config_path}")
         self.load_model(config_path)
+
+        # Warm up the inference engine(s) with a throwaway prefill so the
+        # first real client request doesn't pay one-time initialization cost.
+        self.pipeline.warmup()
     
     def finalize(self) -> None:
         """Finalize the model."""

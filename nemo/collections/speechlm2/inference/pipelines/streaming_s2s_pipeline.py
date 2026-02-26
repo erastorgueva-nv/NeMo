@@ -301,6 +301,45 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 			  f"total={1000*(t_prefill-t0):.1f}ms, has_prompt={self._stream_has_prompt}")
 		return self._stream_has_prompt
 
+	_WARMUP_FALLBACK_PROMPT = "Mock system prompt for warmup."
+
+	def warmup(self, system_prompt: str | None = None) -> None:
+		"""Run a throwaway prefill cycle to warm up the inference engine.
+
+		The very first prefill incurs one-time overhead (e.g. CUDA graph
+		compilation, memory pool allocation, DynamicCache initialization).
+		Calling this once during startup moves that cost out of the
+		critical path so the first real client request is fast.
+
+		The method performs a full prefill (TTS speaker embedding + LLM
+		system prompt), then aborts the request and resets all pipeline
+		state so the next real stream starts cleanly.
+
+		Args:
+			system_prompt: Prompt text to use for warmup.  Falls back to
+				the YAML-configured ``self.system_prompt``, then to a
+				short fallback string so the LLM prefill path is always
+				exercised.
+		"""
+		prompt = system_prompt if system_prompt is not None else self.system_prompt
+		if not prompt:
+			prompt = self._WARMUP_FALLBACK_PROMPT
+			logging.info(f"No system prompt configured — using fallback prompt for warmup: \"{prompt}\"")
+
+		warmup_stream_id = -1
+
+		logging.info("Running pipeline warmup prefill...")
+		t0 = time.time()
+
+		self.prefill_for_new_stream(warmup_stream_id, prompt)
+
+		# Tear down the warmup request so the engine is clean for real traffic
+		self._abort_stream_request(warmup_stream_id)
+		self.context_manager.reset()
+		self._stream_has_prompt = False
+
+		logging.info(f"Pipeline warmup complete in {time.time() - t0:.3f}s")
+
 	def generate_step(self, frames: List[Frame]):
 		"""Main streaming API similar to *transcribe_step* in recognizers.
 
