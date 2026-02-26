@@ -659,20 +659,18 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 		use_vllm_llm = "vllm_llm" in engine_type.lower()
 		
 		if use_vllm_llm:
-			# For vLLM LLM: process prompt embeddings sequentially
-			# vLLM manages its own KV cache internally
-			logging.info(f"Processing {prompt_len} prompt embeddings for vLLM LLM...")
+			# For vLLM LLM: prefill all prompt embeddings in one shot
+			# (decode_steps=0 triggers a single bulk prefill in the vLLM engine)
+			logging.info(f"Prefilling {prompt_len} prompt embeddings for vLLM LLM...")
 			start_prefill = time.time()
 			with torch.no_grad():
-				for t in range(prompt_len):
-					frame_emb = prompt_embedded[:, t:t+1, :]
-					_ = self.s2s_model.model_llm_interface(
-						frame_emb,
-						request_id=request_id,
-						generated_tokens=None,
-						current_step=t
-					)
-			logging.info(f"System prompt processed ({prompt_len} tokens) in {time.time() - start_prefill:.3f}s")
+				_ = self.s2s_model.model_llm_interface(
+					prompt_embedded,
+					request_id=request_id,
+					decode_steps=0,
+					prompt_token_ids=None,
+				)
+			logging.info(f"System prompt prefilled ({prompt_len} tokens) in {time.time() - start_prefill:.3f}s")
 		
 		else:
 			context, _ = self.context_manager.get_context([stream_id])
