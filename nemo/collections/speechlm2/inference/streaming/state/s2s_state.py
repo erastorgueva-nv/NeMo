@@ -122,18 +122,23 @@ class S2SStreamingState:
 		"""Return accumulated words with timings."""
 		return list(self.output_words)
 
-	def save_token_tensors(self, gen_text: torch.Tensor, gen_asr_text: torch.Tensor, total_frames: int) -> None:
+	def save_token_tensors(self, gen_text: torch.Tensor, gen_asr_text: torch.Tensor, total_frames: int,
+						   gen_function_text: torch.Tensor = None) -> None:
 		"""Snapshot the full token-ID tensors from the context before it is destroyed."""
 		with torch.no_grad():
 			self.final_gen_text = gen_text[:, :total_frames].clone().cpu()
 			self.final_gen_asr_text = gen_asr_text[:, :total_frames].clone().cpu()
 			self.final_total_frames = total_frames
+			self.final_gen_function_text = (
+				gen_function_text[:, :total_frames].clone().cpu()
+				if gen_function_text is not None else None
+			)
 
 	def get_token_tensors(self) -> Optional[tuple]:
-		"""Return (gen_text, gen_asr_text, total_frames) or None if not saved."""
+		"""Return (gen_text, gen_asr_text, total_frames[, gen_function_text]) or None if not saved."""
 		if self.final_gen_text is None:
 			return None
-		return self.final_gen_text, self.final_gen_asr_text, self.final_total_frames
+		return self.final_gen_text, self.final_gen_asr_text, self.final_total_frames, getattr(self, 'final_gen_function_text', None)
 
 	def cleanup_after_response(self) -> None:
 		"""Clear transient audio; keep token workspaces allocated."""

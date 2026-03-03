@@ -231,6 +231,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 			code=context.code,
 			subword_mask=context.subword_mask,
 			gen_asr_text=context.gen_asr_text,
+			gen_function_text=context.gen_function_text,
 			request_id=request_id,
 			perception_cache=context.perception_cache,
 			has_prompt=has_prompt,
@@ -249,7 +250,8 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 				]
 				if ctx is not None:
 					state = self.get_or_create_state(stream_id)
-					state.save_token_tensors(ctx.gen_text, ctx.gen_asr_text, ctx.frame_idx)
+					state.save_token_tensors(ctx.gen_text, ctx.gen_asr_text, ctx.frame_idx,
+											 gen_function_text=ctx.gen_function_text)
 
 		self.context_manager.reset_slots(stream_ids, eos_flags)
 		
@@ -596,7 +598,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
 			token_data = state.get_token_tensors()
 			if token_data is not None:
-				gen_text, gen_asr_text, total_frames = token_data
+				gen_text, gen_asr_text, total_frames, gen_function_text = token_data
 				lengths = torch.tensor([total_frames], dtype=torch.long)
 				texts_with_timestamps.append(
 					tokens_to_str(gen_text, lengths, tokenizer=tokenizer, pad_id=pad_id, eval_text_turn_taking=True)[0]
@@ -610,6 +612,10 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 				raw_asr_texts.append(
 					tokens_to_str_raw(gen_asr_text, lengths, tokenizer=tokenizer, pad_id=pad_id)[0]
 				)
+				if gen_function_text is not None:
+					fc_text = tokens_to_str(gen_function_text, lengths, tokenizer=tokenizer, pad_id=pad_id, eval_text_turn_taking=False)[0]
+					fc_text_raw = tokens_to_str_raw(gen_function_text, lengths, tokenizer=tokenizer, pad_id=pad_id)[0]
+					logging.info(f"Function calling channel: {fc_text}")
 			else:
 				texts_with_timestamps.append("")
 				asr_texts_with_timestamps.append("")

@@ -434,6 +434,8 @@ class NemotronVoicechatInferenceWrapper:
 
             if missing_tts:
                 logging.info(f"  {len(missing_tts)} TTS keys missing")
+                for mk in missing_tts:
+                    logging.info(f"    missing: {mk}")
             if unexpected_tts:
                 logging.info(f"  {len(unexpected_tts)} unexpected TTS keys")
 
@@ -485,6 +487,9 @@ class NemotronVoicechatInferenceWrapper:
         self.model.stt_model.embed_tokens = self.model.stt_model.embed_tokens.to(self.dtype)
         self.model.stt_model.asr_head = self.model.stt_model.asr_head.to(self.dtype)
         self.model.stt_model.embed_asr_tokens = self.model.stt_model.embed_asr_tokens.to(self.dtype)
+        if self.model.stt_model.function_head is not None:
+            self.model.stt_model.function_head = self.model.stt_model.function_head.to(self.dtype)
+            logging.info("function_head converted to %s", self.dtype)
         #self.model.stt_model.perception = self.model.stt_model.perception.to(self.dtype)
         logging.info("S2S components converted, TTS kept in float32")
         logging.info("new update, perception also is kept in float32")
@@ -612,15 +617,20 @@ class NemotronVoicechatInferenceWrapper:
         pad_asr_emb = self.model.stt_model.embed_asr_tokens(pad_token).to(dtype=self.dtype)  # [1, H]
 
         # For positions t > 0, add pad embeddings (simulating gen_text[:, t-1] = pad_id)
+        has_fc = self.model.stt_model.function_head is not None
         if prompt_len > 1:
             prompt_embedded[:, 1:, :] += pad_emb
             prompt_embedded[:, 1:, :] += pad_asr_emb
+            if has_fc:
+                prompt_embedded[:, 1:, :] += pad_emb  # FC channel also uses pad at t > 0
 
         # Step 4: For position 0, add BOS embeddings
         bos_emb = self._get_bos_embedding()  # [1, H]
         asr_bos_emb = self._get_asr_bos_embedding()  # [1, H]
         prompt_embedded[:, 0, :] += bos_emb.squeeze(0)
         prompt_embedded[:, 0, :] += asr_bos_emb.squeeze(0)
+        if has_fc:
+            prompt_embedded[:, 0, :] += pad_emb.squeeze(0)  # FC channel uses pad at t=0
 
         logging.info(f"   System prompt embeddings prepared: shape {prompt_embedded.shape}")
 
@@ -753,6 +763,7 @@ class NemotronVoicechatInferenceWrapper:
                        code=None,
                        subword_mask=None,
                        gen_asr_text=None,
+                       gen_function_text=None,
                        request_id: Optional[str] = None,
                        perception_cache: Optional[PerceptionCacheState] = None,
                        has_prompt: bool = False,
@@ -767,6 +778,7 @@ class NemotronVoicechatInferenceWrapper:
 
         predicted_tokens = torch.empty((batch_size, num_frames_per_chunk), dtype=gen_text.dtype, device=gen_text.device)
         asr_predicted_tokens = torch.empty((batch_size, num_frames_per_chunk), dtype=gen_text.dtype, device=gen_text.device)
+        function_predicted_tokens = torch.empty((batch_size, num_frames_per_chunk), dtype=gen_text.dtype, device=gen_text.device)
 
         # Do "perception" step outside the for-loop
         start_perception = time.time()
@@ -824,10 +836,16 @@ class NemotronVoicechatInferenceWrapper:
 
             current_input_emb = current_frame_embedding.clone()
 
+            has_fc = gen_function_text is not None
+
             if current_frame_idx == 0 and not has_prompt:
                 # Only add BOS if there's no prompt (BOS is already in prompt's position 0)
                 current_input_emb += self._get_bos_embedding()
                 current_input_emb += self._get_asr_bos_embedding()
+                if has_fc:
+                    pad_id = self.model.stt_model.text_pad_id
+                    fc_pad_token = torch.full((1,), fill_value=pad_id, device=self.device, dtype=torch.long)
+                    current_input_emb += self.model.stt_model.embed_tokens(fc_pad_token).to(dtype=self.dtype)
             elif current_frame_idx == 0 and has_prompt:
                 # With prompt: first audio frame uses pad embedding (like offline_inference)
                 # gen_text[:, -1] from prompt positions is pad_id
@@ -837,12 +855,17 @@ class NemotronVoicechatInferenceWrapper:
                 pad_asr_emb = self.model.stt_model.embed_asr_tokens(pad_token).to(dtype=self.dtype)
                 current_input_emb += pad_emb
                 current_input_emb += pad_asr_emb
+                if has_fc:
+                    current_input_emb += self.model.stt_model.embed_tokens(pad_token).to(dtype=self.dtype)
             else:
                 # t > 0: add embeddings from model's own predictions at t-1
                 last_token_emb = self.model.stt_model.embed_tokens(gen_text[:, current_frame_idx - 1])
                 current_input_emb += last_token_emb
                 last_asr_token_emb = self.model.stt_model.embed_asr_tokens(gen_asr_text[:, current_frame_idx - 1])
                 current_input_emb += last_asr_token_emb
+                if has_fc:
+                    last_fc_token_emb = self.model.stt_model.embed_tokens(gen_function_text[:, current_frame_idx - 1])
+                    current_input_emb += last_fc_token_emb.to(dtype=self.dtype)
 
             start_stt_model = time.time()
 
@@ -885,6 +908,11 @@ class NemotronVoicechatInferenceWrapper:
 
             gen_asr_text[:, current_frame_idx] = asr_predicted_token
             asr_predicted_tokens[:, frame_offset] = asr_predicted_token
+
+            if "function_predicted_token" in ans:
+                function_predicted_tokens[:, frame_offset] = ans["function_predicted_token"]
+                if gen_function_text is not None:
+                    gen_function_text[:, current_frame_idx] = ans["function_predicted_token"]
 
             # Apply forced turn taking based on ASR results
             self._maybe_apply_forced_turn_taking(current_frame_idx, gen_text, gen_asr_text)
@@ -1024,7 +1052,7 @@ class NemotronVoicechatInferenceWrapper:
         time_for_one_step = time.time() - start_time_one_step
         logging.info(f'frame {frame_idx}: Time taken for one step: {time_for_one_step:.3f}s')
 
-        return {
+        result = {
             'predicted_text_tokens': predicted_tokens,
             'asr_predicted_text_tokens': asr_predicted_tokens,
             'audio_toks_buffer': audio_toks_buffer,
@@ -1038,6 +1066,9 @@ class NemotronVoicechatInferenceWrapper:
             'perception_cache': perception_cache,
             'codec_cache': codec_cache,
         }
+        if self.model.stt_model.function_head is not None:
+            result['function_predicted_text_tokens'] = function_predicted_tokens
+        return result
 
     def abort_request(self, request_id: Optional[str]) -> bool:
         """
@@ -1330,6 +1361,9 @@ class NemotronVoicechatInferenceWrapper:
 
         gen_text = torch.full((1, total_frames), self.model.stt_model.text_pad_id, device=self.device, dtype=torch.long)
         gen_asr_text = torch.full((1, total_frames), self.model.stt_model.text_pad_id, device=self.device, dtype=torch.long)
+        has_function_head = self.model.stt_model.function_head is not None
+        if has_function_head:
+            gen_function_text = torch.full((1, total_frames), self.model.stt_model.text_pad_id, device=self.device, dtype=torch.long)
 
         # initialize list to which we will append generated audio segments
         audio_segments = []
@@ -1363,6 +1397,7 @@ class NemotronVoicechatInferenceWrapper:
                 code=code if self.decode_audio else None,
                 subword_mask=subword_mask if self.decode_audio else None,
                 gen_asr_text=gen_asr_text,
+                gen_function_text=gen_function_text if has_function_head else None,
                 request_id=stream_request_id,
                 perception_cache=perception_cache,
                 has_prompt=(prompt_len > 0),
@@ -1370,6 +1405,9 @@ class NemotronVoicechatInferenceWrapper:
             )
 
             # handle results from infer_one_step
+            if has_function_head and 'function_predicted_text_tokens' in result:
+                for fi in range(num_frames_per_chunk):
+                    gen_function_text[:, frame_idx + fi] = result['function_predicted_text_tokens'][:, fi]
             input_embeds_history = result['input_embeds_history']
             llm_cache = result['dynamic_cache']
             if self.use_perception_cache:
@@ -1429,6 +1467,13 @@ class NemotronVoicechatInferenceWrapper:
         logging.info(f"Generated text: {text_output[0]}")
         logging.info(f"Generated ASR text: {asr_text_output[0]}")
 
+        # Decode function calling channel
+        if has_function_head:
+            gen_function_text = gen_function_text[:, :total_frames]
+            function_text_output = tokens_to_str(gen_function_text, lengths, tokenizer=self.tokenizer, pad_id=self.model.stt_model.text_pad_id, eval_text_turn_taking=False)
+            function_text_output_raw = tokens_to_str_raw(gen_function_text, lengths, tokenizer=self.tokenizer, pad_id=self.model.stt_model.text_pad_id)
+            logging.info(f"Generated function text: {function_text_output[0]}")
+
         ans = {
             "text": text_output,
             "text_raw": text_output_raw,
@@ -1440,6 +1485,10 @@ class NemotronVoicechatInferenceWrapper:
             "asr_tokens": gen_asr_text,
             "system_prompt": system_prompt if system_prompt else "",
         }
+        if has_function_head:
+            ans["function_text"] = function_text_output
+            ans["function_text_raw"] = function_text_output_raw
+            ans["function_tokens"] = gen_function_text
 
         if self.use_vllm_llm or self.use_vllm_eartts:
             self.abort_request(stream_request_id)

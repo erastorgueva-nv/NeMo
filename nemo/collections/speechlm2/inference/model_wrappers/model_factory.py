@@ -497,13 +497,16 @@ class VllmLLMModel(ModelInterface):
                 current_step=current_step,
             )
 
-        return {
+        ans = {
             "predicted_token": predicted_token,
             "asr_predicted_token": asr_token_ids[-1],
             "cache": None,  # vLLM manages cache internally
             "is_finished": is_finished,
             "request_id": request_id
         }
+        if result and result.custom_outputs and "function_tokens" in result.custom_outputs:
+            ans["function_predicted_token"] = result.custom_outputs["function_tokens"]
+        return ans
 
 
     def to(self, device_or_dtype: Union[torch.device, torch.dtype]) -> 'VLLMModel':
@@ -854,11 +857,14 @@ class NativeModel(ModelInterface):
         # ASR tokens use greedy decoding (no sampling)
         asr_predicted_token = result["asr_logits"][:, -1].argmax(dim=-1)
 
-        return {
+        ans = {
             "predicted_token": predicted_token,
             "asr_predicted_token": asr_predicted_token,
-            "cache": result.get("cache", None)
+            "cache": result.get("cache", None),
         }
+        if "function_logits" in result:
+            ans["function_predicted_token"] = result["function_logits"][:, -1].argmax(dim=-1)
+        return ans
 
     @staticmethod
     def _extract_special_token_ids_from_nemo(model) -> Set[int]:

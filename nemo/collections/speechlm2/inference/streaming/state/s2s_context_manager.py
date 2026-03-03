@@ -31,6 +31,7 @@ class StreamingRealtimeContext:
 	frame_idx: int
 	gen_text: torch.Tensor
 	gen_asr_text: torch.Tensor
+	gen_function_text: Optional[torch.Tensor]
 	audio_toks_buffer: Optional[torch.Tensor]
 	input_embeds_history: List[torch.Tensor]
 	dynamic_cache: Optional[DynamicCache]
@@ -100,6 +101,17 @@ class S2SContextManager:
 			dtype=torch.long,
 		)
 
+		stt_model = getattr(self.s2s_model.model, "stt_model", None)
+		has_function_head = stt_model is not None and getattr(stt_model, "function_head", None) is not None
+		gen_function_text = None
+		if has_function_head:
+			gen_function_text = torch.full(
+				(1, self.max_len),
+				fill_value=self.text_pad_id,
+				device=self.device,
+				dtype=torch.long,
+			)
+
 		dynamic_cache = None if self.cache_disabled else DynamicCache()
 		audio_toks_buffer: Optional[torch.Tensor] = None
 		past_key_values: Any = None
@@ -140,6 +152,7 @@ class S2SContextManager:
 			frame_idx=0,
 			gen_text=gen_text,
 			gen_asr_text=gen_asr_text,
+			gen_function_text=gen_function_text,
 			audio_toks_buffer=audio_toks_buffer,
 			input_embeds_history=[],
 			dynamic_cache=dynamic_cache,
@@ -227,6 +240,14 @@ class S2SContextManager:
 			else:
 				asr_token_slice = asr_predicted_tokens[0:1]
 			context.gen_asr_text[:, start_idx:end_idx] = asr_token_slice.to(context.gen_asr_text.device)
+
+		func_predicted_tokens = step_result.get("function_predicted_text_tokens")
+		if func_predicted_tokens is not None and context.gen_function_text is not None:
+			if func_predicted_tokens.dim() == 1:
+				func_token_slice = func_predicted_tokens.unsqueeze(0)
+			else:
+				func_token_slice = func_predicted_tokens[0:1]
+			context.gen_function_text[:, start_idx:end_idx] = func_token_slice.to(context.gen_function_text.device)
 
 		context.frame_idx = end_idx
 
