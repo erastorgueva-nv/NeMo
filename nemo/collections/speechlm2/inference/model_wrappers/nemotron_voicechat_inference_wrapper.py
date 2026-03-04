@@ -535,6 +535,22 @@ class NemotronVoicechatInferenceWrapper:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 
+            # Set ASR logit boosts as env vars BEFORE creating the vLLM engine,
+            # so they are inherited by the forked worker process.  The modified
+            # nemotron_h.py reads VLLM_ASR_BOOST_<token_id> in __init__.
+            stt = self.model.stt_model
+            boost_map = {
+                "inference_user_pad_boost": stt.text_pad_id,
+                "inference_user_bos_boost": stt.user_bos_id,
+                "inference_user_eos_boost": stt.text_eos_id,
+            }
+            for cfg_key, token_id in boost_map.items():
+                val = self.model_cfg.get(cfg_key, None)
+                if val is not None and float(val) != 0.0:
+                    env_key = f"VLLM_ASR_BOOST_{token_id}"
+                    os.environ[env_key] = str(float(val))
+                    logging.info(f"Set env {env_key}={val} (from {cfg_key})")
+
             self.model_llm_interface = create_model(
                 model=self.model_path,
                 engine_type="vllm_llm",
