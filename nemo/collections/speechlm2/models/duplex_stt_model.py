@@ -304,6 +304,14 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             if self.cfg.get("inference_eos_boost", None):
                 text_logits[:, :, self.text_eos_id] += self.cfg.inference_eos_boost
 
+            if self.predict_user_text:
+                if self.cfg.get("inference_user_pad_boost", None):
+                    asr_logits[:, :, self.text_pad_id] += self.cfg.inference_user_pad_boost
+                if self.cfg.get("inference_user_bos_boost", None):
+                    asr_logits[:, :, self.user_bos_id] += self.cfg.inference_user_bos_boost
+                if self.cfg.get("inference_user_eos_boost", None):
+                    asr_logits[:, :, self.text_eos_id] += self.cfg.inference_user_eos_boost
+
         ans = {"text_logits": text_logits}
         if self.predict_user_text:
             ans["asr_logits"] = asr_logits

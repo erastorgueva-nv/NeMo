@@ -500,10 +500,29 @@ class NemotronVoicechatInferenceWrapper:
         #self.model.on_train_epoch_start()
         self.tokenizer = self.model.stt_model.tokenizer
 
+
+        # allow overrides/additions from the self.model_cfg of nemotron_voicechat_inference_wrapper,
+        # into the model cfg that is read from config.json of the model.
+        # Specifically, this is so that we can specify inference_pad_boost, ... etc.
+        for key in (
+            "inference_pad_boost",
+            "inference_bos_boost",
+            "inference_eos_boost",
+            "inference_user_pad_boost",
+            "inference_user_bos_boost",
+            "inference_user_eos_boost",
+        ):
+            val = self.model_cfg.get(key, None)
+            if val is not None:
+                OmegaConf.update(self.model.stt_model.cfg, key, val)
+
         # Print inference boost values
         logging.info(f"inference_eos_boost: {self.model.stt_model.cfg.get('inference_eos_boost', None)}")
         logging.info(f"inference_bos_boost: {self.model.stt_model.cfg.get('inference_bos_boost', None)}")
         logging.info(f"inference_pad_boost: {self.model.stt_model.cfg.get('inference_pad_boost', None)}")
+        logging.info(f"inference_user_pad_boost: {self.model.stt_model.cfg.get('inference_user_pad_boost', None)}")
+        logging.info(f"inference_user_bos_boost: {self.model.stt_model.cfg.get('inference_user_bos_boost', None)}")
+        logging.info(f"inference_user_eos_boost: {self.model.stt_model.cfg.get('inference_user_eos_boost', None)}")
 
         # Wrap model with appropriate interface (Native or vLLM)
         if self.use_vllm_llm:
@@ -1131,7 +1150,7 @@ class NemotronVoicechatInferenceWrapper:
             # Require that the pad window starts after a non-pad token
             if has_pad_window and pad_lookback_start > 0:
                 token_before_window = gen_asr[batch_idx, pad_lookback_start - 1]
-                has_pad_window = (token_before_window != self.model.stt_model.text_pad_id) and (token_before_window != self.model.stt_model.text_bos_id)
+                has_pad_window = (token_before_window != self.model.stt_model.text_pad_id) and (token_before_window != self.model.stt_model.user_bos_id)
             elif has_pad_window and pad_lookback_start == 0:
                 # If the pad window starts at position 0, it doesn't meet the requirement
                 has_pad_window = False
