@@ -121,10 +121,11 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 		# ------------------------------------------------------------------
 		# Input audio padding (silence appended after real audio)
 		# ------------------------------------------------------------------
-		self.pad_to_duration_secs: float | None = cfg.get("pad_to_duration_secs", None)
+		self.pad_audio_to_sec: float | None = cfg.get("pad_audio_to_sec", None)
 		self.pad_silence_ratio: float | None = cfg.get("pad_silence_ratio", None)
-		if self.pad_to_duration_secs and self.pad_silence_ratio:
-			raise ValueError("Set pad_to_duration_secs or pad_silence_ratio, not both")
+		self.pad_audio_by_sec: float | None = cfg.get("pad_audio_by_sec", None)
+		if sum(x is not None for x in [self.pad_audio_to_sec, self.pad_silence_ratio, self.pad_audio_by_sec]) > 1:
+			raise ValueError("Set at most one of: pad_audio_to_sec, pad_silence_ratio, pad_audio_by_sec")
 
 		super().__init__()
 
@@ -533,7 +534,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 			# Padding is generated immediately (same iteration) to avoid
 			# the next stream's setup destroying this stream's context.
 			pad_targets: dict[int, float] = {}
-			if self.pad_to_duration_secs or self.pad_silence_ratio:
+			if self.pad_audio_to_sec or self.pad_silence_ratio or self.pad_audio_by_sec:
 				processed_frames = []
 				for frame in frames:
 					if frame.is_last:
@@ -741,10 +742,12 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
 	def _padding_remaining_secs(self, elapsed_secs: float) -> float:
 		"""Return how many seconds of silence padding are still needed."""
-		if self.pad_to_duration_secs is not None:
-			return max(0.0, self.pad_to_duration_secs - elapsed_secs)
+		if self.pad_audio_to_sec is not None:
+			return max(0.0, self.pad_audio_to_sec - elapsed_secs)
 		if self.pad_silence_ratio is not None:
 			return elapsed_secs * self.pad_silence_ratio
+		if self.pad_audio_by_sec is not None:
+			return self.pad_audio_by_sec
 		return 0.0
 
 	def _request_id_for_stream(self, stream_id: int) -> str:

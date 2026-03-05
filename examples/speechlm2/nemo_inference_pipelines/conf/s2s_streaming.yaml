@@ -18,8 +18,9 @@ audio_file: ???
 output_dir: ./generated
 
 # Input audio padding (set at most one; null = disabled)
-pad_to_duration_secs: null   # Pad each audio to this fixed duration (seconds)
+pad_audio_to_sec: null       # Pad each audio to this fixed duration (seconds)
 pad_silence_ratio: null      # Append silence = ratio * original duration (e.g. 0.2 = 20%)
+pad_audio_by_sec: null       # Append this fixed number of extra seconds of silence
 
 pipeline_type: s2s_streaming
 

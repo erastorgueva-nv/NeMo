@@ -1183,7 +1183,7 @@ class NemotronVoicechatInferenceWrapper:
                     logging.info(f"Forced turn-taking at frame {t}: inserted agent EOS (reason: user started speaking)")
 
     @torch.no_grad()
-    def inference_realtime_streaming(self, audio_path: str, num_frames_per_chunk: int = None, request_id: Optional[str] = None, pad_audio_to_sec: Optional[float] = None, system_prompt: Optional[str] = None):
+    def inference_realtime_streaming(self, audio_path: str, num_frames_per_chunk: int = None, request_id: Optional[str] = None, pad_audio_to_sec: Optional[float] = None, pad_silence_ratio: Optional[float] = None, pad_audio_by_sec: Optional[float] = None, system_prompt: Optional[str] = None):
         """
         Perform realtime streaming inference simulating microphone capture.
 
@@ -1192,6 +1192,8 @@ class NemotronVoicechatInferenceWrapper:
             num_frames_per_chunk: Number of frames to process per inference step (default: 1)
             request_id: Optional request ID for vLLM streaming
             pad_audio_to_sec: Optional duration to pad audio to (in seconds)
+            pad_silence_ratio: Optional ratio of original duration to append as silence (e.g. 0.2 = 20%)
+            pad_audio_by_sec: Optional fixed number of extra seconds of silence to append
             system_prompt: Optional system prompt to provide context to the model
 
         Returns:
@@ -1257,12 +1259,22 @@ class NemotronVoicechatInferenceWrapper:
         logging.info(f"   Total duration: {total_duration:.2f}s")
         logging.info(f"   Total samples: {total_samples}")
 
-        # Optionally pad audio to a specific duration
+        # Optionally pad audio (at most one of these is set; enforced by caller)
         if pad_audio_to_sec is not None and pad_audio_to_sec > total_duration:
             target_samples = int(pad_audio_to_sec * SAMPLE_RATE)
             audio_signal = np.pad(audio_signal, (0, target_samples - total_samples), mode='constant')
             total_samples = len(audio_signal)
             logging.info(f"   Padded to {pad_audio_to_sec:.2f}s ({total_samples} samples)")
+        elif pad_silence_ratio is not None:
+            extra_samples = int(total_duration * pad_silence_ratio * SAMPLE_RATE)
+            audio_signal = np.pad(audio_signal, (0, extra_samples), mode='constant')
+            total_samples = len(audio_signal)
+            logging.info(f"   Padded with {pad_silence_ratio*100:.1f}% extra silence ({extra_samples} samples)")
+        elif pad_audio_by_sec is not None:
+            extra_samples = int(pad_audio_by_sec * SAMPLE_RATE)
+            audio_signal = np.pad(audio_signal, (0, extra_samples), mode='constant')
+            total_samples = len(audio_signal)
+            logging.info(f"   Padded with {pad_audio_by_sec:.2f}s extra silence ({extra_samples} samples)")
 
         # derive num_inference_steps
         total_frames_maybe = int(np.ceil(total_samples / FRAME_SIZE_SAMPLES)) # "maybe" because we might need to add padding
@@ -1547,6 +1559,10 @@ def main():
                        help="Output directory for audio files and JSON results")
     parser.add_argument("--pad_audio_to_sec", type=float, default=None,
                        help="Pad audio to this duration in seconds (useful for consistent buffer behavior)")
+    parser.add_argument("--pad_silence_ratio", type=float, default=None,
+                       help="Append silence equal to this ratio of the original audio duration (e.g. 0.2 = 20%% extra)")
+    parser.add_argument("--pad_audio_by_sec", type=float, default=None,
+                       help="Append this many seconds of extra silence after the audio")
     parser.add_argument("--speaker_reference", type=str, required=True,
                        help="Path to speaker reference audio file")
     parser.add_argument("--buffer_size_frames", type=int, default=DEFAULT_BUFFER_SIZE_FRAMES,
@@ -1603,6 +1619,9 @@ def main():
         parser.error("Either --audio_path (single-file mode) or --input_json (batch mode) must be provided")
     if args.audio_path is not None and args.input_json is not None:
         parser.error("Cannot use both --audio_path and --input_json at the same time")
+
+    if sum(x is not None for x in [args.pad_audio_to_sec, args.pad_silence_ratio, args.pad_audio_by_sec]) > 1:
+        raise ValueError("Set at most one of: --pad_audio_to_sec, --pad_silence_ratio, --pad_audio_by_sec")
 
     try:
         import json
@@ -1712,6 +1731,8 @@ def main():
                     audio_path,
                     num_frames_per_chunk=args.num_frames_per_chunk,
                     pad_audio_to_sec=args.pad_audio_to_sec,
+                    pad_silence_ratio=args.pad_silence_ratio,
+                    pad_audio_by_sec=args.pad_audio_by_sec,
                     request_id=f"streaming_request_{idx}",
                     system_prompt=record_system_prompt,
                 )

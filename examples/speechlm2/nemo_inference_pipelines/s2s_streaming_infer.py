@@ -112,18 +112,21 @@ def calculate_duration(audio_filepaths: List[str]) -> float:
 
 def calculate_padded_duration(
     audio_filepaths: List[str],
-    pad_to_duration_secs: float | None = None,
+    pad_audio_to_sec: float | None = None,
     pad_silence_ratio: float | None = None,
+    pad_audio_by_sec: float | None = None,
 ) -> float:
     """Calculate total duration including padding for RTFX reporting."""
     total = 0.0
     for fp in audio_filepaths:
         sound = sf.SoundFile(fp)
         orig = sound.frames / sound.samplerate
-        if pad_to_duration_secs is not None:
-            total += max(orig, pad_to_duration_secs)
+        if pad_audio_to_sec is not None:
+            total += max(orig, pad_audio_to_sec)
         elif pad_silence_ratio is not None:
             total += orig * (1 + pad_silence_ratio)
+        elif pad_audio_by_sec is not None:
+            total += orig + pad_audio_by_sec
         else:
             total += orig
     return total
@@ -227,10 +230,11 @@ def main(cfg: DictConfig):
     logging.info(f"Generated {len(audio_filepaths)} files in {exec_dur:.2f}s")
 
     # Log RTFX (accounts for padding when configured)
-    pad_to = cfg.get("pad_to_duration_secs", None)
+    pad_to = cfg.get("pad_audio_to_sec", None)
     pad_ratio = cfg.get("pad_silence_ratio", None)
-    if pad_to or pad_ratio:
-        data_dur = calculate_padded_duration(audio_filepaths, pad_to, pad_ratio)
+    pad_by = cfg.get("pad_audio_by_sec", None)
+    if pad_to or pad_ratio or pad_by:
+        data_dur = calculate_padded_duration(audio_filepaths, pad_to, pad_ratio, pad_by)
     else:
         data_dur = calculate_duration(audio_filepaths)
     rtfx = data_dur / exec_dur if exec_dur > 0 else float('inf')
