@@ -23,6 +23,7 @@ import re
 import os
 import sys
 import argparse
+import math
 import torchaudio
 import functools
 from dataclasses import dataclass
@@ -183,7 +184,7 @@ class NemotronVoicechatInferenceWrapper:
         logging.info(f"Compute dtype: {self.dtype}")
         logging.info(f"Decode audio: {self.decode_audio}")
         logging.info(f"Engine type: {model_cfg.get('engine_type', 'native')}")
-        logging.info(f"Sampling - top_p: {model_cfg.get('top_p', 1.0)}, repetition_penalty: {model_cfg.get('repetition_penalty', 1.0)}")
+        logging.info(f"Sampling - top_p: {model_cfg.get('top_p', 1.0)}, repetition_penalty: {model_cfg.get('repetition_penalty', 1.0)}, temperature: {model_cfg.get('temperature', 1.0)}")
         logging.info("=" * 70)
 
         # Cached TTS helpers populated during initialization/warmup
@@ -208,6 +209,7 @@ class NemotronVoicechatInferenceWrapper:
         # Sampling parameters
         self.top_p = float(model_cfg.get("top_p", 1.0))
         self.repetition_penalty = float(model_cfg.get("repetition_penalty", 1.0))
+        self.temperature = float(model_cfg.get("temperature", 1.0))
 
         # Codec streaming cache: decode only new tokens each step using the
         # codec's CausalConv1dCache, which maintains ConvNeXt and ISTFT state
@@ -556,7 +558,8 @@ class NemotronVoicechatInferenceWrapper:
                 engine_type="vllm_llm",
                 vllm_config=self.vllm_llm_config,
                 top_p=self.top_p,
-                repetition_penalty=self.repetition_penalty
+                repetition_penalty=self.repetition_penalty,
+                temperature=self.temperature,
             )
 
             logging.info("VllmLLMModel interface created")
@@ -566,7 +569,8 @@ class NemotronVoicechatInferenceWrapper:
                 model=self.model,
                 engine_type="native",
                 top_p=self.top_p,
-                repetition_penalty=self.repetition_penalty
+                repetition_penalty=self.repetition_penalty,
+                temperature=self.temperature,
             )
             logging.info("NativeModel interface created")
 
@@ -1606,6 +1610,8 @@ def main():
                        help="Top-p (nucleus) sampling threshold. 1.0 disables it (greedy). Default: 1.0")
     parser.add_argument("--repetition_penalty", type=float, default=1.0,
                        help="Repetition penalty for generated tokens. 1.0 disables it. Default: 1.0. Recommended: 1.2")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                       help="Temperature for sampling. 1.0 = no change, <1.0 = sharper, >1.0 = flatter, 0.0 = greedy. Default: 1.0")
 
     # System prompt
     parser.add_argument("--system_prompt", type=str, default=None,
@@ -1622,6 +1628,8 @@ def main():
 
     if sum(x is not None for x in [args.pad_audio_to_sec, args.pad_silence_ratio, args.pad_audio_by_sec]) > 1:
         raise ValueError("Set at most one of: --pad_audio_to_sec, --pad_silence_ratio, --pad_audio_by_sec")
+    if not math.isfinite(args.temperature) or args.temperature < 0.0:
+        parser.error(f"--temperature must be a finite value >= 0.0, got {args.temperature}")
 
     try:
         import json
@@ -1639,6 +1647,7 @@ def main():
             "use_codec_cache": bool(args.use_codec_cache),
             "top_p": args.top_p,
             "repetition_penalty": args.repetition_penalty,
+            "temperature": args.temperature,
             "tts_system_prompt": args.tts_system_prompt,
         }
 

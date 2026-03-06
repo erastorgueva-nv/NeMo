@@ -66,6 +66,7 @@ s2s:
 
   top_p: 1.0
   repetition_penalty: 1.0
+  temperature: 1.0
   force_turn_taking: true
   force_turn_taking_threshold: 40
   force_turn_taking_pad_window: 25

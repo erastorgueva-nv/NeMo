@@ -34,6 +34,7 @@ Usage Example:
 
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, Union, Set
+import math
 import os
 import torch
 from transformers import DynamicCache
@@ -56,6 +57,7 @@ class ModelInterface(ABC):
         special_token_ids: Optional[Set[int]] = None,
         top_p: float = 1.0,
         repetition_penalty: float = 1.0,
+        temperature: float = 1.0,
     ):
         """
         Initialize base interface with sampling parameters.
@@ -65,10 +67,18 @@ class ModelInterface(ABC):
                                These tokens will use greedy decoding and won't be penalized.
             top_p: Top-p (nucleus) sampling threshold. 1.0 disables it (greedy). Default: 1.0
             repetition_penalty: Penalty for repeated tokens. 1.0 disables it. Default: 1.0
+            temperature: Temperature for sampling. 1.0 = no change, <1.0 = sharper, >1.0 = flatter.
+                        0.0 = greedy (argmax). Default: 1.0
         """
+        if not math.isfinite(temperature):
+            raise ValueError(f"temperature must be finite, got {temperature}")
+        if temperature < 0.0:
+            raise ValueError(f"temperature must be >= 0.0, got {temperature}")
+
         self.special_token_ids = special_token_ids if special_token_ids is not None else set()
         self.top_p = top_p
         self.repetition_penalty = repetition_penalty
+        self.temperature = temperature
 
     def _sample_text_token(
         self,
@@ -95,7 +105,11 @@ class ModelInterface(ABC):
         greedy_tokens = logits.argmax(dim=-1)  # (B,)
 
         # If no sampling needed (all disabled), return greedy
-        if self.top_p >= 1.0 and self.repetition_penalty == 1.0:
+        if self.top_p >= 1.0 and self.repetition_penalty == 1.0 and (self.temperature == 1.0 or self.temperature == 0.0):
+            return greedy_tokens
+
+        # temperature=0 means greedy
+        if self.temperature == 0.0:
             return greedy_tokens
 
         # For each batch, if greedy is special token, use greedy; otherwise sample
@@ -127,6 +141,10 @@ class ModelInterface(ABC):
                         batch_logits[token_id] = batch_logits[token_id] / self.repetition_penalty
                     else:
                         batch_logits[token_id] = batch_logits[token_id] * self.repetition_penalty
+
+            # Apply temperature scaling
+            if self.temperature != 1.0:
+                batch_logits = batch_logits / self.temperature
 
             # Apply top-p sampling
             if self.top_p < 1.0:
@@ -229,6 +247,7 @@ class VllmLLMModel(ModelInterface):
         special_token_ids: Optional[Set[int]] = None,
         top_p: float = 1.0,
         repetition_penalty: float = 1.0,
+        temperature: float = 1.0,
         model_type: str = "llm",
         **sampling_kwargs
     ):
@@ -246,6 +265,7 @@ class VllmLLMModel(ModelInterface):
             special_token_ids: Set of special token IDs (for potential post-processing)
             top_p: Top-p sampling (currently vLLM uses greedy decoding)
             repetition_penalty: Repetition penalty (currently not used by vLLM engine)
+            temperature: Temperature for sampling. Applied in _sample_text_token, not in vLLM engine.
             model_type: Type of model for vLLM engine ("llm", "chatglm", etc.)
             **sampling_kwargs: Additional sampling parameters passed to vLLM engine.
                                By default, vLLM uses greedy decoding (temperature=0)
@@ -254,7 +274,8 @@ class VllmLLMModel(ModelInterface):
         super().__init__(
             special_token_ids=special_token_ids,
             top_p=top_p,
-            repetition_penalty=repetition_penalty
+            repetition_penalty=repetition_penalty,
+            temperature=temperature,
         )
 
         import asyncio
@@ -482,7 +503,7 @@ class VllmLLMModel(ModelInterface):
         text_logits = result.custom_outputs["text_logits"] if result else None
 
         predicted_token = text_token_ids[-1]
-        if self.top_p < 1.0 or self.repetition_penalty != 1.0:
+        if self.top_p < 1.0 or self.repetition_penalty != 1.0 or (self.temperature != 1.0 and self.temperature != 0.0):
             # Use provided generated_tokens or create empty tensor
             batch_size = text_logits.shape[0]
             if generated_tokens is None:
@@ -761,6 +782,7 @@ class NativeModel(ModelInterface):
         special_token_ids: Optional[Set[int]] = None,
         top_p: float = 1.0,
         repetition_penalty: float = 1.0,
+        temperature: float = 1.0,
     ):
         """
         Initialize with an existing model.
@@ -775,6 +797,8 @@ class NativeModel(ModelInterface):
             top_p: Top-p (nucleus) sampling threshold. 1.0 disables it (greedy). Default: 1.0
             repetition_penalty: Penalty for repeated tokens. 1.0 disables it. Default: 1.0
                                Recommended value when enabling: 1.2
+            temperature: Temperature for sampling. 1.0 = no change, <1.0 = sharper, >1.0 = flatter.
+                        0.0 = greedy (argmax). Default: 1.0
         """
         # Default special token IDs: bos=1, eos=2, pad=12
         DEFAULT_SPECIAL_TOKEN_IDS = {1, 2, 12}
@@ -789,7 +813,8 @@ class NativeModel(ModelInterface):
         super().__init__(
             special_token_ids=special_token_ids,
             top_p=top_p,
-            repetition_penalty=repetition_penalty
+            repetition_penalty=repetition_penalty,
+            temperature=temperature,
         )
 
         self.model = model
@@ -797,10 +822,11 @@ class NativeModel(ModelInterface):
         logging.debug(f"Special token IDs: {self.special_token_ids}")
 
         # Validate: if sampling is enabled, special_token_ids should be set
-        if (top_p < 1.0 or repetition_penalty != 1.0) and not self.special_token_ids:
+        sampling_active = top_p < 1.0 or repetition_penalty != 1.0 or (temperature != 1.0 and temperature != 0.0)
+        if sampling_active and not self.special_token_ids:
             import warnings
             warnings.warn(
-                "Sampling is enabled (top_p < 1.0 or repetition_penalty != 1.0) but special_token_ids is empty. "
+                "Sampling is enabled but special_token_ids is empty. "
                 "Could not auto-extract from model.tokenizer. "
                 "Please provide special_token_ids manually to ensure special tokens use greedy decoding. "
                 "Otherwise, EOS tokens may be randomly sampled and generation may not stop properly!"
@@ -943,6 +969,7 @@ def create_model(
     special_token_ids: Optional[Set[int]] = None,
     top_p: float = 1.0,
     repetition_penalty: float = 1.0,
+    temperature: float = 1.0,
     **kwargs
 ) -> ModelInterface:
     """
@@ -960,6 +987,7 @@ def create_model(
                           You can manually provide: {tokenizer.pad_token_id, tokenizer.eos_token_id, tokenizer.bos_token_id}
         top_p: Top-p (nucleus) sampling threshold. 1.0 disables it (greedy). Default: 1.0
         repetition_penalty: Penalty for repeated tokens. 1.0 disables it. Default: 1.0
+        temperature: Temperature for sampling. 1.0 = no change, 0.0 = greedy. Default: 1.0
         **kwargs: Additional arguments passed to the interface constructor
 
     Returns:
@@ -1027,6 +1055,7 @@ def create_model(
             special_token_ids=special_token_ids,
             top_p=top_p,
             repetition_penalty=repetition_penalty,
+            temperature=temperature,
         )
 
     elif engine_type == "vllm_eartts":
@@ -1039,6 +1068,7 @@ def create_model(
             special_token_ids=special_token_ids,
             top_p=top_p,
             repetition_penalty=repetition_penalty,
+            temperature=temperature,
             **kwargs
         )
 
@@ -1052,6 +1082,7 @@ def create_model(
             special_token_ids=special_token_ids,
             top_p=top_p,
             repetition_penalty=repetition_penalty,
+            temperature=temperature,
             **kwargs
         )
 
