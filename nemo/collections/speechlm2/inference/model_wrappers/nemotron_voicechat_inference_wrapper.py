@@ -1613,6 +1613,28 @@ def main():
     parser.add_argument("--temperature", type=float, default=1.0,
                        help="Temperature for sampling. 1.0 = no change, <1.0 = sharper, >1.0 = flatter, 0.0 = greedy. Default: 1.0")
 
+    # Turn-taking
+    parser.add_argument("--force_turn_taking", action="store_true",
+                       help="Enable forced turn-taking based on ASR channel tokens")
+    parser.add_argument("--force_turn_taking_threshold", type=int, default=40,
+                       help="Number of lookback steps for turn-taking detection (default: 40)")
+    parser.add_argument("--force_turn_taking_pad_window", type=int, default=25,
+                       help="Number of consecutive ASR pad tokens to trigger turn-taking (default: 25)")
+
+    # Inference logit boosts
+    parser.add_argument("--inference_pad_boost", type=float, default=None,
+                       help="Boost for agent pad logit at inference time")
+    parser.add_argument("--inference_bos_boost", type=float, default=None,
+                       help="Boost for agent BOS logit at inference time")
+    parser.add_argument("--inference_eos_boost", type=float, default=None,
+                       help="Boost for agent EOS logit at inference time")
+    parser.add_argument("--inference_user_pad_boost", type=float, default=None,
+                       help="Boost for ASR pad logit at inference time")
+    parser.add_argument("--inference_user_bos_boost", type=float, default=None,
+                       help="Boost for ASR BOS logit at inference time")
+    parser.add_argument("--inference_user_eos_boost", type=float, default=None,
+                       help="Boost for ASR EOS logit at inference time")
+
     # System prompt
     parser.add_argument("--system_prompt", type=str, default=None,
                        help="System prompt to provide context to the model. Can also be specified per-record in input JSON.")
@@ -1649,6 +1671,15 @@ def main():
             "repetition_penalty": args.repetition_penalty,
             "temperature": args.temperature,
             "tts_system_prompt": args.tts_system_prompt,
+            "force_turn_taking": args.force_turn_taking,
+            "force_turn_taking_threshold": args.force_turn_taking_threshold,
+            "force_turn_taking_pad_window": args.force_turn_taking_pad_window,
+            "inference_pad_boost": args.inference_pad_boost,
+            "inference_bos_boost": args.inference_bos_boost,
+            "inference_eos_boost": args.inference_eos_boost,
+            "inference_user_pad_boost": args.inference_user_pad_boost,
+            "inference_user_bos_boost": args.inference_user_bos_boost,
+            "inference_user_eos_boost": args.inference_user_eos_boost,
         }
 
         # Pop GPU memory utilization values: first for LLM, second (or same) for TTS
