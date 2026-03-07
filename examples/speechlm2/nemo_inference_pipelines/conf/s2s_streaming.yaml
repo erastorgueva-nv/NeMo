@@ -64,15 +64,16 @@ s2s:
   use_codec_cache: true                       # Incremental codec decode to remove clicking sounds and wasted computation
                                               # (when true, codec_token_history_size is unused)
 
-  top_p: 1.0
-  repetition_penalty: 1.0
-  temperature: 1.0
+  # sampling parameters. if set all to 1.0, it will be greedy decoding.
+  top_p: 0.5
+  repetition_penalty: 1.1
+  temperature: 0.3
   force_turn_taking: true
   force_turn_taking_threshold: 40
   force_turn_taking_pad_window: 25
 
   # Inference logit boosts (applied to model logits at inference time)
-  inference_user_pad_boost: 0.2         # Boost ASR pad logit
+  inference_user_pad_boost: 0.8         # Boost ASR pad logit
   inference_user_bos_boost: null         # Boost ASR BOS logit
   inference_user_eos_boost: null         # Boost ASR EOS logit
 
