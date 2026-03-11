@@ -64,6 +64,12 @@ s2s:
   use_codec_cache: true                       # Incremental codec decode to remove clicking sounds and wasted computation
                                               # (when true, codec_token_history_size is unused)
 
+  # Deterministic inference (native engine only). Ensures identical results across
+  # runs by disabling FlashAttention and forcing deterministic CUDA algorithms.
+  # Trade-offs: slower inference, might be worse results than non-deterministic mode, since
+  # non-deterministic mode was used in training.
+  deterministic: false
+
   # sampling parameters. if set all to 1.0, it will be greedy decoding.
   top_p: 0.5
   repetition_penalty: 1.1

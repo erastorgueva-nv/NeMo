@@ -137,10 +137,38 @@ class NemotronVoicechatInferenceWrapper:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.set_float32_matmul_precision("medium")
 
-        logging.info(f"after setting - torch.backends.cudnn.allow_tf32: {torch.backends.cudnn.allow_tf32}")
-        logging.info(f"after setting - torch.backends.cuda.matmul.allow_tf32: {torch.backends.cuda.matmul.allow_tf32}")
-        logging.info(f"after setting - torch.get_float32_matmul_precision(): {torch.get_float32_matmul_precision()}")
+        self._deterministic = bool(model_cfg.get("deterministic", False))
+        if self._deterministic:
+            engine_type = model_cfg.get("engine_type", "native")
+            if "vllm" in engine_type.lower():
+                raise ValueError(
+                    "`deterministic` is not compatible with vLLM engines because vLLM uses custom "
+                    "CUDA kernels (PagedAttention, FlashAttention) that do not support deterministic mode. "
+                    f"Got engine_type='{engine_type}'. Use engine_type='native' for deterministic inference."
+                )
 
+            # Required by torch.use_deterministic_algorithms for cuBLAS reproducibility
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+            torch.manual_seed(0)
+            torch.cuda.manual_seed_all(0)
+            torch.backends.cuda.enable_flash_sdp(False)
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+            torch.use_deterministic_algorithms(True, warn_only=False)
+
+            logging.info("Deterministic mode ENABLED")
+            logging.info(f"  CUBLAS_WORKSPACE_CONFIG={os.environ.get('CUBLAS_WORKSPACE_CONFIG')}")
+            logging.info(f"  flash_sdp enabled: {torch.backends.cuda.flash_sdp_enabled()}")
+            logging.info(f"  mem_efficient_sdp enabled: {torch.backends.cuda.mem_efficient_sdp_enabled()}")
+            logging.info(
+                "  NOTE: deterministic mode uses different CUDA kernels (e.g. math SDPA instead of "
+                "FlashAttention), so results may differ slightly from non-deterministic mode. "
+                "Inference will also be slower."
+            )
+
+        logging.info(f"torch.backends.cudnn.allow_tf32: {torch.backends.cudnn.allow_tf32}")
+        logging.info(f"torch.backends.cuda.matmul.allow_tf32: {torch.backends.cuda.matmul.allow_tf32}")
+        logging.info(f"torch.get_float32_matmul_precision(): {torch.get_float32_matmul_precision()}")
 
         self.model_cfg = model_cfg
 
@@ -1591,6 +1619,12 @@ def main():
     parser.add_argument("--combine_inp_out_audio", action="store_true",
                        help="Whether to combine input and output audio into a stereo file")
 
+    # Deterministic inference
+    parser.add_argument("--deterministic", action="store_true",
+                       help="Enable fully deterministic inference (disables FlashAttention, forces deterministic "
+                            "CUDA algorithms). Useful for reproducible benchmarking. Not compatible with vLLM engines. "
+                            "Note: results may differ slightly from non-deterministic mode due to different compute path.")
+
     # Perception cache argument
     parser.add_argument("--use_perception_cache", action="store_true",
                        help="Enable cache-aware streaming for perception encoder")
@@ -1677,6 +1711,7 @@ def main():
             "buffer_size_frames": args.buffer_size_frames,
             "decode_audio": bool(args.decode_audio),
             "engine_type": args.engine_type,
+            "deterministic": bool(args.deterministic),
             "use_perception_cache": bool(args.use_perception_cache),
             "use_perception_cudagraph": bool(args.use_perception_cudagraph),
             "use_codec_cache": bool(args.use_codec_cache),
