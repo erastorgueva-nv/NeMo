@@ -31,7 +31,7 @@ from nemo.collections.asr.inference.utils.progressbar import ProgressBar
 from nemo.collections.speechlm2.inference.pipelines.s2s_pipeline_interface import S2SPipelineInterface
 from nemo.collections.speechlm2.inference.streaming.state.s2s_state import S2SStreamingState
 from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_inference_wrapper import NemotronVoicechatInferenceWrapper, tokens_to_str_raw
-from nemo.collections.speechlm2.models.duplex_s2s_model import tokens_to_str
+from nemo.collections.speechlm2.parts.text_utils import tokens_to_str
 from nemo.collections.speechlm2.inference.streaming.state.s2s_context_manager import S2SContextManager
 from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
 from nemo.collections.speechlm2.inference.utils.pipeline_utils import PipelineOutput

@@ -44,7 +44,7 @@ os.environ.setdefault("NEMO_NLP_TMP", os.path.join(_default_cache, "nemo_nlp_tmp
 
 from nemo.collections.speechlm2.models.nemotron_voicechat import NemotronVoiceChat
 
-from nemo.collections.speechlm2.models.duplex_s2s_model import tokens_to_str
+from nemo.collections.speechlm2.parts.text_utils import tokens_to_str
 from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.audio.parts.utils.transforms import resample
 from nemo.collections.speechlm2.inference.model_wrappers.model_factory import create_model
@@ -190,8 +190,9 @@ class NemotronVoicechatInferenceWrapper:
         )
 
         self.speaker_reference = model_cfg.get("speaker_reference")
-        if self.decode_audio and not self.speaker_reference:
-            raise ValueError("`model_cfg.speaker_reference` must be provided when decode_audio is enabled.")
+        self.speaker_name = model_cfg.get("speaker_name", None)
+        if self.decode_audio and not self.speaker_reference and not self.speaker_name:
+            raise ValueError("`model_cfg.speaker_reference` or `model_cfg.speaker_name` must be provided when decode_audio is enabled.")
 
         self.tts_system_prompt = model_cfg.get("tts_system_prompt", None)
         logging.info(f"TTS system prompt: {self.tts_system_prompt}")
@@ -572,7 +573,7 @@ class NemotronVoicechatInferenceWrapper:
             stt = self.model.stt_model
             asr_boost_map = {
                 "inference_user_pad_boost": stt.text_pad_id,
-                "inference_user_bos_boost": stt.user_bos_id,
+                "inference_user_bos_boost": stt.text_bos_id,
                 "inference_user_eos_boost": stt.text_eos_id,
             }
             for cfg_key, token_id in asr_boost_map.items():
@@ -741,18 +742,22 @@ class NemotronVoicechatInferenceWrapper:
 
         logging.info("Preparing TTS warmup state...")
 
-        with fp32_precision():
-            speaker_audio, speaker_sr = torchaudio.load(self.speaker_reference)
-            speaker_audio = resample(speaker_audio, speaker_sr, self.model.tts_model.target_sample_rate)
+        if self.speaker_name is not None:
+            logging.info(f"Using registered speaker name: {self.speaker_name}")
+            speaker_audio = None
+            speaker_audio_lens = None
+        else:
+            with fp32_precision():
+                speaker_audio, speaker_sr = torchaudio.load(self.speaker_reference)
+                speaker_audio = resample(speaker_audio, speaker_sr, self.model.tts_model.target_sample_rate)
+            speaker_audio = speaker_audio.to(self.device)
+            speaker_audio_lens = torch.tensor([speaker_audio.size(1)], device=self.device).long()
 
-        speaker_audio = speaker_audio.to(self.device)
-        speaker_audio_lens = torch.tensor([speaker_audio.size(1)], device=self.device).long()
-
-        #  init tts_model
         self.model.tts_model.set_init_inputs(
             speaker_audio=speaker_audio,
             speaker_audio_lens=speaker_audio_lens,
             system_prompt=self.tts_system_prompt,
+            speaker_name=self.speaker_name,
         )
         init_inputs = self.model.tts_model.get_init_inputs(B=1)
 
@@ -1211,7 +1216,7 @@ class NemotronVoicechatInferenceWrapper:
             # Require that the pad window starts after a non-pad token
             if has_pad_window and pad_lookback_start > 0:
                 token_before_window = gen_asr[batch_idx, pad_lookback_start - 1]
-                has_pad_window = (token_before_window != self.model.stt_model.text_pad_id) and (token_before_window != self.model.stt_model.user_bos_id)
+                has_pad_window = (token_before_window != self.model.stt_model.text_pad_id) and (token_before_window != self.model.stt_model.text_bos_id)
             elif has_pad_window and pad_lookback_start == 0:
                 # If the pad window starts at position 0, it doesn't meet the requirement
                 has_pad_window = False
@@ -1222,7 +1227,7 @@ class NemotronVoicechatInferenceWrapper:
                     logging.info(f"Forced turn-taking at frame {t}: inserted agent BOS (reason: pad window)")
 
             # ASR BOS → insert agent EOS if not present in window
-            elif current_asr_token == self.model.stt_model.user_bos_id:
+            elif current_asr_token == self.model.stt_model.text_bos_id:
                 if not (agent_text_window == self.model.stt_model.text_eos_id).any():
                     gen_text[batch_idx, t] = self.model.stt_model.text_eos_id
                     logging.info(f"Forced turn-taking at frame {t}: inserted agent EOS (reason: user started speaking)")

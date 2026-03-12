@@ -28,7 +28,8 @@ pipeline_type: s2s_streaming
 s2s:
   model_path: ???
   llm_checkpoint_path: ???
-  speaker_reference: ???
+  speaker_reference: null
+  speaker_name: null
   engine_type: ??? # Engine type: 'native' or 'vllm_llm' or 'vllm_eartts' or 'vllm_llm_vllm_eartts'
   vllm_llm_config:
     model_path: ${s2s.model_path}             # Inherits from s2s.model_path
