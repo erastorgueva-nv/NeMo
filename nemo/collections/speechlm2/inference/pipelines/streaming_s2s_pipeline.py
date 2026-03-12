@@ -237,6 +237,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 			perception_cache=context.perception_cache,
 			has_prompt=has_prompt,
 			codec_cache=context.codec_cache,
+			cache_position_offset=context.cache_position_offset,
 		)
 
 		# Persist updated cache & clean finished streams
@@ -723,17 +724,19 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 			if context.dynamic_cache is not None:
 				# Native cache mode: process prompt through LLM to update KV cache
 				with torch.no_grad():
+					cache_pos = torch.arange(prompt_len, device=self.s2s_model.device)
 					llm_cache = context.dynamic_cache
 					ans = self.s2s_model.model_llm_interface(
 						prompt_embedded,
 						cache=llm_cache,
+						cache_position=cache_pos,
 						generated_tokens=None,
 						current_step=0
 					)
 					context.dynamic_cache = ans.get("cache", llm_cache)
-				logging.info(f"System prompt processed, cache updated ({prompt_len} tokens)")
+				context.cache_position_offset = prompt_len
+				logging.info(f"System prompt processed, cache updated ({prompt_len} tokens, offset={prompt_len})")
 			else:
-				# No-cache mode (e.g. Nemotron): add prompt embeddings to history
 				for t in range(prompt_len):
 					context.input_embeds_history.append(prompt_embedded[:, t:t+1, :])
 				logging.info(f"Added {prompt_len} prompt embeddings to input_embeds_history")

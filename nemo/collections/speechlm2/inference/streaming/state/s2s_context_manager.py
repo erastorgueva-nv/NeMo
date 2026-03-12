@@ -34,12 +34,13 @@ class StreamingRealtimeContext:
 	gen_function_text: Optional[torch.Tensor]
 	audio_toks_buffer: Optional[torch.Tensor]
 	input_embeds_history: List[torch.Tensor]
-	dynamic_cache: Optional[DynamicCache]
+	dynamic_cache: Any  # DynamicCache or HybridMambaAttentionDynamicCache
 	past_key_values: Any
 	code: Optional[torch.Tensor]
 	subword_mask: Optional[torch.Tensor]
 	perception_cache: Optional["PerceptionCacheState"] = None
 	codec_cache: Optional[CausalConv1dCache] = None
+	cache_position_offset: int = 0
 
 
 class S2SContextManager:
@@ -53,18 +54,6 @@ class S2SContextManager:
 		self.s2s_model = s2s_model
 		self.num_slots = num_slots
 		
-		# Detect Nemotron models and disable DynamicCache
-		# (they require NemotronHHybridDynamicCache which isn't supported yet)
-		self.cache_disabled = False
-		stt_model = getattr(self.s2s_model.model, "stt_model", None)
-		if stt_model is not None:
-			pretrained_llm = stt_model.cfg.get("pretrained_llm", "")
-			if "Nemotron" in pretrained_llm:
-				logging.warning(
-					f"Detected Nemotron model ({pretrained_llm}). "
-					"Disabling DynamicCache (Nemotron requires NemotronHHybridDynamicCache which is not yet supported)."
-				)
-				self.cache_disabled = True
 		self.max_len = max_len
 		self.device = getattr(self.s2s_model, "device", torch.device("cpu"))
 		self.dtype = getattr(self.s2s_model, "dtype", torch.float32)
@@ -73,6 +62,24 @@ class S2SContextManager:
 		self.decode_audio = bool(getattr(self.s2s_model, "decode_audio", False))
 		self.use_perception_cache = bool(getattr(self.s2s_model, "use_perception_cache", False))
 		self.use_codec_cache = bool(getattr(self.s2s_model, "use_codec_cache", True))
+		self.use_llm_cache = bool(getattr(self.s2s_model, "use_llm_cache", True))
+
+		self.is_nemotron = False
+		stt_model = getattr(self.s2s_model.model, "stt_model", None)
+		if stt_model is not None:
+			pretrained_llm = stt_model.cfg.get("pretrained_llm", "")
+			if "Nemotron" in pretrained_llm:
+				self.is_nemotron = True
+				if self.use_llm_cache:
+					logging.info(
+						f"Detected Nemotron model ({pretrained_llm}). "
+						"Will use HybridMambaAttentionDynamicCache for KV caching."
+					)
+				else:
+					logging.info(
+						f"Detected Nemotron model ({pretrained_llm}). "
+						"LLM cache is disabled (use_llm_cache=False)."
+					)
 
 		self.reset()
 
@@ -112,7 +119,13 @@ class S2SContextManager:
 				dtype=torch.long,
 			)
 
-		dynamic_cache = None if self.cache_disabled else DynamicCache()
+		if not self.use_llm_cache:
+			dynamic_cache = None
+		elif self.is_nemotron:
+			stt_model = getattr(self.s2s_model.model, "stt_model", None)
+			dynamic_cache = stt_model._create_nemotron_cache(batch_size=1)
+		else:
+			dynamic_cache = DynamicCache()
 		audio_toks_buffer: Optional[torch.Tensor] = None
 		past_key_values: Any = None
 		code: Optional[torch.Tensor] = None
@@ -267,6 +280,8 @@ class S2SContextManager:
 			context.perception_cache = step_result["perception_cache"]
 		if "codec_cache" in step_result and step_result["codec_cache"] is not None:
 			context.codec_cache = step_result["codec_cache"]
+		if "cache_position_offset" in step_result:
+			context.cache_position_offset = step_result["cache_position_offset"]
 
 	def reset_slots(self, stream_ids: List[int], eos_flags: List[bool]) -> None:
 		"""Release contexts for streams that signalled end-of-stream."""

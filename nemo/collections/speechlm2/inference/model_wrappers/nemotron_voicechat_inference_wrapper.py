@@ -255,6 +255,11 @@ class NemotronVoicechatInferenceWrapper:
                     f"will be ignored (context is maintained incrementally by the codec cache)."
                 )
 
+        # LLM KV cache: when enabled, uses DynamicCache (standard) or
+        # HybridMambaAttentionDynamicCache (Nemotron) for incremental decoding.
+        # When disabled, falls back to full-history reprocessing each step.
+        self.use_llm_cache = bool(model_cfg.get("use_llm_cache", True))
+
         # Perception cache configuration
         self.use_perception_cache = bool(model_cfg.get("use_perception_cache", False))
         use_perception_cudagraph = bool(model_cfg.get("use_perception_cudagraph", False))
@@ -852,7 +857,8 @@ class NemotronVoicechatInferenceWrapper:
                        request_id: Optional[str] = None,
                        perception_cache: Optional[PerceptionCacheState] = None,
                        has_prompt: bool = False,
-                       codec_cache=None):
+                       codec_cache=None,
+                       cache_position_offset: int = 0):
 
         # Set up effective request ID for vLLM streaming
         effective_request_id = request_id or self.request_id
@@ -964,9 +970,13 @@ class NemotronVoicechatInferenceWrapper:
                         current_step=current_frame_idx
                     )
                 else:
+                    cache_pos = torch.tensor(
+                        [cache_position_offset + frame_offset], device=self.device
+                    )
                     ans = self.model_llm_interface(
                         current_input_emb,
                         cache=dynamic_cache,
+                        cache_position=cache_pos,
                         generated_tokens=gen_text,
                         current_step=current_frame_idx
                     )
@@ -1150,6 +1160,7 @@ class NemotronVoicechatInferenceWrapper:
             'code': code,
             'perception_cache': perception_cache,
             'codec_cache': codec_cache,
+            'cache_position_offset': cache_position_offset + num_frames_per_chunk if use_cache else cache_position_offset,
         }
         if self.model.stt_model.function_head is not None:
             result['function_predicted_text_tokens'] = function_predicted_tokens
@@ -1343,10 +1354,10 @@ class NemotronVoicechatInferenceWrapper:
         # convert audio signal to tensor
         audio_signal_tensor = torch.tensor(audio_signal, dtype=self.dtype, device=self.device).unsqueeze(0)
 
-        # Check if Nemotron (no cache support)
-        use_cache = 'Nemotron' not in self.model.stt_model.cfg.pretrained_llm
+        use_cache = self.use_llm_cache
+        is_nemotron = 'Nemotron' in self.model.stt_model.cfg.pretrained_llm
         logging.info(f"Model: {self.model.stt_model.cfg.pretrained_llm}")
-        logging.info(f"   Use cache: {use_cache}")
+        logging.info(f"   Use LLM cache: {use_cache}, is_nemotron: {is_nemotron}")
 
         # Initialize buffer and state
         audio_buffer = torch.zeros(1, buffer_size_samples, dtype=self.dtype, device=self.device)
@@ -1354,10 +1365,14 @@ class NemotronVoicechatInferenceWrapper:
 
         # Initialize LLM cache
         if use_cache:
-            llm_cache = DynamicCache()
+            if is_nemotron:
+                llm_cache = self.model.stt_model._create_nemotron_cache(batch_size=1)
+            else:
+                llm_cache = DynamicCache()
         else:
             llm_cache = None
-            input_embeds_history = []  # For no-cache mode
+            input_embeds_history = []
+        cache_position_offset = 0
 
         # Process system prompt if provided (before streaming audio)
         prompt_embedded = None
@@ -1399,9 +1414,11 @@ class NemotronVoicechatInferenceWrapper:
             elif prompt_embedded is not None and use_cache:
                 # For cache mode: process prompt through LLM to update cache
                 with torch.no_grad():
-                    ans = self.model.stt_model(prompt_embedded, cache=llm_cache)
+                    cache_pos = torch.arange(prompt_len, device=self.device)
+                    ans = self.model.stt_model(prompt_embedded, cache=llm_cache, cache_position=cache_pos)
                     llm_cache = ans.get("cache", llm_cache)
-                logging.info(f"   System prompt processed, cache updated")
+                cache_position_offset = prompt_len
+                logging.info(f"   System prompt processed, cache updated (offset={cache_position_offset})")
 
         # Initialize TTS
         code = None
@@ -1499,6 +1516,7 @@ class NemotronVoicechatInferenceWrapper:
                 perception_cache=perception_cache,
                 has_prompt=(prompt_len > 0),
                 codec_cache=codec_cache,
+                cache_position_offset=cache_position_offset,
             )
 
             # handle results from infer_one_step
@@ -1507,6 +1525,7 @@ class NemotronVoicechatInferenceWrapper:
                     gen_function_text[:, frame_idx + fi] = result['function_predicted_text_tokens'][:, fi]
             input_embeds_history = result['input_embeds_history']
             llm_cache = result['dynamic_cache']
+            cache_position_offset = result.get('cache_position_offset', cache_position_offset)
             if self.use_perception_cache:
                 perception_cache = result.get('perception_cache', perception_cache)
             if self.decode_audio:
@@ -1635,6 +1654,9 @@ def main():
                        help="Enable cache-aware streaming for perception encoder")
     parser.add_argument("--use_perception_cudagraph", action="store_true",
                        help="Use CUDA graphs for perception encoder (requires --use_perception_cache)")
+    # LLM KV cache argument
+    parser.add_argument("--use_llm_cache", action="store_true",
+                       help="Use KV cache for the STT LLM (DynamicCache or HybridMambaAttentionDynamicCache for Nemotron)")
     # Codec streaming cache argument
     parser.add_argument("--use_codec_cache", action="store_true",
                        help="Enable incremental codec decode to remove clicking sounds and wasted inference computation (recommended)")
@@ -1719,6 +1741,7 @@ def main():
             "deterministic": bool(args.deterministic),
             "use_perception_cache": bool(args.use_perception_cache),
             "use_perception_cudagraph": bool(args.use_perception_cudagraph),
+            "use_llm_cache": bool(args.use_llm_cache),
             "use_codec_cache": bool(args.use_codec_cache),
             "top_p": args.top_p,
             "repetition_penalty": args.repetition_penalty,

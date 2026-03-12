@@ -836,6 +836,7 @@ class NativeModel(ModelInterface):
         self,
         input_embeds: torch.Tensor,
         cache: Optional[Any] = None,
+        cache_position: Optional[torch.Tensor] = None,
         generated_tokens: Optional[torch.Tensor] = None,
         current_step: int = 0,
         **kwargs
@@ -845,7 +846,8 @@ class NativeModel(ModelInterface):
 
         Args:
             input_embeds: Input embeddings [batch, seq_len, hidden_dim]
-            cache: Optional DynamicCache for transformers
+            cache: Optional DynamicCache or HybridMambaAttentionDynamicCache
+            cache_position: Optional position tensor for Nemotron models
             generated_tokens: Previously generated tokens [batch, num_generated].
                              Required for repetition_penalty. If None, creates empty tensor.
             current_step: Current decoding step. Used for repetition penalty.
@@ -854,8 +856,7 @@ class NativeModel(ModelInterface):
         Returns:
             Dictionary with 'predicted_token', 'asr_predicted_token', and 'cache'
         """
-        # Call the underlying model
-        result = self.model.stt_model(input_embeds, cache=cache, **kwargs)
+        result = self.model.stt_model(input_embeds, cache=cache, cache_position=cache_position, **kwargs)
 
         # Ensure consistent return format
         if not isinstance(result, dict):

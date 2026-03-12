@@ -64,6 +64,7 @@ s2s:
   use_perception_cudagraph: true              # Enable CUDA graph-accelerated perception encoder
   use_codec_cache: true                       # Incremental codec decode to remove clicking sounds and wasted computation
                                               # (when true, codec_token_history_size is unused)
+  use_llm_cache: true                         # Use KV cache for the STT LLM (DynamicCache or HybridMambaAttentionDynamicCache)
 
   # Deterministic inference (native engine only). Ensures identical results across
   # runs by disabling FlashAttention and forcing deterministic CUDA algorithms.
