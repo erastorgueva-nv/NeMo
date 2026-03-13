@@ -534,6 +534,25 @@ class NemotronVoicechatInferenceWrapper:
         # and anyway - when sticking to "native", saw no difference in output
         # with and without this call
         #self.model.on_train_epoch_start()
+
+        # torch.compile for native TTS backbone
+        use_tts_torch_compile = bool(self.model_cfg.get("use_tts_torch_compile", False))
+        if use_tts_torch_compile and not self.use_vllm_eartts and hasattr(self.model, 'tts_model'):
+            tts_backbone = getattr(self.model.tts_model, 'tts_model', None)
+            if tts_backbone is not None and hasattr(tts_backbone, 'backbone'):
+                logging.info("Compiling TTS backbone with torch.compile(mode='default')...")
+                tts_backbone.backbone = torch.compile(tts_backbone.backbone, mode="default")
+                logging.info("  TTS backbone compiled")
+
+        # Inject TTS speedup flags into the TTS model config so ear_tts_model.py can read them
+        tts_inner = getattr(self.model.tts_model, 'tts_model', None) if hasattr(self.model, 'tts_model') else None
+        if tts_inner is not None and hasattr(tts_inner, 'config'):
+            if bool(self.model_cfg.get("use_tts_subword_cache", False)):
+                OmegaConf.update(tts_inner.config, "use_tts_subword_cache", True)
+                logging.info("TTS speedup enabled: use_tts_subword_cache")
+                if hasattr(tts_inner, 'embed_subword') and tts_inner.embed_subword is not None and hasattr(tts_inner.embed_subword, 'use_tts_subword_cache'):
+                    tts_inner.embed_subword.use_tts_subword_cache = True
+
         self.tokenizer = self.model.stt_model.tokenizer
 
 
@@ -1661,6 +1680,14 @@ def main():
     parser.add_argument("--use_codec_cache", action="store_true",
                        help="Enable incremental codec decode to remove clicking sounds and wasted inference computation (recommended)")
 
+    # torch.compile for native inference
+    parser.add_argument("--use_tts_torch_compile", action="store_true",
+                       help="Compile TTS backbone with torch.compile for faster native inference (mode='default')")
+
+    # TTS model speedup flags (applied inside ear_tts_model.py)
+    parser.add_argument("--use_tts_subword_cache", action="store_true",
+                       help="Cache CharAwareSubwordEncoder embeddings at inference time (skip backbone for repeated tokens)")
+
     # vLLM arguments
     parser.add_argument("--engine_type", type=str, default="native", choices=["native", "vllm_llm", "vllm_eartts", "vllm_llm_vllm_eartts"],
                        help="Engine type for inference (default: native)")
@@ -1743,6 +1770,8 @@ def main():
             "use_perception_cudagraph": bool(args.use_perception_cudagraph),
             "use_llm_cache": bool(args.use_llm_cache),
             "use_codec_cache": bool(args.use_codec_cache),
+            "use_tts_torch_compile": bool(args.use_tts_torch_compile),
+            "use_tts_subword_cache": bool(args.use_tts_subword_cache),
             "top_p": args.top_p,
             "repetition_penalty": args.repetition_penalty,
             "temperature": args.temperature,

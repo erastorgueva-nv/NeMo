@@ -66,6 +66,10 @@ s2s:
                                               # (when true, codec_token_history_size is unused)
   use_llm_cache: true                         # Use KV cache for the STT LLM (DynamicCache or HybridMambaAttentionDynamicCache)
 
+  # TTS speedup flags (default to false; enable to speed up native inference)
+  use_tts_torch_compile: false                # Compile TTS backbone with torch.compile (mode='default')
+  use_tts_subword_cache: false                # Cache CharAwareSubwordEncoder embeddings (skip backbone for repeated tokens)
+
   # Deterministic inference (native engine only). Ensures identical results across
   # runs by disabling FlashAttention and forcing deterministic CUDA algorithms.
   # Trade-offs: slower inference, might be worse results than non-deterministic mode, since
