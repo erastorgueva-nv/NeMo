@@ -119,7 +119,8 @@ class S2SContextManager:
 				dtype=torch.long,
 			)
 
-		if not self.use_llm_cache:
+		use_vllm_llm = bool(getattr(self.s2s_model, "use_vllm_llm", False))
+		if not self.use_llm_cache or use_vllm_llm:
 			dynamic_cache = None
 		elif self.is_nemotron:
 			stt_model = getattr(self.s2s_model.model, "stt_model", None)

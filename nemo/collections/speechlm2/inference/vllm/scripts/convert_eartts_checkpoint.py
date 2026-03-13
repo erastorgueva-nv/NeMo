@@ -38,7 +38,8 @@ def convert(outdir, config, model_path):
 
     # load config
     with open(config, "r") as f:
-        config_dict = json.load(f)["model"]["speech_generation"]
+        full_config = json.load(f)
+    config_dict = full_config["model"]["speech_generation"]
     cfg = DictConfig(config_dict)
     # config modification that is needed to run inference
     cfg.model.tts_config.use_unshifthed_prompt = True
@@ -54,14 +55,15 @@ def convert(outdir, config, model_path):
     cfg.data.target_sample_rate = 22050
     cfg.model.pretrained_model = None
 
-    # Compatibility fix: remove 'pretrained_tokenizer_name' from cas_config
-    # (the new codebase's CharAwareSubwordEncoder no longer accepts this parameter;
-    #  NemotronVoiceChat.__init__ handles this, but we bypass it here)
-    _pretrained_tokenizer_name = None
-    if hasattr(cfg.model, "tts_config") and hasattr(cfg.model.tts_config, "cas_config"):
-        _pretrained_tokenizer_name = cfg.model.tts_config.cas_config.get("pretrained_tokenizer_name", None)
-        if _pretrained_tokenizer_name is not None:
-            del cfg.model.tts_config.cas_config.pretrained_tokenizer_name
+    # Resolve tokenizer name from the STT config (same tokenizer is shared by TTS).
+    _pretrained_tokenizer_name = (
+        full_config.get("model", {}).get("stt", {}).get("model", {}).get("pretrained_llm", None)
+    )
+    if _pretrained_tokenizer_name is None:
+        raise ValueError(
+            "Cannot determine tokenizer: 'pretrained_llm' not found in "
+            "config.json -> model -> stt -> model. Check the checkpoint."
+        )
 
     model = DuplexEARTTS(OmegaConf.to_container(cfg, resolve=True)).eval()
     # get subword encoder vocabs and config
@@ -243,12 +245,32 @@ def convert(outdir, config, model_path):
         {"name": "text_tokens", "dtype": "int32"},
         {"name": "text_mask"},
         {"name": "bos_mask"},
+        {"name": "speaker_latent", "dim": flat_config["hidden_size"]},
     ]
     flat_config["custom_outputs"] = ["acoustic_tokens"]
 
     with open(os.path.join(outdir, "config.json"), "w") as f:
         json.dump(flat_config, f, indent=2)
     logging.info("Saved vllm config")
+
+    # Extract and save pre-computed speaker latents (audio_prompt_latents.*)
+    # from the NeMo checkpoint so they can be used at inference time.
+    speaker_latents_dir = os.path.join(outdir, "speaker_latents")
+    all_weights = load_file(model_path)
+    found_latents = False
+    for key, tensor in all_weights.items():
+        if "audio_prompt_latents." in key:
+            speaker_name = key.split("audio_prompt_latents.")[-1]
+            os.makedirs(speaker_latents_dir, exist_ok=True)
+            latent_path = os.path.join(speaker_latents_dir, f"{speaker_name}.pt")
+            torch.save(tensor, latent_path)
+            logging.info(f"Saved speaker latent '{speaker_name}' to {latent_path} (shape={tensor.shape})")
+            found_latents = True
+    if not found_latents:
+        logging.warning(
+            "No audio_prompt_latents found in checkpoint. "
+            "speaker_name will not work unless latents are added."
+        )
 
 
 if __name__ == "__main__":

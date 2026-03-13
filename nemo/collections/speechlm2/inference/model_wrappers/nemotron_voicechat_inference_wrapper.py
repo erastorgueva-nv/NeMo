@@ -1382,15 +1382,15 @@ class NemotronVoicechatInferenceWrapper:
         audio_buffer = torch.zeros(1, buffer_size_samples, dtype=self.dtype, device=self.device)
         buffer_fill_level = 0  # How many samples currently in buffer
 
-        # Initialize LLM cache
-        if use_cache:
-            if is_nemotron:
-                llm_cache = self.model.stt_model._create_nemotron_cache(batch_size=1)
-            else:
-                llm_cache = DynamicCache()
-        else:
+        # Initialize LLM cache (skip for vLLM -- it manages its own KV cache)
+        if not use_cache or self.use_vllm_llm:
             llm_cache = None
-            input_embeds_history = []
+            if not use_cache:
+                input_embeds_history = []
+        elif is_nemotron:
+            llm_cache = self.model.stt_model._create_nemotron_cache(batch_size=1)
+        else:
+            llm_cache = DynamicCache()
         cache_position_offset = 0
 
         # Process system prompt if provided (before streaming audio)

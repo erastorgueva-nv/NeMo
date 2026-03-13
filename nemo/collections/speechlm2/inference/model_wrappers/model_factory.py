@@ -637,6 +637,7 @@ class VllmEARTTSModel(VllmLLMModel):
             **kwargs: Arguments passed to the VllmLLMModel constructor
         """
         super().__init__(**kwargs)
+        self._speaker_latent_dim = None
         logging.info("VllmEARTTSModel initialized with EARTTS-specific settings.")
 
     def _convert_ckpt(self, save_path: str):
@@ -759,6 +760,32 @@ class VllmEARTTSModel(VllmLLMModel):
             # small enough that bos_mask * bos_emb remains negligible.
             bos_mask = torch.full_like(current_subword_id, 1e-20, dtype=getattr(torch, self._dtype))
             input_tensors.append(bos_mask)
+
+        # Pass speaker_latent: the pre-extracted speaker embedding.
+        # During prefill with speaker_name: audio_prompt_lantent is [1, T, hidden_size]
+        # During decode or speaker_reference: pass zeros so the model falls back
+        # to computing the latent from acoustic tokens.
+        if "audio_prompt_lantent" in inputs and inputs["audio_prompt_lantent"] is not None:
+            speaker_latent = inputs["audio_prompt_lantent"].squeeze(0)  # T x hidden_size
+            self._speaker_latent_dim = speaker_latent.shape[-1]
+            input_tensors.append(speaker_latent.to(dtype=getattr(torch, self._dtype)))
+        else:
+            if self._speaker_latent_dim is None:
+                # Read hidden_size from the converted model config
+                import json as _json
+                dir_name = os.path.basename(os.path.normpath(self.model_path))
+                converted_config_path = os.path.join("/tmp", dir_name + "_vllm_converted_eartts", "config.json")
+                if os.path.exists(converted_config_path):
+                    with open(converted_config_path) as _f:
+                        self._speaker_latent_dim = _json.load(_f)["hidden_size"]
+                else:
+                    raise RuntimeError(
+                        f"Cannot determine speaker_latent_dim: converted config not found at {converted_config_path}. "
+                        "Run a prefill with audio_prompt_lantent first, or ensure the converted checkpoint exists."
+                    )
+            num_tokens = codes.shape[0]
+            speaker_latent = torch.zeros(num_tokens, self._speaker_latent_dim, dtype=getattr(torch, self._dtype))
+            input_tensors.append(speaker_latent)
 
         result = await self.engine.generate_next_token(input_tensors, prompt_token_ids=prompt_token_ids, request_id=request_id)
         acoustic_tokens = result.custom_outputs["acoustic_tokens"]  # T x 31
