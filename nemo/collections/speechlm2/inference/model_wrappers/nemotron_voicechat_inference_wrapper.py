@@ -1651,8 +1651,10 @@ def main():
                        help="Append silence equal to this ratio of the original audio duration (e.g. 0.2 = 20%% extra)")
     parser.add_argument("--pad_audio_by_sec", type=float, default=None,
                        help="Append this many seconds of extra silence after the audio")
-    parser.add_argument("--speaker_reference", type=str, required=True,
+    parser.add_argument("--speaker_reference", type=str, default=None,
                        help="Path to speaker reference audio file")
+    parser.add_argument("--speaker_name", type=str, default=None,
+                       help="Name of a registered speaker whose latent is cached in the checkpoint")
     parser.add_argument("--buffer_size_frames", type=int, default=DEFAULT_BUFFER_SIZE_FRAMES,
                        help=f"Size of audio buffer in frames (each frame = 80ms, default: {DEFAULT_BUFFER_SIZE_FRAMES})")
     parser.add_argument("--num_frames_per_chunk", type=int, default=DEFAULT_NUM_FRAMES_PER_CHUNK,
@@ -1751,6 +1753,8 @@ def main():
 
     if sum(x is not None for x in [args.pad_audio_to_sec, args.pad_silence_ratio, args.pad_audio_by_sec]) > 1:
         raise ValueError("Set at most one of: --pad_audio_to_sec, --pad_silence_ratio, --pad_audio_by_sec")
+    if args.speaker_reference is None and args.speaker_name is None:
+        parser.error("At least one of --speaker_reference or --speaker_name must be provided")
     if not math.isfinite(args.temperature) or args.temperature < 0.0:
         parser.error(f"--temperature must be a finite value >= 0.0, got {args.temperature}")
 
@@ -1762,6 +1766,7 @@ def main():
             "model_path": args.model_path,
             "llm_checkpoint_path": args.llm_checkpoint_path,
             "speaker_reference": args.speaker_reference,
+            "speaker_name": args.speaker_name,
             "buffer_size_frames": args.buffer_size_frames,
             "decode_audio": bool(args.decode_audio),
             "engine_type": args.engine_type,
