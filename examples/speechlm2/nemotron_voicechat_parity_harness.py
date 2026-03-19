@@ -588,6 +588,11 @@ def run_parity_harness(args) -> dict[str, Any]:
             prompt_tokens = torch.tensor(prompt_token_ids, device=wrapper.device, dtype=torch.long).unsqueeze(0)
             prompt_token_lens = torch.tensor([len(prompt_token_ids)], device=wrapper.device, dtype=torch.long)
 
+        if wrapper.speaker_name is not None:
+            OmegaConf.update(wrapper.model.cfg, "inference_speaker_name", wrapper.speaker_name, force_add=True)
+        elif wrapper.speaker_reference:
+            OmegaConf.update(wrapper.model.cfg, "inference_speaker_reference", wrapper.speaker_reference, force_add=True)
+
         offline = wrapper.model.offline_inference(
             input_signal=audio,
             input_signal_lens=audio_lens,
