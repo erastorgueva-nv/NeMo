@@ -866,6 +866,7 @@ class NativeModel(ModelInterface):
         cache_position: Optional[torch.Tensor] = None,
         generated_tokens: Optional[torch.Tensor] = None,
         current_step: int = 0,
+        return_logits: bool = False,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -916,6 +917,11 @@ class NativeModel(ModelInterface):
             "asr_predicted_token": asr_predicted_token,
             "cache": result.get("cache", None),
         }
+        if return_logits:
+            ans["text_logits"] = result["text_logits"]
+            ans["asr_logits"] = result.get("asr_logits")
+            if "function_logits" in result:
+                ans["function_logits"] = result["function_logits"]
         if "function_logits" in result:
             ans["function_predicted_token"] = result["function_logits"][:, -1].argmax(dim=-1)
         return ans

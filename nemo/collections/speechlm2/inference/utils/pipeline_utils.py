@@ -15,6 +15,8 @@
 import re
 from typing import List, Optional
 
+import torch
+
 from nemo.collections.asr.inference.utils.text_segment import Word
 
 
@@ -50,6 +52,12 @@ class PipelineOutput:
         asr_texts_with_timestamps: Optional[List[str]] = None,
         raw_texts: Optional[List[str]] = None,
         raw_asr_texts: Optional[List[str]] = None,
+        token_texts: Optional[List[torch.Tensor | None]] = None,
+        token_asr_texts: Optional[List[torch.Tensor | None]] = None,
+        token_function_texts: Optional[List[torch.Tensor | None]] = None,
+        token_lengths: Optional[List[int | None]] = None,
+        audio_filepaths: Optional[List[str | None]] = None,
+        debug_data: Optional[List[list]] = None,
     ):
         if texts is None and words is None:
             raise ValueError("At least one of the 'texts' or 'words' should be provided.")
@@ -60,3 +68,9 @@ class PipelineOutput:
         self.asr_texts_with_timestamps = asr_texts_with_timestamps
         self.raw_texts = raw_texts
         self.raw_asr_texts = raw_asr_texts
+        self.token_texts = token_texts
+        self.token_asr_texts = token_asr_texts
+        self.token_function_texts = token_function_texts
+        self.token_lengths = token_lengths
+        self.audio_filepaths = audio_filepaths
+        self.debug_data = debug_data

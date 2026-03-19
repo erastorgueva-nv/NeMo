@@ -49,6 +49,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 		# ------------------------------------------------------------------
 		self.s2s_model = s2s_model
 		self.device = self.s2s_model.device
+		self.collect_debug = False
 
 		# ------------------------------------------------------------------
 		# Streaming configuration
@@ -58,6 +59,11 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 		self.output_sample_rate = getattr(self.streaming_cfg, "output_sample_rate", 22050)
 		self.batch_size = getattr(self.streaming_cfg, "batch_size", 1)
 		self.max_len = getattr(self.streaming_cfg, "max_len", 200)
+		if self.batch_size != 1:
+			raise ValueError(
+				"StreamingS2SPipeline currently supports only single-stream inference "
+				"(streaming.batch_size must be 1)."
+			)
 		
 
 		# ------------------------------------------------------------------
@@ -238,7 +244,14 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 			has_prompt=has_prompt,
 			codec_cache=context.codec_cache,
 			cache_position_offset=context.cache_position_offset,
+			return_debug=self.collect_debug,
 		)
+
+		if self.collect_debug and "debug" in result:
+			state = self.get_or_create_state(stream_ids[0])
+			if not hasattr(state, "debug_steps"):
+				state.debug_steps = []
+			state.debug_steps.append(result["debug"])
 
 		# Persist updated cache & clean finished streams
 		self.context_manager.update_context(stream_ids, result, self.num_frames_per_chunk)
@@ -583,6 +596,11 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 		asr_texts_with_timestamps = []
 		raw_texts = []
 		raw_asr_texts = []
+		token_texts = []
+		token_asr_texts = []
+		token_function_texts = []
+		token_lengths = []
+		audio_paths = []
 
 		tokenizer = self.s2s_model.tokenizer
 		pad_id = self.s2s_model.model.stt_model.text_pad_id
@@ -593,6 +611,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 			if not text_value:
 				text_value = saved_paths_by_stream.get(idx, "")
 			texts.append(text_value)
+			audio_paths.append(saved_paths_by_stream.get(idx))
 			per_stream_words = state.get_output_words() if hasattr(state, "get_output_words") else []
 			words.append(per_stream_words)
 			asr_text_value = state.get_output_asr_text() if hasattr(state, "get_output_asr_text") else ""
@@ -601,6 +620,10 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 			token_data = state.get_token_tensors()
 			if token_data is not None:
 				gen_text, gen_asr_text, total_frames, gen_function_text = token_data
+				token_texts.append(gen_text)
+				token_asr_texts.append(gen_asr_text)
+				token_function_texts.append(gen_function_text)
+				token_lengths.append(total_frames)
 				lengths = torch.tensor([total_frames], dtype=torch.long)
 				texts_with_timestamps.append(
 					tokens_to_str(gen_text, lengths, tokenizer=tokenizer, pad_id=pad_id, eval_text_turn_taking=True)[0]
@@ -619,10 +642,20 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 					fc_text_raw = tokens_to_str_raw(gen_function_text, lengths, tokenizer=tokenizer, pad_id=pad_id)[0]
 					logging.info(f"Function calling channel: {fc_text}")
 			else:
+				token_texts.append(None)
+				token_asr_texts.append(None)
+				token_function_texts.append(None)
+				token_lengths.append(None)
 				texts_with_timestamps.append("")
 				asr_texts_with_timestamps.append("")
 				raw_texts.append("")
 				raw_asr_texts.append("")
+
+		debug_data = []
+		if self.collect_debug:
+			for idx in range(len(audio_filepaths)):
+				state = self.get_or_create_state(idx)
+				debug_data.append(getattr(state, "debug_steps", []))
 
 		self.close_session()
 
@@ -634,6 +667,12 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 			asr_texts_with_timestamps=asr_texts_with_timestamps,
 			raw_texts=raw_texts,
 			raw_asr_texts=raw_asr_texts,
+			token_texts=token_texts,
+			token_asr_texts=token_asr_texts,
+			token_function_texts=token_function_texts,
+			token_lengths=token_lengths,
+			audio_filepaths=audio_paths,
+			debug_data=debug_data if debug_data else None,
 		)
 
 	def _prefill_system_prompt(self, stream_id: int, system_prompt: str | None = None) -> Optional[torch.Tensor]:

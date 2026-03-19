@@ -17,9 +17,6 @@ from queue import Queue
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import torch
-from transformers import DynamicCache
-
-from nemo.collections.speechlm2.modules.ear_tts_vae_codec import CausalConv1dCache
 from nemo.utils import logging
 
 if TYPE_CHECKING:
@@ -27,7 +24,7 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class StreamingRealtimeContext:
+class StreamingDecodeState:
 	frame_idx: int
 	gen_text: torch.Tensor
 	gen_asr_text: torch.Tensor
@@ -39,7 +36,7 @@ class StreamingRealtimeContext:
 	code: Optional[torch.Tensor]
 	subword_mask: Optional[torch.Tensor]
 	perception_cache: Optional["PerceptionCacheState"] = None
-	codec_cache: Optional[CausalConv1dCache] = None
+	codec_cache: Any = None
 	cache_position_offset: int = 0
 
 
@@ -57,29 +54,6 @@ class S2SContextManager:
 		self.max_len = max_len
 		self.device = getattr(self.s2s_model, "device", torch.device("cpu"))
 		self.dtype = getattr(self.s2s_model, "dtype", torch.float32)
-		self.text_pad_id = getattr(getattr(self.s2s_model, "model", None), "text_pad_id", 0)
-		self.codec_token_history_size = int(getattr(self.s2s_model, "codec_token_history_size", 0))
-		self.decode_audio = bool(getattr(self.s2s_model, "decode_audio", False))
-		self.use_perception_cache = bool(getattr(self.s2s_model, "use_perception_cache", False))
-		self.use_codec_cache = bool(getattr(self.s2s_model, "use_codec_cache", True))
-		self.use_llm_cache = bool(getattr(self.s2s_model, "use_llm_cache", True))
-
-		self.is_nemotron = False
-		stt_model = getattr(self.s2s_model.model, "stt_model", None)
-		if stt_model is not None:
-			pretrained_llm = stt_model.cfg.get("pretrained_llm", "")
-			if "Nemotron" in pretrained_llm:
-				self.is_nemotron = True
-				if self.use_llm_cache:
-					logging.info(
-						f"Detected Nemotron model ({pretrained_llm}). "
-						"Will use HybridMambaAttentionDynamicCache for KV caching."
-					)
-				else:
-					logging.info(
-						f"Detected Nemotron model ({pretrained_llm}). "
-						"LLM cache is disabled (use_llm_cache=False)."
-					)
 
 		self.reset()
 
@@ -90,91 +64,27 @@ class S2SContextManager:
 		self.free_slots = Queue(self.num_slots)
 		for i in range(self.num_slots):
 			self.free_slots.put(i)
-		self.slot_contexts: List[Optional[StreamingRealtimeContext]] = [None] * self.num_slots
+		self.slot_contexts: List[Optional[StreamingDecodeState]] = [None] * self.num_slots
 
-	def _create_context(self) -> StreamingRealtimeContext:
+	def _create_context(self) -> StreamingDecodeState:
 		"""Allocate a fresh context backed by the realtime inference model."""
-		gen_text = torch.full(
-			(1, self.max_len),
-			fill_value=self.text_pad_id,
-			device=self.device,
-			dtype=torch.long,
-		)
-
-		gen_asr_text = torch.full(
-			(1, self.max_len),
-			fill_value=self.text_pad_id,
-			device=self.device,
-			dtype=torch.long,
-		)
-
-		stt_model = getattr(self.s2s_model.model, "stt_model", None)
-		has_function_head = stt_model is not None and getattr(stt_model, "function_head", None) is not None
-		gen_function_text = None
-		if has_function_head:
-			gen_function_text = torch.full(
-				(1, self.max_len),
-				fill_value=self.text_pad_id,
-				device=self.device,
-				dtype=torch.long,
-			)
-
-		use_vllm_llm = bool(getattr(self.s2s_model, "use_vllm_llm", False))
-		if not self.use_llm_cache or use_vllm_llm:
-			dynamic_cache = None
-		elif self.is_nemotron:
-			stt_model = getattr(self.s2s_model.model, "stt_model", None)
-			dynamic_cache = stt_model._create_nemotron_cache(batch_size=1)
-		else:
-			dynamic_cache = DynamicCache()
-		audio_toks_buffer: Optional[torch.Tensor] = None
-		past_key_values: Any = None
-		code: Optional[torch.Tensor] = None
-		subword_mask: Optional[torch.Tensor] = None
-		perception_cache = None
-		codec_cache = None
-
-		if self.decode_audio and hasattr(getattr(self.s2s_model, "model", None), "tts_model"):
-			tts_model = self.s2s_model.model.tts_model
-			if self.use_codec_cache:
-				# Incremental decode path: CausalConv1dCache maintains all codec
-				# context internally, so no audio_toks_buffer is needed and
-				# codec_token_history_size is irrelevant.
-				codec_cache = CausalConv1dCache()
-			elif self.codec_token_history_size > 0:
-				# Sliding-window fallback: allocate silence buffer of
-				# codec_token_history_size tokens that is re-decoded every step.
-				silence_tokens_base = tts_model.codec_silence_tokens.detach().clone()
-				silence_tokens = silence_tokens_base.view(1, 1, -1).expand(
-					-1, self.codec_token_history_size, -1
-				).contiguous()  # contiguous() ensures it's a real copy, not a view
-				audio_toks_buffer = silence_tokens.to(self.device).clone()
-			subword_mask = torch.ones((1, self.max_len), device=self.device, dtype=torch.bool)
-
-			if getattr(self.s2s_model, "first_tts_past_key_values_input", None) is not None:
-				past_key_values = self.s2s_model._clone_cache(self.s2s_model.first_tts_past_key_values_input)
-			if getattr(self.s2s_model, "first_tts_code_input", None) is not None:
-				code = self.s2s_model.first_tts_code_input.detach().clone()
-
-		# Initialize perception cache if enabled
-		if self.use_perception_cache:
-			mgr = getattr(self.s2s_model, "perception_cache_mgr", None)
-			if mgr is not None:
-				perception_cache = mgr.get_initial_state(batch_size=1)
-
-		return StreamingRealtimeContext(
-			frame_idx=0,
-			gen_text=gen_text,
-			gen_asr_text=gen_asr_text,
-			gen_function_text=gen_function_text,
-			audio_toks_buffer=audio_toks_buffer,
-			input_embeds_history=[],
-			dynamic_cache=dynamic_cache,
-			past_key_values=past_key_values,
-			code=code,
-			subword_mask=subword_mask,
-			perception_cache=perception_cache,
-			codec_cache=codec_cache,
+		if not hasattr(self.s2s_model, "create_decode_state"):
+			raise RuntimeError("s2s_model must provide create_decode_state(max_len)")
+		decode_state = self.s2s_model.create_decode_state(self.max_len)
+		return StreamingDecodeState(
+			frame_idx=decode_state["frame_idx"],
+			gen_text=decode_state["gen_text"],
+			gen_asr_text=decode_state["gen_asr_text"],
+			gen_function_text=decode_state["gen_function_text"],
+			audio_toks_buffer=decode_state["audio_toks_buffer"],
+			input_embeds_history=decode_state["input_embeds_history"],
+			dynamic_cache=decode_state["dynamic_cache"],
+			past_key_values=decode_state["past_key_values"],
+			code=decode_state["code"],
+			subword_mask=decode_state["subword_mask"],
+			perception_cache=decode_state["perception_cache"],
+			codec_cache=decode_state["codec_cache"],
+			cache_position_offset=decode_state["cache_position_offset"],
 		)
 
 	def _ensure_slot(self, stream_id: int) -> int:
@@ -292,7 +202,7 @@ class S2SContextManager:
 			if eos_flag and stream_id in self.streamidx2slotidx:
 				self.reset_slot(self.streamidx2slotidx[stream_id])
 
-	def get_context(self, stream_ids: List[int]) -> Tuple[StreamingRealtimeContext, Dict[int, int]]:
+	def get_context(self, stream_ids: List[int]) -> Tuple[StreamingDecodeState, Dict[int, int]]:
 		"""Return the cached context associated with the provided stream ids."""
 		if len(stream_ids) == 0:
 			return self._create_context(), {}

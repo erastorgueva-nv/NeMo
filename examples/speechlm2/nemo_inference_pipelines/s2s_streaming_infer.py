@@ -142,11 +142,10 @@ def dump_output(
     """
     Dump inference results to output_processed.json and output_raw.json.
 
-    output_processed.json uses the same schema as the standalone wrapper's
-    output_results_processed.json (timestamps in pred_text via <|t|> / <$t$>).
+    output_processed.json uses the canonical S2S processed-output schema
+    (timestamps in pred_text via <|t|> / <$t$>).
 
-    output_raw.json preserves all tokens including <SPECIAL_12> (pad tokens),
-    matching the standalone wrapper's output_results_raw.json.
+    output_raw.json preserves all tokens including <SPECIAL_12> (pad tokens).
 
     CTM files are still written for per-word audio-sample-based timing.
 

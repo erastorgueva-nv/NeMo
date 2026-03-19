@@ -13,26 +13,21 @@
 # limitations under the License.
 
 import torch
-import yaml
 from omegaconf import OmegaConf, DictConfig
-import numpy as np
-import librosa
 import time
-from transformers import DynamicCache
 import re
 import os
 import sys
-import argparse
-import math
 import torchaudio
 import functools
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from nemo.utils import logging
-from jiwer import wer
 
 import gc
 import types
+
+from transformers import DynamicCache
 
 
 # Set environment variables (use existing env vars if set, otherwise use defaults)
@@ -47,6 +42,7 @@ from nemo.collections.speechlm2.models.nemotron_voicechat import NemotronVoiceCh
 from nemo.collections.speechlm2.parts.text_utils import tokens_to_str
 from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.audio.parts.utils.transforms import resample
+from nemo.collections.speechlm2.modules.ear_tts_vae_codec import CausalConv1dCache
 from nemo.collections.speechlm2.inference.model_wrappers.model_factory import create_model
 from nemo.collections.speechlm2.inference.model_wrappers.perception_cache import (
     PerceptionCacheState,
@@ -118,7 +114,7 @@ class NemotronVoicechatInferenceWrapper:
         Initialize the model for realtime streaming inference.
 
         Args:
-            model_cfg (DictConfig): Configuration describing the model paths and runtime parameters.
+            model_cfg (DictConfig): Configuration describing the model paths and inference parameters.
         """
         if model_cfg is None:
             raise ValueError("model_cfg must be provided")
@@ -678,66 +674,32 @@ class NemotronVoicechatInferenceWrapper:
         self,
         system_prompt: str,
     ) -> Tuple[Optional[torch.Tensor], int]:
-        """
-        Prepare system prompt embeddings consistent with offline_inference.
-
-        In offline_inference, prompt embeddings are structured as:
-        - Position 0: prompt_token_emb + bos_emb + asr_bos
-        - Position t > 0: prompt_token_emb + pad_emb + pad_asr
-
-        Args:
-            system_prompt: The system prompt text
-
-        Returns:
-            Tuple of (prompt_embedded [1, prompt_len, H], prompt_length)
-            Returns (None, 0) if system_prompt is empty
-        """
-
         if not system_prompt or not system_prompt.strip():
             return None, 0
 
-        logging.info(f"Preparing system prompt: {system_prompt[:100]}...")
-
-        # Step 1: Tokenize the prompt
-        # Format: [bos] + text_tokens + [eos] (consistent with collate_system_prompt)
-        prompt_token_ids = (
-            [self.tokenizer.bos_id] +
-            self.tokenizer.text_to_ids(system_prompt) +
-            [self.tokenizer.eos_id]
-        )
-        prompt_tokens = torch.tensor(prompt_token_ids, dtype=torch.long, device=self.device).unsqueeze(0)  # [1, prompt_len]
+        prompt_token_ids = self._build_prompt_token_ids(system_prompt)
+        prompt_tokens = torch.tensor(prompt_token_ids, dtype=torch.long, device=self.device).unsqueeze(0)
+        prompt_embedded = self.model.stt_model.embed_tokens(prompt_tokens).to(dtype=self.dtype)
         prompt_len = prompt_tokens.shape[1]
 
-        logging.info(f"   Prompt length: {prompt_len} tokens")
-
-        # Step 2: Embed the prompt tokens (this acts as the "audio channel" for prompt positions)
-        prompt_embedded = self.model.stt_model.embed_tokens(prompt_tokens)  # [1, prompt_len, H]
-        prompt_embedded = prompt_embedded.to(dtype=self.dtype)
-
-        # Step 3: Add pad embeddings for text and ASR channels (for positions t > 0)
-        # In offline_inference, prompt positions use gen_text[:, t-1] = pad_id
         pad_id = self.model.stt_model.text_pad_id
         pad_token = torch.full((1,), fill_value=pad_id, device=self.device, dtype=torch.long)
-        pad_emb = self.model.stt_model.embed_tokens(pad_token).to(dtype=self.dtype)  # [1, H]
-        pad_asr_emb = self.model.stt_model.embed_asr_tokens(pad_token).to(dtype=self.dtype)  # [1, H]
+        pad_emb = self.model.stt_model.embed_tokens(pad_token).to(dtype=self.dtype)
+        pad_asr_emb = self.model.stt_model.embed_asr_tokens(pad_token).to(dtype=self.dtype)
 
-        # For positions t > 0, add pad embeddings (simulating gen_text[:, t-1] = pad_id)
         has_fc = self.model.stt_model.function_head is not None
         if prompt_len > 1:
             prompt_embedded[:, 1:, :] += pad_emb
             prompt_embedded[:, 1:, :] += pad_asr_emb
             if has_fc:
-                prompt_embedded[:, 1:, :] += pad_emb  # FC channel also uses pad at t > 0
+                prompt_embedded[:, 1:, :] += pad_emb
 
-        # Step 4: For position 0, add BOS embeddings
-        bos_emb = self._get_bos_embedding()  # [1, H]
-        asr_bos_emb = self._get_asr_bos_embedding()  # [1, H]
+        bos_emb = self._get_bos_embedding()
+        asr_bos_emb = self._get_asr_bos_embedding()
         prompt_embedded[:, 0, :] += bos_emb.squeeze(0)
         prompt_embedded[:, 0, :] += asr_bos_emb.squeeze(0)
         if has_fc:
-            prompt_embedded[:, 0, :] += pad_emb.squeeze(0)  # FC channel uses pad at t=0
-
-        logging.info(f"   System prompt embeddings prepared: shape {prompt_embedded.shape}")
+            prompt_embedded[:, 0, :] += pad_emb.squeeze(0)
 
         return prompt_embedded, prompt_len
 
@@ -751,12 +713,49 @@ class NemotronVoicechatInferenceWrapper:
             return type(cache)(self._clone_cache(x) for x in cache)
         if isinstance(cache, dict):
             return {k: self._clone_cache(v) for k, v in cache.items()}
-        # Handle complex objects (e.g., DynamicCache with __dict__ attributes)
-        # Use deepcopy to ensure complete isolation between streams
         if hasattr(cache, '__dict__'):
             import copy
             return copy.deepcopy(cache)
         return cache
+
+    def _build_prompt_token_ids(self, system_prompt: str | None) -> list[int]:
+        if not system_prompt or not system_prompt.strip():
+            return []
+        return [self.tokenizer.bos_id] + self.tokenizer.text_to_ids(system_prompt) + [self.tokenizer.eos_id]
+
+    def _create_generation_workspace(self, max_len: int):
+        stt_model = self.model.stt_model
+        gen_text = torch.full((1, max_len), stt_model.text_pad_id, device=self.device, dtype=torch.long)
+        gen_asr_text = torch.full((1, max_len), stt_model.text_pad_id, device=self.device, dtype=torch.long)
+        gen_function_text = None
+        if getattr(stt_model, "function_head", None) is not None:
+            gen_function_text = torch.full((1, max_len), stt_model.text_pad_id, device=self.device, dtype=torch.long)
+        return gen_text, gen_asr_text, gen_function_text
+
+    def _create_llm_cache(self):
+        if not self.use_llm_cache or self.use_vllm_llm:
+            return None
+        pretrained_llm = str(self.model.stt_model.cfg.get("pretrained_llm", ""))
+        if "Nemotron" in pretrained_llm:
+            return self.model.stt_model._create_nemotron_cache(batch_size=1)
+        return DynamicCache()
+
+    def _create_codec_state(self, max_len: int):
+        if not self.decode_audio or not hasattr(self.model, "tts_model"):
+            return None, None, None
+
+        audio_toks_buffer = None
+        codec_cache = None
+        if self.use_codec_cache:
+            codec_cache = CausalConv1dCache()
+        elif self.codec_token_history_size > 0:
+            silence_tokens = self.model.tts_model.codec_silence_tokens.detach().clone()
+            audio_toks_buffer = silence_tokens.view(1, 1, -1).expand(
+                1, self.codec_token_history_size, -1
+            ).contiguous().to(self.device)
+
+        subword_mask = torch.ones((1, max_len), device=self.device, dtype=torch.bool)
+        return audio_toks_buffer, subword_mask, codec_cache
 
     def _prepare_tts_initial_state(self):
         if not self.decode_audio:
@@ -803,9 +802,6 @@ class NemotronVoicechatInferenceWrapper:
                 outputs = self.model.tts_model.tts_model(**init_inputs)
 
             code = init_inputs["code"][:, -1:]
-            # code, _, _ = self.model.tts_model.tts_model.generate_step(
-            #     outputs.hidden_states[:, -1:], **self.generation_config
-            # )
 
         self.first_context_subword_id = init_inputs["subword_ids"][:, -1].unsqueeze(-1)
         self.first_tts_code_input = code.detach().clone()
@@ -814,51 +810,35 @@ class NemotronVoicechatInferenceWrapper:
 
         logging.info("TTS warmup state prepared")
 
-    def _update_audio_buffer(self, audio_buffer, buffer_fill_level, new_audio, buffer_size_samples):
-        """
-        Append incoming samples to the sliding-window buffer and produce the view used for inference.
+    def create_decode_state(self, max_len: int):
+        gen_text, gen_asr_text, gen_function_text = self._create_generation_workspace(max_len)
+        llm_cache = self._create_llm_cache()
+        audio_toks_buffer, subword_mask, codec_cache = self._create_codec_state(max_len)
+        perception_cache = None
+        if self.use_perception_cache and self.perception_cache_mgr is not None:
+            perception_cache = self.perception_cache_mgr.get_initial_state(batch_size=1)
 
-        Parameters:
-            audio_buffer (torch.Tensor): Tensor of shape `[1, buffer_size_samples]` holding the latest audio samples.
-            buffer_fill_level (int): Number of valid samples currently stored in `audio_buffer`.
-            new_audio (torch.Tensor): Incoming samples of shape `[1, slice_n_samples]` for the current step.
-            buffer_size_samples (int): Total capacity of the buffer in samples.
+        past_key_values = None
+        code = None
+        if self.decode_audio and self.first_tts_code_input is not None:
+            past_key_values = self._clone_cache(self.first_tts_past_key_values_input)
+            code = self.first_tts_code_input.detach().clone()
 
-        Returns:
-            Tuple[torch.Tensor, int, torch.Tensor]:
-                - Updated `audio_buffer` containing the newest samples (always capped to `buffer_size_samples`).
-                - Updated `buffer_fill_level`, reflecting how many contiguous samples are valid.
-                - `current_buffer`, a view over the valid portion of the buffer used for the model input.
-
-        Notes:
-            `audio_buffer` always retains the last `buffer_size_samples` samples even when overfilled,
-            whereas `current_buffer` may be shorter during the initial warm-up phase when the buffer
-            is not yet full.
-        """
-        if new_audio.shape[1] == 0:
-            current_buffer = audio_buffer[:, :buffer_fill_level]
-            return audio_buffer, buffer_fill_level, current_buffer
-
-        remaining = new_audio
-
-        if buffer_fill_level < buffer_size_samples and remaining.shape[1] > 0:
-            warmup_take = min(buffer_size_samples - buffer_fill_level, remaining.shape[1])
-            if warmup_take > 0:
-                audio_buffer[:, buffer_fill_level:buffer_fill_level + warmup_take] = remaining[:, :warmup_take]
-                buffer_fill_level += warmup_take
-                remaining = remaining[:, warmup_take:]
-
-        if remaining.shape[1] > 0:
-            if remaining.shape[1] >= buffer_size_samples:
-                audio_buffer = remaining[:, -buffer_size_samples:]
-            else:
-                audio_buffer = torch.cat([
-                    audio_buffer[:, remaining.shape[1]:],
-                    remaining
-                ], dim=1)
-            buffer_fill_level = buffer_size_samples
-        current_buffer = audio_buffer if buffer_fill_level == buffer_size_samples else audio_buffer[:, :buffer_fill_level]
-        return audio_buffer, buffer_fill_level, current_buffer
+        return {
+            "frame_idx": 0,
+            "gen_text": gen_text,
+            "gen_asr_text": gen_asr_text,
+            "gen_function_text": gen_function_text,
+            "audio_toks_buffer": audio_toks_buffer,
+            "input_embeds_history": [],
+            "dynamic_cache": llm_cache,
+            "past_key_values": past_key_values,
+            "code": code,
+            "subword_mask": subword_mask,
+            "perception_cache": perception_cache,
+            "codec_cache": codec_cache,
+            "cache_position_offset": 0,
+        }
 
     def infer_one_step(self,
                        audio_input,
@@ -877,7 +857,8 @@ class NemotronVoicechatInferenceWrapper:
                        perception_cache: Optional[PerceptionCacheState] = None,
                        has_prompt: bool = False,
                        codec_cache=None,
-                       cache_position_offset: int = 0):
+                       cache_position_offset: int = 0,
+                       return_debug: bool = False):
 
         # Set up effective request ID for vLLM streaming
         effective_request_id = request_id or self.request_id
@@ -889,6 +870,10 @@ class NemotronVoicechatInferenceWrapper:
         predicted_tokens = torch.empty((batch_size, num_frames_per_chunk), dtype=gen_text.dtype, device=gen_text.device)
         asr_predicted_tokens = torch.empty((batch_size, num_frames_per_chunk), dtype=gen_text.dtype, device=gen_text.device)
         function_predicted_tokens = torch.empty((batch_size, num_frames_per_chunk), dtype=gen_text.dtype, device=gen_text.device)
+        debug_text_logits = []
+        debug_asr_logits = []
+        debug_input_embeds = []
+        selected_frame_indices = []
 
         # Do "perception" step outside the for-loop
         start_perception = time.time()
@@ -942,16 +927,22 @@ class NemotronVoicechatInferenceWrapper:
             current_frame_idx = frame_idx + frame_offset
             current_frame_index = base_frame_index + frame_offset
             current_frame_index = min(current_frame_index, total_encoded_frames - 1)
+            selected_frame_indices.append(current_frame_index)
             current_frame_embedding = source_encoded[:, current_frame_index:current_frame_index + 1, :]
 
             current_input_emb = current_frame_embedding.clone()
+            current_input_emb *= self.model.stt_model.cfg.get("duplex_user_channel_weight", 1.0)
 
             has_fc = gen_function_text is not None
 
             if current_frame_idx == 0 and not has_prompt:
                 # Only add BOS if there's no prompt (BOS is already in prompt's position 0)
-                current_input_emb += self._get_bos_embedding()
-                current_input_emb += self._get_asr_bos_embedding()
+                current_input_emb += self._get_bos_embedding() * self.model.stt_model.cfg.get(
+                    "duplex_text_channel_weight", 1.0
+                )
+                current_input_emb += self._get_asr_bos_embedding() * self.model.stt_model.cfg.get(
+                    "duplex_asr_text_weight", 1.0
+                )
                 if has_fc:
                     pad_id = self.model.stt_model.text_pad_id
                     fc_pad_token = torch.full((1,), fill_value=pad_id, device=self.device, dtype=torch.long)
@@ -969,13 +960,18 @@ class NemotronVoicechatInferenceWrapper:
                     current_input_emb += self.model.stt_model.embed_tokens(pad_token).to(dtype=self.dtype)
             else:
                 # t > 0: add embeddings from model's own predictions at t-1
-                last_token_emb = self.model.stt_model.embed_tokens(gen_text[:, current_frame_idx - 1])
-                current_input_emb += last_token_emb
-                last_asr_token_emb = self.model.stt_model.embed_asr_tokens(gen_asr_text[:, current_frame_idx - 1])
-                current_input_emb += last_asr_token_emb
+                last_token_emb = self.model.stt_model.embed_tokens(
+                    gen_text[:, current_frame_idx - 1]
+                ) * self.model.stt_model.cfg.get("duplex_text_channel_weight", 1.0)
+                last_asr_token_emb = self.model.stt_model.embed_asr_tokens(
+                    gen_asr_text[:, current_frame_idx - 1]
+                ) * self.model.stt_model.cfg.get("duplex_asr_text_weight", 1.0)
+                current_input_emb += last_token_emb + last_asr_token_emb
                 if has_fc:
                     last_fc_token_emb = self.model.stt_model.embed_tokens(gen_function_text[:, current_frame_idx - 1])
                     current_input_emb += last_fc_token_emb.to(dtype=self.dtype)
+            if return_debug:
+                debug_input_embeds.append(current_input_emb.detach().cpu())
 
             start_stt_model = time.time()
 
@@ -997,7 +993,8 @@ class NemotronVoicechatInferenceWrapper:
                         cache=dynamic_cache,
                         cache_position=cache_pos,
                         generated_tokens=gen_text,
-                        current_step=current_frame_idx
+                        current_step=current_frame_idx,
+                        return_logits=return_debug,
                     )
                 dynamic_cache = ans["cache"]
             else:
@@ -1007,7 +1004,8 @@ class NemotronVoicechatInferenceWrapper:
                     full_input_embeds,
                     cache=None,
                     generated_tokens=gen_text,
-                    current_step=current_frame_idx
+                    current_step=current_frame_idx,
+                    return_logits=return_debug,
                 )
 
             torch.cuda.synchronize()
@@ -1016,6 +1014,10 @@ class NemotronVoicechatInferenceWrapper:
 
             predicted_token = ans["predicted_token"]
             asr_predicted_token = ans["asr_predicted_token"]
+            if return_debug and "text_logits" in ans:
+                debug_text_logits.append(ans["text_logits"][:, -1].detach().cpu())
+            if return_debug and "asr_logits" in ans and ans["asr_logits"] is not None:
+                debug_asr_logits.append(ans["asr_logits"][:, -1].detach().cpu())
 
             gen_text[:, current_frame_idx] = predicted_token
             predicted_tokens[:, frame_offset] = predicted_token
@@ -1183,6 +1185,16 @@ class NemotronVoicechatInferenceWrapper:
         }
         if self.model.stt_model.function_head is not None:
             result['function_predicted_text_tokens'] = function_predicted_tokens
+        if return_debug:
+            result["debug"] = {
+                "source_encoded": source_encoded.detach().cpu(),
+                "selected_frame_indices": selected_frame_indices,
+                "input_embeds": torch.cat(debug_input_embeds, dim=1) if debug_input_embeds else None,
+                "gen_text": gen_text.detach().cpu(),
+                "gen_asr": gen_asr_text.detach().cpu() if gen_asr_text is not None else None,
+                "text_logits": torch.stack(debug_text_logits, dim=1) if debug_text_logits else None,
+                "asr_logits": torch.stack(debug_asr_logits, dim=1) if debug_asr_logits else None,
+            }
         return result
 
     def abort_request(self, request_id: Optional[str]) -> bool:
@@ -1262,746 +1274,11 @@ class NemotronVoicechatInferenceWrapper:
                     gen_text[batch_idx, t] = self.model.stt_model.text_eos_id
                     logging.info(f"Forced turn-taking at frame {t}: inserted agent EOS (reason: user started speaking)")
 
-    @torch.no_grad()
-    def inference_realtime_streaming(self, audio_path: str, num_frames_per_chunk: int = None, request_id: Optional[str] = None, pad_audio_to_sec: Optional[float] = None, pad_silence_ratio: Optional[float] = None, pad_audio_by_sec: Optional[float] = None, system_prompt: Optional[str] = None):
-        """
-        Perform realtime streaming inference simulating microphone capture.
-
-        Args:
-            audio_path: Path to input audio file (simulates microphone input)
-            num_frames_per_chunk: Number of frames to process per inference step (default: 1)
-            request_id: Optional request ID for vLLM streaming
-            pad_audio_to_sec: Optional duration to pad audio to (in seconds)
-            pad_silence_ratio: Optional ratio of original duration to append as silence (e.g. 0.2 = 20%)
-            pad_audio_by_sec: Optional fixed number of extra seconds of silence to append
-            system_prompt: Optional system prompt to provide context to the model
-
-        Returns:
-            Dictionary with 'text', 'tokens_text', 'tokens_audio', 'audio', 'audio_len', 'system_prompt'
-        """
-        # Use provided value or default
-        if num_frames_per_chunk is None:
-            num_frames_per_chunk = DEFAULT_NUM_FRAMES_PER_CHUNK
-        if num_frames_per_chunk < 1:
-            raise ValueError("num_frames_per_chunk must be at least 1")
-        start_time = time.time()
-
-        logging.info("\n" + "=" * 70)
-        logging.info("STARTING REALTIME STREAMING INFERENCE")
-        logging.info("=" * 70)
-
-        # Set up request ID for vLLM streaming
-        stream_request_id = request_id or self.request_id
-
-        buffer_size_frames = int(self.model_cfg.get("buffer_size_frames", DEFAULT_BUFFER_SIZE_FRAMES))
-        buffer_size_samples = buffer_size_frames * FRAME_SIZE_SAMPLES
-        if num_frames_per_chunk > buffer_size_frames:
-            raise ValueError(
-                f"num_frames_per_chunk ({num_frames_per_chunk}) must be "
-                f"less than or equal to buffer_size_frames ({buffer_size_frames})."
-            )
-
-        att_context_size = self.model.stt_model.perception.encoder._cfg.att_context_size
-        if self.use_perception_cache:
-            min_buffer = num_frames_per_chunk * (att_context_size[1] + 1) + 2
-            reason = (
-                f"must be >= num_frames_per_chunk * (att_context_size[1] + 1) + 2 = "
-                f"{num_frames_per_chunk} * ({att_context_size[1]} + 1) + 2 = {min_buffer} "
-                f"when using perception cache (+2 to minimize windowing artifacts)"
-            )
-        else:
-            min_buffer = att_context_size[0] + att_context_size[1] + 1
-            reason = (
-                f"must be >= att_context_size[0] + att_context_size[1] + 1 = "
-                f"{att_context_size[0]} + {att_context_size[1]} + 1 = {min_buffer} "
-                f"without perception cache"
-            )
-        if buffer_size_frames < min_buffer:
-            raise ValueError(
-                f"buffer_size_frames ({buffer_size_frames}) is too small: {reason}."
-            )
-        if self.decode_audio and not self.use_codec_cache and num_frames_per_chunk > self.codec_token_history_size:
-            raise ValueError(
-                f"num_frames_per_chunk ({num_frames_per_chunk}) must be "
-                f"<= codec_token_history_size ({self.codec_token_history_size}) when decode_audio=True "
-                f"and use_codec_cache=False. "
-                f"Either reduce num_frames_per_chunk, increase codec_token_history_size, or enable use_codec_cache."
-            )
-        logging.info(f"Buffer size: {buffer_size_frames} frames ({buffer_size_frames * FRAME_SIZE_SEC}s)")
-        logging.info(f"Frames per inference step: {num_frames_per_chunk}")
-
-        # Load audio file (simulating microphone stream)
-        logging.info(f"Loading audio file: {audio_path}")
-        audio_signal, sr = librosa.load(audio_path, sr=SAMPLE_RATE)
-        total_samples = len(audio_signal)
-        total_duration = total_samples / SAMPLE_RATE
-
-        logging.info(f"   Total duration: {total_duration:.2f}s")
-        logging.info(f"   Total samples: {total_samples}")
-
-        # Optionally pad audio (at most one of these is set; enforced by caller)
-        if pad_audio_to_sec is not None and pad_audio_to_sec > total_duration:
-            target_samples = int(pad_audio_to_sec * SAMPLE_RATE)
-            audio_signal = np.pad(audio_signal, (0, target_samples - total_samples), mode='constant')
-            total_samples = len(audio_signal)
-            logging.info(f"   Padded to {pad_audio_to_sec:.2f}s ({total_samples} samples)")
-        elif pad_silence_ratio is not None:
-            extra_samples = int(total_duration * pad_silence_ratio * SAMPLE_RATE)
-            audio_signal = np.pad(audio_signal, (0, extra_samples), mode='constant')
-            total_samples = len(audio_signal)
-            logging.info(f"   Padded with {pad_silence_ratio*100:.1f}% extra silence ({extra_samples} samples)")
-        elif pad_audio_by_sec is not None:
-            extra_samples = int(pad_audio_by_sec * SAMPLE_RATE)
-            audio_signal = np.pad(audio_signal, (0, extra_samples), mode='constant')
-            total_samples = len(audio_signal)
-            logging.info(f"   Padded with {pad_audio_by_sec:.2f}s extra silence ({extra_samples} samples)")
-
-        # derive num_inference_steps
-        total_frames_maybe = int(np.ceil(total_samples / FRAME_SIZE_SAMPLES)) # "maybe" because we might need to add padding
-        num_inference_steps = (total_frames_maybe // num_frames_per_chunk)
-        if total_frames_maybe % num_frames_per_chunk != 0:
-            num_inference_steps += 1
-        total_frames = num_inference_steps * num_frames_per_chunk
-
-        # pad audio signal so that it is divisible by num_inference_steps
-        padded_total_samples = num_inference_steps * num_frames_per_chunk * FRAME_SIZE_SAMPLES
-        if padded_total_samples > total_samples:
-            audio_signal = np.pad(audio_signal, (0, padded_total_samples - total_samples), mode='constant')
-            logging.info(f"   Padded to: {padded_total_samples} samples")
-        logging.info(f" {num_frames_per_chunk=} => {total_frames=}, {num_inference_steps=}")
-
-        # convert audio signal to tensor
-        audio_signal_tensor = torch.tensor(audio_signal, dtype=self.dtype, device=self.device).unsqueeze(0)
-
-        use_cache = self.use_llm_cache
-        is_nemotron = 'Nemotron' in self.model.stt_model.cfg.pretrained_llm
-        logging.info(f"Model: {self.model.stt_model.cfg.pretrained_llm}")
-        logging.info(f"   Use LLM cache: {use_cache}, is_nemotron: {is_nemotron}")
-
-        # Initialize buffer and state
-        audio_buffer = torch.zeros(1, buffer_size_samples, dtype=self.dtype, device=self.device)
-        buffer_fill_level = 0  # How many samples currently in buffer
-
-        # Initialize LLM cache (skip for vLLM -- it manages its own KV cache)
-        if not use_cache or self.use_vllm_llm:
-            llm_cache = None
-            if not use_cache:
-                input_embeds_history = []
-        elif is_nemotron:
-            llm_cache = self.model.stt_model._create_nemotron_cache(batch_size=1)
-        else:
-            llm_cache = DynamicCache()
-        cache_position_offset = 0
-
-        # Process system prompt if provided (before streaming audio)
-        prompt_embedded = None
-        prompt_len = 0
-        
-        if system_prompt:
-            start_get_prompt_embeddings = time.time()
-            prompt_embedded, prompt_len = self._prepare_system_prompt_embeddings(system_prompt)
-            logging.info(f"Time taken to get prompt embeddings: {time.time() - start_get_prompt_embeddings:.3f}s")
-            if prompt_embedded is not None and "vllm" in self.engine_type.lower():
-                # Prepare token IDs for the prompt
-                prompt_token_ids = (
-                    [self.tokenizer.bos_id] +
-                    self.tokenizer.text_to_ids(system_prompt) +
-                    [self.tokenizer.eos_id]
-                )
-
-                # For vLLM mode: use efficient BATCH prefill (~20x faster than sequential)
-                logging.info(f"   Batch prefilling {prompt_len} prompt embeddings...")
-                start_batch_prefill = time.time()
-                with torch.no_grad():
-                    success = self.model_llm_interface(
-                        prompt_embedded,
-                        request_id=stream_request_id,
-                        decode_steps=0,
-                        prompt_token_ids=prompt_token_ids,
-                    )
-                logging.info(f"Time taken to batch prefill stt model: {time.time() - start_batch_prefill:.3f}s")
-                if success:
-                    logging.info(f" System prompt prefilled ({prompt_len} tokens)")
-                else:
-                    raise RuntimeError("vLLM batch prefill for system prompt failed.")
-            elif prompt_embedded is not None and not use_cache:
-                # For no-cache mode (Nemotron): add prompt embeddings to history
-                # Split into individual frames for consistent processing
-                for t in range(prompt_len):
-                    input_embeds_history.append(prompt_embedded[:, t:t+1, :])
-                logging.info(f"   Added {prompt_len} prompt embeddings to input_embeds_history")
-            elif prompt_embedded is not None and use_cache:
-                # For cache mode: process prompt through LLM to update cache
-                with torch.no_grad():
-                    cache_pos = torch.arange(prompt_len, device=self.device)
-                    ans = self.model.stt_model(prompt_embedded, cache=llm_cache, cache_position=cache_pos)
-                    llm_cache = ans.get("cache", llm_cache)
-                cache_position_offset = prompt_len
-                logging.info(f"   System prompt processed, cache updated (offset={cache_position_offset})")
-
-        # Initialize TTS
-        code = None
-        past_key_values = None
-        subword_mask = None
-        audio_toks_buffer = None
-        if self.decode_audio and hasattr(self.model, 'tts_model'):
-
-            # Sliding-window buffer is only needed when codec_cache is off
-            if not self.use_codec_cache:
-                audio_toks_buffer = self.model.tts_model.codec_silence_tokens.view(1, 1, -1).expand(
-                    -1, self.codec_token_history_size, -1
-                ).to(self.device)
-
-            if (
-                self.first_context_subword_id is None
-                or self.generation_config is None
-                or self.first_tts_code_input is None
-                or self.first_tts_past_key_values_input is None
-            ) and not self.use_vllm_eartts:
-                raise RuntimeError("TTS warmup state was not prepared during initialization.")
-
-            if not self.use_vllm_eartts:
-                past_key_values = self._clone_cache(self.first_tts_past_key_values_input)
-                code = self.first_tts_code_input.detach().clone()
-            else:
-                start_batch_prefill = time.time()
-                logging.info(f"   Batch prefilling TTS model with speaker embedding...")
-                # use speaker embedding to prefill EarTTS's vLLM
-                tts_result = self.model.tts_model.tts_model(
-                    self.tts_init_inputs,
-                    request_id=stream_request_id,
-                    prompt_token_ids=self.tts_prompt_token_ids
-                )
-                code = self.first_tts_code_input.detach().clone()
-                past_key_values = None
-                logging.info(f"Time taken to batch prefill tts model: {time.time() - start_batch_prefill:.3f}s")
-                # Initialize subword_mask for vLLM path as well
-            subword_mask = torch.ones(1, total_frames, device=self.device, dtype=torch.bool)
-            logging.info(f"TTS initialized")
-
-        # Initialize perception cache if enabled
-        perception_cache = None
-        if self.use_perception_cache:
-            perception_cache = self.perception_cache_mgr.get_initial_state(batch_size=1)
-            logging.info(f"Perception cache initialized")
-
-        # Initialize codec streaming cache to remove clicking sounds and wasted inference computation
-        codec_cache = None
-        if self.decode_audio and self.use_codec_cache:
-            from nemo.collections.speechlm2.modules.ear_tts_vae_codec import CausalConv1dCache
-            codec_cache = CausalConv1dCache()
-            logging.info(f"Codec streaming cache initialized")
-
-        gen_text = torch.full((1, total_frames), self.model.stt_model.text_pad_id, device=self.device, dtype=torch.long)
-        gen_asr_text = torch.full((1, total_frames), self.model.stt_model.text_pad_id, device=self.device, dtype=torch.long)
-        has_function_head = self.model.stt_model.function_head is not None
-        if has_function_head:
-            gen_function_text = torch.full((1, total_frames), self.model.stt_model.text_pad_id, device=self.device, dtype=torch.long)
-
-        # initialize list to which we will append generated audio segments
-        audio_segments = []
-
-        logging.info("\n" + "=" * 70)
-        logging.info("STARTING FRAME-BY-FRAME PROCESSING")
-        logging.info("=" * 70)
-
-        # frame_idx corresponds to index of the first frame passed to infer_one_step
-        # (we need this distinction in the case that num_frames_per_chunk > 1)
-        frame_idx = 0
-        while frame_idx < total_frames:
-            slice_start = frame_idx * FRAME_SIZE_SAMPLES
-            slice_n_samples = num_frames_per_chunk * FRAME_SIZE_SAMPLES
-            slice_end = slice_start + slice_n_samples
-            new_audio = audio_signal_tensor[:, slice_start:slice_end]
-
-            audio_buffer, buffer_fill_level, current_buffer = self._update_audio_buffer(
-                audio_buffer, buffer_fill_level, new_audio, buffer_size_samples
-            )
-
-            result = self.infer_one_step(
-                audio_input=current_buffer,
-                num_frames_per_chunk=num_frames_per_chunk,
-                frame_idx=frame_idx,
-                gen_text=gen_text,
-                audio_toks_buffer=audio_toks_buffer if self.decode_audio else None,
-                input_embeds_history=input_embeds_history if not use_cache else [],
-                dynamic_cache=llm_cache if use_cache else None,
-                past_key_values=past_key_values if self.decode_audio else None,
-                code=code if self.decode_audio else None,
-                subword_mask=subword_mask if self.decode_audio else None,
-                gen_asr_text=gen_asr_text,
-                gen_function_text=gen_function_text if has_function_head else None,
-                request_id=stream_request_id,
-                perception_cache=perception_cache,
-                has_prompt=(prompt_len > 0),
-                codec_cache=codec_cache,
-                cache_position_offset=cache_position_offset,
-            )
-
-            # handle results from infer_one_step
-            if has_function_head and 'function_predicted_text_tokens' in result:
-                for fi in range(num_frames_per_chunk):
-                    gen_function_text[:, frame_idx + fi] = result['function_predicted_text_tokens'][:, fi]
-            input_embeds_history = result['input_embeds_history']
-            llm_cache = result['dynamic_cache']
-            cache_position_offset = result.get('cache_position_offset', cache_position_offset)
-            if self.use_perception_cache:
-                perception_cache = result.get('perception_cache', perception_cache)
-            if self.decode_audio:
-                audio_toks_buffer = result['audio_toks_buffer']
-                decoded_audio_new = result['decoded_audio_new']
-                if decoded_audio_new is not None:
-                    audio_segments.append(decoded_audio_new)
-
-                past_key_values = result['past_key_values']
-                code = result['code']
-                codec_cache = result.get('codec_cache', codec_cache)
-            else:
-                decoded_audio_new = None
-
-            if frame_idx % 10 == 0 or frame_idx < 3 or gen_text[:, frame_idx].item() == self.model.stt_model.text_eos_id:
-                token_str = self.tokenizer.ids_to_text([gen_text[0, frame_idx].item()])
-                buffer_status = f"{buffer_fill_level}/{buffer_size_samples}" if buffer_fill_level < buffer_size_samples else "FULL"
-                special_label = ""
-                if gen_text[0, frame_idx].item() == self.model.stt_model.text_bos_id:
-                    special_label = " [BOS]"
-                elif gen_text[0, frame_idx].item() == self.model.stt_model.text_eos_id:
-                    special_label = " [EOS]"
-                elif gen_text[0, frame_idx].item() == self.model.stt_model.text_pad_id:
-                    special_label = " [PAD]"
-                logging.info(f"Frame {frame_idx:3d}/{total_frames} | Buffer: {buffer_status:20s} | Token: {gen_text[0, frame_idx].item():5d}{special_label} | '{token_str}'")
-
-            frame_idx += num_frames_per_chunk
-
-        # Prepare results
-        elapsed_time = time.time() - start_time
-        logging.info("\n" + "=" * 70)
-        logging.info("STREAMING INFERENCE COMPLETED")
-        logging.info("=" * 70)
-        logging.info(f"Total time: {elapsed_time:.2f}s")
-        logging.info(f"Audio duration: {total_duration:.2f}s")
-        logging.info(f"RTF (Real-Time Factor): {elapsed_time / total_duration:.2f}x")
-        logging.info(f"Processed frames: {total_frames}")
-
-        # Trim to actual length
-        # TODO: this is currently redundant since we iterate over all frames in the while loop
-        gen_text = gen_text[:, :total_frames]
-        gen_asr_text = gen_asr_text[:, :total_frames]
-
-        # Decode text
-        lengths = torch.tensor([total_frames], dtype=torch.long, device=self.device)
-        text_output = tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.model.stt_model.text_pad_id, eval_text_turn_taking=True)
-
-        # Decode ASR text
-        asr_text_output = tokens_to_str(gen_asr_text, lengths, tokenizer=self.tokenizer, pad_id=self.model.stt_model.text_pad_id, eval_text_turn_taking=True)
-
-        # Also create raw versions with <SPECIAL_12> kept for comparison
-        text_output_raw = tokens_to_str_raw(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.model.stt_model.text_pad_id)
-        asr_text_output_raw = tokens_to_str_raw(gen_asr_text, lengths, tokenizer=self.tokenizer, pad_id=self.model.stt_model.text_pad_id)
-
-        logging.info(f"Generated text: {text_output[0]}")
-        logging.info(f"Generated ASR text: {asr_text_output[0]}")
-
-        # Decode function calling channel
-        if has_function_head:
-            gen_function_text = gen_function_text[:, :total_frames]
-            function_text_output = tokens_to_str(gen_function_text, lengths, tokenizer=self.tokenizer, pad_id=self.model.stt_model.text_pad_id, eval_text_turn_taking=False)
-            function_text_output_raw = tokens_to_str_raw(gen_function_text, lengths, tokenizer=self.tokenizer, pad_id=self.model.stt_model.text_pad_id)
-            logging.info(f"Generated function text: {function_text_output[0]}")
-
-        ans = {
-            "text": text_output,
-            "text_raw": text_output_raw,
-            "tokens_text": gen_text,
-            "tokens_len": lengths,
-            "audio": torch.cat(audio_segments, dim=-1) if audio_segments else None,
-            "asr_text": asr_text_output,
-            "asr_text_raw": asr_text_output_raw,
-            "asr_tokens": gen_asr_text,
-            "system_prompt": system_prompt if system_prompt else "",
-        }
-        if has_function_head:
-            ans["function_text"] = function_text_output
-            ans["function_text_raw"] = function_text_output_raw
-            ans["function_tokens"] = gen_function_text
-
-        if self.use_vllm_llm or self.use_vllm_eartts:
-            self.abort_request(stream_request_id)
-
-        return ans
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Realtime Streaming Inference")
-    parser.add_argument("--model_path", type=str, required=True,
-                       help="Path to eartts's checkpoint with TTS (HF format)")
-    parser.add_argument("--llm_checkpoint_path", type=str, required=True,
-                       help="Path to checkpoint with LLM/perception (HF format)")
-    parser.add_argument("--audio_path", type=str, default=None,
-                       help="Path to input audio file (for single-file mode)")
-    parser.add_argument("--input_json", type=str, default=None,
-                       help="Path to input JSON file containing list of records with audio_filepath and text fields (for batch mode)")
-    parser.add_argument("--output_json", type=str, default=None,
-                       help="Path to output JSON file with predictions")
-    parser.add_argument("--output_dir", type=str, default="output_streaming",
-                       help="Output directory for audio files and JSON results")
-    parser.add_argument("--pad_audio_to_sec", type=float, default=None,
-                       help="Pad audio to this duration in seconds (useful for consistent buffer behavior)")
-    parser.add_argument("--pad_silence_ratio", type=float, default=None,
-                       help="Append silence equal to this ratio of the original audio duration (e.g. 0.2 = 20%% extra)")
-    parser.add_argument("--pad_audio_by_sec", type=float, default=None,
-                       help="Append this many seconds of extra silence after the audio")
-    parser.add_argument("--speaker_reference", type=str, default=None,
-                       help="Path to speaker reference audio file")
-    parser.add_argument("--speaker_name", type=str, default=None,
-                       help="Name of a registered speaker whose latent is cached in the checkpoint")
-    parser.add_argument("--buffer_size_frames", type=int, default=DEFAULT_BUFFER_SIZE_FRAMES,
-                       help=f"Size of audio buffer in frames (each frame = 80ms, default: {DEFAULT_BUFFER_SIZE_FRAMES})")
-    parser.add_argument("--num_frames_per_chunk", type=int, default=DEFAULT_NUM_FRAMES_PER_CHUNK,
-                       help="Number of frames per inference step (default: 1)")
-    parser.add_argument("--decode_audio", action="store_true",
-                       help="Whether to decode audio")
-    parser.add_argument("--combine_inp_out_audio", action="store_true",
-                       help="Whether to combine input and output audio into a stereo file")
-
-    # Deterministic inference
-    parser.add_argument("--deterministic", action="store_true",
-                       help="Enable fully deterministic inference (disables FlashAttention, forces deterministic "
-                            "CUDA algorithms). Useful for reproducible benchmarking. Not compatible with vLLM engines. "
-                            "Note: results may differ slightly from non-deterministic mode due to different compute path.")
-
-    # Perception cache argument
-    parser.add_argument("--use_perception_cache", action="store_true",
-                       help="Enable cache-aware streaming for perception encoder")
-    parser.add_argument("--use_perception_cudagraph", action="store_true",
-                       help="Use CUDA graphs for perception encoder (requires --use_perception_cache)")
-    # LLM KV cache argument
-    parser.add_argument("--use_llm_cache", action="store_true",
-                       help="Use KV cache for the STT LLM (DynamicCache or HybridMambaAttentionDynamicCache for Nemotron)")
-    # Codec streaming cache argument
-    parser.add_argument("--use_codec_cache", action="store_true",
-                       help="Enable incremental codec decode to remove clicking sounds and wasted inference computation (recommended)")
-
-    # torch.compile for native inference
-    parser.add_argument("--use_tts_torch_compile", action="store_true",
-                       help="Compile TTS backbone with torch.compile for faster native inference (mode='default')")
-
-    # TTS model speedup flags (applied inside ear_tts_model.py)
-    parser.add_argument("--use_tts_subword_cache", action="store_true",
-                       help="Cache CharAwareSubwordEncoder embeddings at inference time (skip backbone for repeated tokens)")
-
-    # vLLM arguments
-    parser.add_argument("--engine_type", type=str, default="native", choices=["native", "vllm_llm", "vllm_eartts", "vllm_llm_vllm_eartts"],
-                       help="Engine type for inference (default: native)")
-    parser.add_argument("--vllm_llm_engine_path", type=str, default=None,
-                       help="Path to vLLM-compatible model checkpoint if the path not exists, it will be auto-converted")
-    parser.add_argument("--vllm_max_model_len", type=int, default=768,
-                       help="Maximum sequence length for vLLM (default: 768)")
-    parser.add_argument("--vllm_gpu_memory_utilization", type=float, nargs='+', default=[0.4],
-                       help="GPU memory utilization for vLLM. Single value shared by both engines; two values assign to LLM and TTS respectively.")
-    parser.add_argument("--vllm_llm_dtype", type=str, default="bfloat16",
-                       help="Data type for vLLM (default: bfloat16)")
-
-    # vLLM EarTTS arguments
-    parser.add_argument("--vllm_eartts_engine_path", type=str, default=None,
-                       help="Path to vLLM-compatible EarTTS model checkpoint if the path not exists, it will be auto-converted")
-    parser.add_argument("--vllm_eartts_dtype", type=str, default="float32",
-                       help="Data type for vLLM (default: float32)")
-
-    # Sampling parameters
-    parser.add_argument("--top_p", type=float, default=1.0,
-                       help="Top-p (nucleus) sampling threshold. 1.0 disables it (greedy). Default: 1.0")
-    parser.add_argument("--repetition_penalty", type=float, default=1.0,
-                       help="Repetition penalty for generated tokens. 1.0 disables it. Default: 1.0. Recommended: 1.2")
-    parser.add_argument("--temperature", type=float, default=1.0,
-                       help="Temperature for sampling. 1.0 = no change, <1.0 = sharper, >1.0 = flatter, 0.0 = greedy. Default: 1.0")
-
-    # Turn-taking
-    parser.add_argument("--force_turn_taking", action="store_true",
-                       help="Enable forced turn-taking based on ASR channel tokens")
-    parser.add_argument("--force_turn_taking_threshold", type=int, default=40,
-                       help="Number of lookback steps for turn-taking detection (default: 40)")
-    parser.add_argument("--force_turn_taking_pad_window", type=int, default=25,
-                       help="Number of consecutive ASR pad tokens to trigger turn-taking (default: 25)")
-
-    # Inference logit boosts
-    parser.add_argument("--inference_pad_boost", type=float, default=None,
-                       help="Boost for agent pad logit at inference time")
-    parser.add_argument("--inference_bos_boost", type=float, default=None,
-                       help="Boost for agent BOS logit at inference time")
-    parser.add_argument("--inference_eos_boost", type=float, default=None,
-                       help="Boost for agent EOS logit at inference time")
-    parser.add_argument("--inference_user_pad_boost", type=float, default=None,
-                       help="Boost for ASR pad logit at inference time")
-    parser.add_argument("--inference_user_bos_boost", type=float, default=None,
-                       help="Boost for ASR BOS logit at inference time")
-    parser.add_argument("--inference_user_eos_boost", type=float, default=None,
-                       help="Boost for ASR EOS logit at inference time")
-
-    # System prompt
-    parser.add_argument("--system_prompt", type=str, default=None,
-                       help="System prompt to provide context to the model. Can also be specified per-record in input JSON.")
-    parser.add_argument("--tts_system_prompt", type=str, default=None,
-                       help="System prompt for EARTTS model.")
-    args = parser.parse_args()
-
-    # Validate arguments: either audio_path OR input_json must be provided
-    if args.audio_path is None and args.input_json is None:
-        parser.error("Either --audio_path (single-file mode) or --input_json (batch mode) must be provided")
-    if args.audio_path is not None and args.input_json is not None:
-        parser.error("Cannot use both --audio_path and --input_json at the same time")
-
-    if sum(x is not None for x in [args.pad_audio_to_sec, args.pad_silence_ratio, args.pad_audio_by_sec]) > 1:
-        raise ValueError("Set at most one of: --pad_audio_to_sec, --pad_silence_ratio, --pad_audio_by_sec")
-    if args.speaker_reference is None and args.speaker_name is None:
-        parser.error("At least one of --speaker_reference or --speaker_name must be provided")
-    if not math.isfinite(args.temperature) or args.temperature < 0.0:
-        parser.error(f"--temperature must be a finite value >= 0.0, got {args.temperature}")
-
-    try:
-        import json
-        import soundfile as sf
-
-        model_cfg_dict = {
-            "model_path": args.model_path,
-            "llm_checkpoint_path": args.llm_checkpoint_path,
-            "speaker_reference": args.speaker_reference,
-            "speaker_name": args.speaker_name,
-            "buffer_size_frames": args.buffer_size_frames,
-            "decode_audio": bool(args.decode_audio),
-            "engine_type": args.engine_type,
-            "deterministic": bool(args.deterministic),
-            "use_perception_cache": bool(args.use_perception_cache),
-            "use_perception_cudagraph": bool(args.use_perception_cudagraph),
-            "use_llm_cache": bool(args.use_llm_cache),
-            "use_codec_cache": bool(args.use_codec_cache),
-            "use_tts_torch_compile": bool(args.use_tts_torch_compile),
-            "use_tts_subword_cache": bool(args.use_tts_subword_cache),
-            "top_p": args.top_p,
-            "repetition_penalty": args.repetition_penalty,
-            "temperature": args.temperature,
-            "tts_system_prompt": args.tts_system_prompt,
-            "force_turn_taking": args.force_turn_taking,
-            "force_turn_taking_threshold": args.force_turn_taking_threshold,
-            "force_turn_taking_pad_window": args.force_turn_taking_pad_window,
-            "inference_pad_boost": args.inference_pad_boost,
-            "inference_bos_boost": args.inference_bos_boost,
-            "inference_eos_boost": args.inference_eos_boost,
-            "inference_user_pad_boost": args.inference_user_pad_boost,
-            "inference_user_bos_boost": args.inference_user_bos_boost,
-            "inference_user_eos_boost": args.inference_user_eos_boost,
-        }
-
-        # Pop GPU memory utilization values: first for LLM, second (or same) for TTS
-        _gpu_mem = list(args.vllm_gpu_memory_utilization)
-        gpu_mem_llm = _gpu_mem.pop(0)
-        gpu_mem_tts = _gpu_mem.pop(0) if _gpu_mem else gpu_mem_llm
-
-        # Add vLLM configuration if using vLLM engine
-        if "vllm_llm" in args.engine_type:
-            model_cfg_dict["vllm_llm_config"] = {
-                "model_path": args.model_path,
-                "max_model_len": args.vllm_max_model_len,
-                "gpu_memory_utilization": gpu_mem_llm,
-                "dtype": args.vllm_llm_dtype,
-                "engine_path": args.vllm_llm_engine_path,  # Will auto-convert if needed
-                "pretrained_llm": args.llm_checkpoint_path,
-            }
-
-        if "vllm_eartts" in args.engine_type:
-            model_cfg_dict["vllm_tts_config"] = {
-                "model_path": args.model_path, # we use exactly the same whole duplexs2s ckpt
-                "max_model_len": args.vllm_max_model_len,
-                "gpu_memory_utilization": gpu_mem_tts,
-                "dtype": args.vllm_eartts_dtype,
-                "engine_path": args.vllm_eartts_engine_path,
-                "pretrained_llm": None,
-                "skip_tokenizer_init": True
-            }
-
-        model_cfg = OmegaConf.create(model_cfg_dict)
-
-        model = NemotronVoicechatInferenceWrapper(model_cfg=model_cfg)
-
-        # =========================================
-        # Load input records (from JSON manifest or single audio file)
-        # =========================================
-        if args.input_json is not None:
-            logging.info(f"Loading input JSON: {args.input_json}")
-            with open(args.input_json, 'r') as f:
-                input_records = [json.loads(line) for line in f]
-        else:
-            input_records = [{"audio_filepath": args.audio_path, "text": ""}]
-
-        logging.info(f"Found {len(input_records)} records to process")
-
-        os.makedirs(args.output_dir, exist_ok=True)
-
-        if args.output_json:
-            base_path = args.output_json.rsplit('.', 1)[0] if '.' in args.output_json else args.output_json
-            output_json_processed = f"{base_path}_processed.json"
-            output_json_raw = f"{base_path}_raw.json"
-        else:
-            output_json_processed = os.path.join(args.output_dir, "output_results_processed.json")
-            output_json_raw = os.path.join(args.output_dir, "output_results_raw.json")
-
-        logging.info(f"Output will be saved incrementally to:")
-        logging.info(f"   Processed: {output_json_processed}")
-        logging.info(f"   Raw: {output_json_raw}")
-        output_file_processed = open(output_json_processed, 'w', encoding='utf-8')
-        output_file_raw = open(output_json_raw, 'w', encoding='utf-8')
-
-        output_records = []
-        wer_scores = []
-
-        try:
-            for idx, record in enumerate(input_records):
-                logging.info("\n" + "=" * 70)
-                logging.info(f"Processing record {idx + 1}/{len(input_records)}")
-                logging.info("=" * 70)
-
-                audio_path = record.get('audio_filepath')
-                ground_truth_text = record.get('text', '')
-                record_system_prompt = record.get('system_prompt', args.system_prompt)
-
-                if not audio_path:
-                    logging.warning(f"Record {idx} missing audio_filepath, skipping...")
-                    continue
-
-                if not os.path.exists(audio_path):
-                    logging.warning(f"Audio file not found: {audio_path}, skipping...")
-                    continue
-
-                logging.info(f"   Audio: {audio_path}")
-                logging.info(f"   Ground truth: {ground_truth_text}")
-
-                audio_id = os.path.splitext(os.path.basename(audio_path))[0]
-
-                results = model.inference_realtime_streaming(
-                    audio_path,
-                    num_frames_per_chunk=args.num_frames_per_chunk,
-                    pad_audio_to_sec=args.pad_audio_to_sec,
-                    pad_silence_ratio=args.pad_silence_ratio,
-                    pad_audio_by_sec=args.pad_audio_by_sec,
-                    request_id=f"streaming_request_{idx}",
-                    system_prompt=record_system_prompt,
-                )
-
-                pred_asr_text = results['asr_text'][0] if 'asr_text' in results else ''
-                pred_asr_text_raw = results['asr_text_raw'][0] if 'asr_text_raw' in results else ''
-                pred_text = results['text'][0] if 'text' in results else ''
-                pred_text_raw = results['text_raw'][0] if 'text_raw' in results else ''
-
-                try:
-                    cleaned_pred = clean_pred_text(pred_asr_text)
-                    cleaned_gt = clean_pred_text(ground_truth_text)
-                    if cleaned_gt.strip() and cleaned_pred.strip():
-                        utterance_wer = wer(cleaned_gt, cleaned_pred)
-                        wer_scores.append(utterance_wer)
-                    else:
-                        utterance_wer = None
-                except Exception as e:
-                    utterance_wer = None
-                    logging.warning(f"Error calculating WER: {e}")
-
-                if utterance_wer is not None:
-                    logging.info(f"WER for utterance {idx + 1}: {utterance_wer:.4f} ({utterance_wer * 100:.2f}%)")
-
-                pred_audio_path = None
-                if args.decode_audio and 'audio' in results and results['audio'] is not None:
-                    input_basename = os.path.splitext(os.path.basename(audio_path))[0]
-                    audio_filename = f"{idx:04d}_{input_basename}_output.wav"
-                    pred_audio_path = os.path.join(args.output_dir, audio_filename)
-
-                    audio_np = results['audio'].float().cpu().numpy().flatten()
-
-                    sf.write(pred_audio_path, audio_np, model.target_sample_rate)
-                    logging.info(f"Audio saved: {pred_audio_path}")
-
-                    if args.combine_inp_out_audio:
-                        stereo_filename = f"{idx:04d}_{input_basename}_combined.wav"
-                        stereo_path_out = os.path.join(args.output_dir, stereo_filename)
-
-                        inp_audio, sr = librosa.load(audio_path, sr=model.target_sample_rate)
-
-                        delay_samples = int(args.num_frames_per_chunk * FRAME_SIZE_SEC * model.target_sample_rate)
-                        out_audio_delayed = np.concatenate([np.zeros(delay_samples, dtype=audio_np.dtype), audio_np])
-
-                        max_len = max(len(inp_audio), len(out_audio_delayed))
-                        inp_audio_padded = np.pad(inp_audio, (0, max_len - len(inp_audio)))
-                        out_audio_padded = np.pad(out_audio_delayed, (0, max_len - len(out_audio_delayed)))
-
-                        stereo_audio = np.stack([inp_audio_padded, out_audio_padded], axis=1)
-                        sf.write(stereo_path_out, stereo_audio, model.target_sample_rate)
-                        logging.info(f"Stereo audio saved: {stereo_path_out}")
-
-                result_system_prompt = results.get('system_prompt', '')
-
-                output_record_processed = {
-                    'id': audio_id,
-                    'target_text': '',
-                    'pred_audio': pred_audio_path,
-                    'src_text': ground_truth_text,
-                    'pred_src_text': pred_asr_text,
-                    'pred_text': pred_text,
-                    'system_prompt': result_system_prompt,
-                }
-
-                output_record_raw = {
-                    'id': audio_id,
-                    'target_text': '',
-                    'pred_audio': pred_audio_path,
-                    'src_text': ground_truth_text,
-                    'pred_src_text': pred_asr_text_raw,
-                    'pred_text': pred_text_raw,
-                    'system_prompt': result_system_prompt,
-                }
-
-                output_records.append(output_record_processed)
-
-                json.dump(output_record_processed, output_file_processed, ensure_ascii=False)
-                output_file_processed.write('\n')
-                output_file_processed.flush()
-
-                json.dump(output_record_raw, output_file_raw, ensure_ascii=False)
-                output_file_raw.write('\n')
-                output_file_raw.flush()
-
-                logging.info(f"Record {idx + 1} completed and saved")
-
-        finally:
-            output_file_processed.close()
-            output_file_raw.close()
-
-        logging.info("\n" + "=" * 70)
-        logging.info("ALL RESULTS SAVED")
-        logging.info("=" * 70)
-        logging.info(f"Results saved to:")
-        logging.info(f"   Processed: {output_json_processed}")
-        logging.info(f"   Raw: {output_json_raw}")
-        logging.info(f"   Processed {len(output_records)}/{len(input_records)} records successfully")
-
-        if wer_scores:
-            avg_wer = np.mean(wer_scores)
-            logging.info("\n" + "=" * 70)
-            logging.info("WER STATISTICS")
-            logging.info("=" * 70)
-            logging.info(f"   Total utterances with WER: {len(wer_scores)}")
-            logging.info(f"   Average WER: {avg_wer:.4f} ({avg_wer * 100:.2f}%)")
-            logging.info(f"   Min WER: {np.min(wer_scores):.4f} ({np.min(wer_scores) * 100:.2f}%)")
-            logging.info(f"   Max WER: {np.max(wer_scores):.4f} ({np.max(wer_scores) * 100:.2f}%)")
-
-        logging.info("=" * 70)
-        logging.info("ALL DONE!")
-        logging.info("=" * 70)
-
-    except Exception as e:
-        logging.error(f"ERROR during inference: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
-
-    return 0
+    raise RuntimeError(
+        "This module cannot be called directly. "
+        "Use examples/speechlm2/nemo_inference_pipelines/s2s_streaming_infer.py instead."
+    )
 
 
 if __name__ == "__main__":

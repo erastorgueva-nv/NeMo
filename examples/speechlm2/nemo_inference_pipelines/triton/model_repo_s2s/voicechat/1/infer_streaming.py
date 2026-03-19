@@ -38,10 +38,10 @@ class TritonPythonModel:
     
     def _resolve_env_overrides(self, cfg):
         """Resolve ??? placeholders in the config from environment variables.
-        
+
         This allows start_triton.sh to control model paths and settings via
         env vars, while sharing the same s2s_streaming.yaml used by the CLI.
-        
+
         Env var mapping (cfg key -> env var, default):
             s2s.model_path             -> S2S_MODEL_PATH (required)
             s2s.llm_checkpoint_path    -> S2S_LLM_CHECKPOINT_PATH (required)
@@ -69,7 +69,6 @@ class TritonPythonModel:
         for cfg_key, (env_var, default) in env_overrides.items():
             val = os.environ.get(env_var)
             if val is not None:
-                # Cast to match the default's type (e.g. "0.08" -> float)
                 if default is not None and isinstance(default, bool):
                     val = val.lower() in ("true", "1", "yes")
                 elif default is not None and isinstance(default, float):
