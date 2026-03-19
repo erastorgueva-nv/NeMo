@@ -122,8 +122,10 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
         # Load Duplex TTS model
         self.tts_model = DuplexEARTTS(OmegaConf.to_container(self.cfg.speech_generation, resolve=True))
 
-        # reset silence tokens to avoid inference issues
-        self.tts_model.codec_silence_tokens = self.tts_model.get_codec_silence_frame()
+        # reset silence tokens to avoid inference issues (skip when codec
+        # has random weights — the buffer will be loaded from checkpoint)
+        if self.tts_model.cfg.get('pretrained_codec_model', None) is not None:
+            self.tts_model.codec_silence_tokens = self.tts_model.get_codec_silence_frame()
         self.target_fps = self.tts_model.target_fps
         # compute source fps
         self.source_fps = self.source_sample_rate / (
@@ -224,6 +226,7 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
         try:
             stt_model_cfg = cfg['model']['stt']['model']
             stt_model_cfg['pretrained_weights'] = False
+            stt_model_cfg['use_meta_device'] = True
             if 'perception' in cfg:
                 stt_model_cfg['perception'] = cfg['perception']
                 logging.info("Injected saved perception config into STT model config")
@@ -257,11 +260,31 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
         if resolved_weights_file is None:
             raise RuntimeError(f"Missing model.safetensors file for {model_id=}")
 
-        # Stream the weights safely using your custom memory-efficient loader!
+        # Stream the weights from safetensors
         ckpt_dir = os.path.dirname(resolved_weights_file)
         model.init_from_safetensors_ckpt(ckpt_dir)
 
         return model
+
+    def _replace_tensor(self, full_key, value):
+        """Replace a parameter or buffer on its parent module.
+
+        Meta-device tensors (from torch.device('meta')) have no storage, so the
+        usual ``target.data.copy_(tensor)`` raises an error.  Instead we walk
+        the module tree to find the parent and swap the entry directly in
+        ``module._parameters`` or ``module._buffers``.
+        """
+        parts = full_key.split(".")
+        module = self
+        for part in parts[:-1]:
+            module = getattr(module, part)
+        name = parts[-1]
+        if name in module._parameters:
+            module._parameters[name] = torch.nn.Parameter(
+                value, requires_grad=module._parameters[name].requires_grad
+            )
+        elif name in module._buffers:
+            module._buffers[name] = value
 
     def init_from_safetensors_ckpt(self, ckpt_path, prefix=""):
         """
@@ -304,6 +327,8 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
 
                     if target.shape != tensor.shape:
                         logging.warning(f"Shape mismatch for {key}: " f"model {target.shape} vs ckpt {tensor.shape}")
+                    elif target.is_meta:
+                        self._replace_tensor(prefix + key, tensor)
                     else:
                         target.data.copy_(tensor)
 
@@ -316,6 +341,8 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
                         logging.warning(
                             f"Buffer shape mismatch for {key}: " f"model {target.shape} vs ckpt {tensor.shape}"
                         )
+                    elif target.is_meta:
+                        self._replace_tensor(prefix + key, tensor)
                     else:
                         target.data.copy_(tensor)
 
@@ -333,6 +360,16 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
 
         if missing_keys:
             logging.warning(f"{len(missing_keys)} keys in checkpoint not found in model")
+
+        # Fail if any parameters/buffers are still on meta device — this means
+        # the checkpoint is missing weights the model requires.
+        meta_remaining = [n for n, p in self.named_parameters() if p.is_meta]
+        meta_remaining += [n for n, b in self.named_buffers() if b.is_meta]
+        if meta_remaining:
+            raise RuntimeError(
+                f"{len(meta_remaining)} tensors still on meta device after checkpoint load "
+                f"(missing from checkpoint): {meta_remaining[:20]}"
+            )
 
         gc.collect()
 

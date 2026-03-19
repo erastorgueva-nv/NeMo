@@ -43,7 +43,11 @@ def load_pretrained_nemo(cls, model_path_or_name: str):
 
 
 def load_pretrained_hf(
-    model_path_or_name: str, pretrained_weights: bool = True, dtype=torch.float32, trust_remote_code: bool = False
+    model_path_or_name: str,
+    pretrained_weights: bool = True,
+    dtype=torch.float32,
+    trust_remote_code: bool = False,
+    use_meta_device: bool = False,
 ):
     """
     Load pretrained HuggingFace AutoModelForCausalLM.
@@ -56,6 +60,8 @@ def load_pretrained_hf(
         pretrained_weights: Whether to load pretrained weights (True) or random init (False)
         dtype: Data type for the model
         trust_remote_code: Whether to trust remote code when loading model (needed for some models like Nemotron)
+        use_meta_device: If True, create the model on the meta device (no memory allocation).
+            The caller must handle materializing meta tensors from a checkpoint.
     """
     if pretrained_weights:
         return AutoModelForCausalLM.from_pretrained(
@@ -63,6 +69,9 @@ def load_pretrained_hf(
         )
     else:
         config = AutoConfig.from_pretrained(model_path_or_name, trust_remote_code=trust_remote_code)
+        if use_meta_device:
+            with torch.device('meta'):
+                return AutoModelForCausalLM.from_config(config, torch_dtype=dtype, trust_remote_code=trust_remote_code)
         return AutoModelForCausalLM.from_config(config, torch_dtype=dtype, trust_remote_code=trust_remote_code)
 
 
