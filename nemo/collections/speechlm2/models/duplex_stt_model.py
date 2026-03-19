@@ -14,6 +14,9 @@
 import copy
 import os
 import re
+import warnings
+from pathlib import Path
+from typing import Optional, Union
 
 import torch
 from lightning import LightningModule
@@ -45,6 +48,7 @@ from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, i
 from nemo.collections.speechlm2.parts.pretrained import (
     load_pretrained_hf,
     maybe_load_pretrained_models,
+    resolve_pretrained_config,
     set_model_dict_for_partial_init,
     setup_speech_encoder,
 )
@@ -79,16 +83,18 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
         self.predict_user_text = self.cfg.get("predict_user_text", False)
 
+        pretrained_weights, tokenizer_path = resolve_pretrained_config(self.cfg)
+
         # Load LLM first
         llm = load_pretrained_hf(
             self.cfg.pretrained_llm,
-            pretrained_weights=self.cfg.pretrained_weights,
+            pretrained_weights=pretrained_weights,
             trust_remote_code=self.cfg.get("trust_remote_code", True),
         ).train()
 
         # Initialize tokenizer with optional special tokens from config
         self.tokenizer = AutoTokenizer(
-            self.cfg.pretrained_llm,
+            tokenizer_path,
             use_fast=True,
             bos_token=self.cfg.get("bos_token", None),
             eos_token=self.cfg.get("eos_token", None),
@@ -119,7 +125,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         maybe_install_lora(self)
 
         # Load the pretrained streaming ASR model
-        setup_speech_encoder(self, pretrained_weights=self.cfg.pretrained_weights)
+        setup_speech_encoder(self, pretrained_weights=pretrained_weights)
 
         maybe_load_pretrained_models(self)
 
@@ -128,6 +134,24 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
         # Initialize streaming inference engine
         self.streaming_inference = DuplexSTTStreamingInference(self)
+
+    def save_pretrained(
+        self,
+        save_directory: Union[str, Path],
+        **kwargs,
+    ) -> Optional[str]:
+        """Save model and also export LLM artifacts (config + tokenizer) for offline inference."""
+        result = super().save_pretrained(save_directory, **kwargs)
+
+        try:
+            llm_dir = Path(save_directory) / "llm_artifacts"
+            llm_dir.mkdir(parents=True, exist_ok=True)
+            self.tokenizer.tokenizer.save_pretrained(str(llm_dir))
+            logging.info(f"Saved LLM tokenizer to {llm_dir}")
+        except Exception as e:
+            warnings.warn(f"Failed to save LLM tokenizer: {e}. Inference will fall back to downloading from HF.")
+
+        return result
 
     @property
     def text_vocab_size(self):

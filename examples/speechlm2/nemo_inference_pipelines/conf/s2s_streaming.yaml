@@ -27,7 +27,6 @@ pipeline_type: s2s_streaming
 # S2S model block
 s2s:
   model_path: ???
-  llm_checkpoint_path: ???
   speaker_reference: null
   speaker_name: null
   engine_type: ??? # Engine type: 'native' or 'vllm_llm' or 'vllm_eartts' or 'vllm_llm_vllm_eartts'
@@ -37,7 +36,7 @@ s2s:
     gpu_memory_utilization: 0.35               # GPU memory utilization (0.0-1.0)
     dtype: bfloat16                           # Data type for vLLM inference
     engine_path: null                         # Path to vLLM engine (null = auto-convert if needed)
-    pretrained_llm: ${s2s.llm_checkpoint_path}  # Inherits from s2s.llm_checkpoint_path
+    pretrained_llm: ${s2s.model_path}
   
   vllm_tts_config:
     model_path: ${s2s.vllm_llm_config.model_path}             # Inherits from s2s.model_path

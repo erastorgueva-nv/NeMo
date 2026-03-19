@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import json
 import os
+import warnings
 from pathlib import Path
 from typing import Optional, Union
 
@@ -131,6 +133,39 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
         self._use_fsdp = False
         self._use_tp = False
 
+    def save_pretrained(
+        self,
+        save_directory: Union[str, Path],
+        **kwargs,
+    ) -> Optional[str]:
+        """Save model and export LLM artifacts (tokenizer + perception config) for offline inference."""
+        result = super().save_pretrained(save_directory, **kwargs)
+
+        # Save tokenizer for offline loading
+        try:
+            llm_dir = Path(save_directory) / "llm_artifacts"
+            llm_dir.mkdir(parents=True, exist_ok=True)
+            self.stt_model.tokenizer.tokenizer.save_pretrained(str(llm_dir))
+            logging.info(f"Saved LLM tokenizer to {llm_dir}")
+        except Exception as e:
+            warnings.warn(f"Failed to save LLM tokenizer: {e}. Inference will fall back to downloading from HF.")
+
+        # Save full perception config at the top level of config.json so that
+        # resolve_pretrained_config() can skip pretrained ASR/LLM downloads.
+        try:
+            config_path = Path(save_directory) / "config.json"
+            if config_path.exists():
+                with open(config_path) as f:
+                    config = json.load(f)
+                config["perception"] = OmegaConf.to_container(self.stt_model.cfg.perception, resolve=True)
+                with open(config_path, "w") as f:
+                    json.dump(config, f, indent=2)
+                logging.info(f"Saved perception config to {config_path}")
+        except Exception as e:
+            warnings.warn(f"Failed to save perception config: {e}")
+
+        return result
+
     def init_from_model_from_ckpt(self, checkpoint_path):
         if checkpoint_path is not None:
             checkpoint_state = torch.load(checkpoint_path, weights_only=False, map_location='cpu')['state_dict']
@@ -182,6 +217,24 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
 
         # Skip loading child module weights natively
         model_kwargs['cfg']['pretrained_weights'] = False
+
+        # Propagate pretrained_weights=False into nested configs so child
+        # modules skip downloading pretrained ASR, LLM, and codec models.
+        cfg = model_kwargs['cfg']
+        try:
+            stt_model_cfg = cfg['model']['stt']['model']
+            stt_model_cfg['pretrained_weights'] = False
+            if 'perception' in cfg:
+                stt_model_cfg['perception'] = cfg['perception']
+                logging.info("Injected saved perception config into STT model config")
+        except (KeyError, TypeError):
+            logging.warning("Could not propagate pretrained_weights=False into nested STT config")
+        try:
+            tts_model_cfg = cfg['model']['speech_generation']['model']
+            tts_model_cfg['pretrained_model'] = None
+            tts_model_cfg['pretrained_codec_model'] = None
+        except (KeyError, TypeError):
+            pass
 
         # Instantiate the empty model skeleton
         model = cls(model_kwargs['cfg'])

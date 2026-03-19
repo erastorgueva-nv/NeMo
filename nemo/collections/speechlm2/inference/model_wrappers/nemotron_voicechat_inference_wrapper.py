@@ -172,10 +172,6 @@ class NemotronVoicechatInferenceWrapper:
         if not self.model_path:
             raise ValueError("`model_cfg.model_path` must be provided.")
 
-        self.llm_checkpoint_path = model_cfg.get("llm_checkpoint_path")
-        if not self.llm_checkpoint_path:
-            raise ValueError("`model_cfg.llm_checkpoint_path` must be provided.")
-
         self.decode_audio = bool(model_cfg.get("decode_audio", True))
         # Number of past codec tokens kept in the sliding-window decode buffer.
         # Only used when use_codec_cache=False (the fallback path). When the
@@ -331,168 +327,35 @@ class NemotronVoicechatInferenceWrapper:
         samples = int(float(rate) * FRAME_SIZE_SEC)
         return samples
 
-    def _load_and_merge_configs(self):
-        """Load and merge configurations from both nano and eartts checkpoints."""
-        logging.info("Loading and merging configurations...")
-
-        # Load nano's config (for LLM, perception)
-        nano_config_file = os.path.join(self.llm_checkpoint_path, "config.json")
-        logging.info(f"  Loading nano config: {nano_config_file}")
-        with open(nano_config_file, 'r') as f:
-            import json
-            nano_cfg_dict = json.load(f)
-        nano_cfg = DictConfig(nano_cfg_dict)
-
-        # Load eartts's config (for TTS)
-        eartts_config_file = os.path.join(self.model_path, "config.json")
-        logging.info(f"  Loading eartts config: {eartts_config_file}")
-        with open(eartts_config_file, 'r') as f:
-            eartts_cfg_dict = json.load(f)
-        eartts_cfg = DictConfig(eartts_cfg_dict)
-
-        # Start with nano's config as base
-        merged_cfg = nano_cfg
-
-        # Override TTS-related parts with eartts's config
-        logging.info("  Merging: Using nano's config for LLM/perception, eartts's for TTS")
-        if 'model' in eartts_cfg and 'speech_generation' in eartts_cfg.model:
-            merged_cfg.model.speech_generation = eartts_cfg.model.speech_generation
-            logging.info("    TTS config from eartts")
-
-        # Set speaker reference
-        if 'model' not in merged_cfg:
-            merged_cfg.model = {}
-        merged_cfg.model.inference_speaker_reference = self.speaker_reference
-
-        # Ensure data section has correct sample rates
-        if 'data' not in merged_cfg:
-            merged_cfg.data = eartts_cfg.data
-
-        logging.info(f"  Final config:")
-        logging.info(f"    - pretrained_llm: {merged_cfg.model.stt.model.pretrained_llm}")
-        logging.info(f"    - perception.d_model: {merged_cfg.model.stt.model.perception.modality_adapter.d_model}")
-        logging.info(f"    - speech_generation: {'present' if 'speech_generation' in merged_cfg.model else 'missing'}")
-
-        return merged_cfg
-
     def _initialize_model(self):
-        """Initialize the NemotronVoiceChat with hybrid loading."""
-        from safetensors.torch import load_file
-        from nemo.collections.speechlm2.parts.pretrained import set_model_dict_for_partial_init
-
-        logging.info("Initializing model with hybrid loading strategy...")
-
-
-        # Step 1: Load and merge configs
-        cfg = self._load_and_merge_configs()
-
-        # Step 2: DO NOT set pretrained_s2s_model - we'll load weights manually
-        cfg.model.stt.model.pretrained_s2s_model = None
-        cfg.model.speech_generation.model.pretrained_model = None
-
-        # Convert to dict for model initialization
-        cfg_dict = OmegaConf.to_container(cfg, resolve=True)
-
-        # Step 3: Initialize model structure
+        """Initialize the NemotronVoiceChat model from an HF checkpoint."""
         logging.info("Initializing model structure...")
         start_DuplexS2S_init = time.time()
-        self.model = NemotronVoiceChat(cfg_dict)
+
+        self.model = NemotronVoiceChat.from_pretrained(
+            self.model_path,
+            local_files_only=True,
+        )
         logging.info(f"Time taken to initialize NemotronVoiceChat: {time.time() - start_DuplexS2S_init} seconds")
         logging.info("  Model structure initialized")
 
-        # Step 4: Load nano's checkpoint (LLM + perception)
-        if self.llm_checkpoint_path is not None:
-            logging.info("Loading LLM + perception:")
-            logging.info(f"  Path: {self.llm_checkpoint_path}")
-
-            nano_state_dict = load_file(os.path.join(self.llm_checkpoint_path, "model.safetensors"))
-
-            # Filter to non-TTS weights
-            tts_keys = ['tts_model.', 'speech_generation.']
-
-            # If using vLLM for LLM, also exclude LLM weights to save memory
-            # vLLM will load its own copy of the LLM
-            if self.use_vllm_llm:
-                llm_keys = ['stt_model.llm.']
-                exclude_keys = tts_keys + llm_keys
-                logging.info(f"  Using vLLM - excluding LLM weights from nano checkpoint")
-            else:
-                exclude_keys = tts_keys
-
-            nano_filtered = {k: v for k, v in nano_state_dict.items()
-                           if not any(k.startswith(prefix) for prefix in exclude_keys)}
-
-            logging.info(f"  Loading {len(nano_filtered)} parameters (excluded: {exclude_keys})...")
-
-            # Free the full state dict immediately to save CPU memory
-            del nano_state_dict
+        if self.use_vllm_eartts:
+            # Use object.__setattr__ to bypass PyTorch's module registration
+            # since VllmEARTTSModel is not a torch.nn.Module
+            del self.model.tts_model.tts_model
             gc.collect()
-
-            nano_filtered = set_model_dict_for_partial_init(nano_filtered, self.model.state_dict())
-            missing, unexpected = self.model.load_state_dict(nano_filtered, strict=False)
-
-            # Free filtered dict
-            del nano_filtered
-            gc.collect()
-
-            missing_non_excluded = [k for k in missing if not any(k.startswith(prefix) for prefix in exclude_keys)]
-            unexpected_non_excluded = [k for k in unexpected if not any(k.startswith(prefix) for prefix in exclude_keys)]
-
-            if missing_non_excluded:
-                logging.info(f"  {len(missing_non_excluded)} keys missing (might be OK)")
-            if unexpected_non_excluded:
-                logging.info(f"  {len(unexpected_non_excluded)} unexpected keys")
-
-        # Step 5: Load eartts's checkpoint (TTS only)
-        if self.model_path is not None:
-            logging.info("Loading TTS checkpoint:")
-            logging.info(f"  Path: {self.model_path}")
-
-            eartts_state_dict = load_file(os.path.join(self.model_path, "model.safetensors"))
-
-            # Filter to only TTS weights
-            tts_keys_filter = ['tts_model.']
-            eartts_tts_only = {k: v for k, v in eartts_state_dict.items()
-                                 if any(k.startswith(prefix) for prefix in tts_keys_filter)}
-
-            logging.info(f"  Loading {len(eartts_tts_only)} TTS parameters...")
-
-            start_tts_load_state_dict = time.time()
-            missing, unexpected = self.model.load_state_dict(eartts_tts_only, strict=False)
-            logging.info(f"Time taken to load TTS state dict: {time.time() - start_tts_load_state_dict} seconds")
-
-            missing_tts = [k for k in missing if any(k.startswith(prefix) for prefix in tts_keys_filter)]
-            unexpected_tts = [k for k in unexpected if any(k.startswith(prefix) for prefix in tts_keys_filter)]
-
-            if missing_tts:
-                logging.info(f"  {len(missing_tts)} TTS keys missing")
-                for mk in missing_tts:
-                    logging.info(f"    missing: {mk}")
-            if unexpected_tts:
-                logging.info(f"  {len(unexpected_tts)} unexpected TTS keys")
-
-            if self.use_vllm_eartts:
-                # gonna convert and load vllm eartts engine
-                # Use object.__setattr__ to bypass PyTorch's module registration
-                # since VllmEARTTSModel is not a torch.nn.Module
-                del self.model.tts_model.tts_model
-                gc.collect()
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-                object.__setattr__(
-                    self.model.tts_model,
-                    'tts_model',
-                    create_model(
-                        model=self.model_path,
-                        engine_type="vllm_eartts",
-                        vllm_config=self.vllm_tts_config)
-                )
-                from nemo.collections.speechlm2.inference.vllm.vllm_patch import patched_infer_codes_one_step
-                self.model.tts_model.infer_codes_one_step = types.MethodType(patched_infer_codes_one_step, self.model.tts_model)
-
-            logging.info(f"  eartts checkpoint loaded (TTS only)")
-
-        logging.info("\nHybrid loading completed!")
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            object.__setattr__(
+                self.model.tts_model,
+                'tts_model',
+                create_model(
+                    model=self.model_path,
+                    engine_type="vllm_eartts",
+                    vllm_config=self.vllm_tts_config)
+            )
+            from nemo.collections.speechlm2.inference.vllm.vllm_patch import patched_infer_codes_one_step
+            self.model.tts_model.infer_codes_one_step = types.MethodType(patched_infer_codes_one_step, self.model.tts_model)
 
         # If using vLLM for LLM, delete native LLM BEFORE moving to device to save memory
         if self.use_vllm_llm:
@@ -579,7 +442,7 @@ class NemotronVoicechatInferenceWrapper:
         if self.use_vllm_llm:
             logging.info("\nWrapping model with VllmLLMModel interface...")
             if self.vllm_llm_config is None:
-                raise ValueError("vllm_llm_config must be provided when engine_type contains'vllm_llm'")
+                raise ValueError("vllm_llm_config must be provided when engine_type contains 'vllm_llm'")
 
             # LLM already deleted above, just ensure cleanup
             gc.collect()
