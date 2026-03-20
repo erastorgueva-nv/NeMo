@@ -38,7 +38,7 @@ import math
 import os
 import torch
 from transformers import DynamicCache
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 from nemo.utils import logging
 
@@ -530,7 +530,7 @@ class VllmLLMModel(ModelInterface):
         return ans
 
 
-    def to(self, device_or_dtype: Union[torch.device, torch.dtype]) -> 'VLLMModel':
+    def to(self, device_or_dtype: Union[torch.device, torch.dtype]) -> 'VllmLLMModel':
         """
         Move model to specified device or convert to specified dtype.
 
@@ -543,7 +543,7 @@ class VllmLLMModel(ModelInterface):
             pass
         return self
 
-    def eval(self) -> 'VLLMModel':
+    def eval(self) -> 'VllmLLMModel':
         """Set model to evaluation mode (vLLM is always in eval mode)."""
         return self
 
@@ -961,12 +961,12 @@ class NativeModel(ModelInterface):
 
         return special_ids
 
-    def to(self, device_or_dtype: Union[torch.device, torch.dtype]) -> 'NativeModelInterface':
+    def to(self, device_or_dtype: Union[torch.device, torch.dtype]) -> 'NativeModel':
         """Move underlying model to device or convert dtype."""
         self.model = self.model.to(device_or_dtype)
         return self
 
-    def eval(self) -> 'NativeModelInterface':
+    def eval(self) -> 'NativeModel':
         """Set underlying model to eval mode."""
         self.model.eval()
         return self
@@ -986,7 +986,7 @@ class NativeModel(ModelInterface):
         Delegate attribute access to the underlying model.
 
         This allows transparent access to model attributes like
-        perception, tokenizer, etc.ß
+        perception, tokenizer, etc.
         """
         # Avoid infinite recursion for special attributes
         if name in ('model', '__dict__', '__class__'):

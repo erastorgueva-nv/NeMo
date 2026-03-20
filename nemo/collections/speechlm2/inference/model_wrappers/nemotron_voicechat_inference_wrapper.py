@@ -12,34 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
-from omegaconf import OmegaConf, DictConfig
-import time
-import re
-import os
-import sys
-import torchaudio
-import functools
-from dataclasses import dataclass
-from typing import Optional, Tuple
-from nemo.utils import logging
-
 import gc
+import os
+import time
 import types
+from typing import Optional, Tuple
 
+import torch
+import torchaudio
+from omegaconf import OmegaConf, DictConfig
+
+from nemo.utils import logging
 from transformers import DynamicCache
 
-
-# Set environment variables (use existing env vars if set, otherwise use defaults)
-_default_cache = "/tmp/cache"
-os.environ.setdefault("HF_HOME", _default_cache)
-os.environ.setdefault("TORCH_HOME", _default_cache)
-os.environ.setdefault("NEMO_CACHE_DIR", _default_cache)
-os.environ.setdefault("NEMO_NLP_TMP", os.path.join(_default_cache, "nemo_nlp_tmp"))
-
 from nemo.collections.speechlm2.models.nemotron_voicechat import NemotronVoiceChat
-
-from nemo.collections.speechlm2.parts.text_utils import tokens_to_str
 from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.audio.parts.utils.transforms import resample
 from nemo.collections.speechlm2.modules.ear_tts_vae_codec import CausalConv1dCache
@@ -48,40 +34,6 @@ from nemo.collections.speechlm2.inference.model_wrappers.perception_cache import
     PerceptionCacheState,
     PerceptionCacheManager,
 )
-from nemo.collections.speechlm2.inference.utils.pipeline_utils import clean_pred_text
-
-
-def tokens_to_str_raw(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer, pad_id: int) -> list:
-    """
-    Convert token IDs to text strings, preserving ALL special tokens including <SPECIAL_12> (pad token).
-
-    Unlike tokens_to_str, this function uses ids_to_tokens which preserves special tokens,
-    and does NOT filter out any tokens (including pad tokens like <SPECIAL_12>).
-
-    Args:
-        tokens: Token IDs tensor (B, T)
-        lengths: Length of each sequence (B,)
-        tokenizer: Tokenizer for decoding
-        pad_id: Pad token ID (not used for filtering in raw mode, kept for API compatibility)
-
-    Returns:
-        List of decoded text strings with ALL special tokens preserved (including <SPECIAL_12>)
-    """
-    ans = []
-    for hyp_ids, hyp_len in zip(tokens.cpu(), lengths.cpu()):
-        hyp_ids = hyp_ids[:hyp_len]
-        # Do NOT filter out any tokens - keep everything including pad tokens (<SPECIAL_12>)
-        hyp_ids_list = hyp_ids.tolist()
-
-        # Use ids_to_tokens which preserves special tokens like <SPECIAL_12>
-        toks = tokenizer.ids_to_tokens(hyp_ids_list)
-
-        # Only replace 'Ġ' with space for proper word boundaries, keep all special tokens
-        toks = [tok.replace('Ġ', ' ') for tok in toks]
-
-        ans.append("".join(toks))
-    return ans
-
 
 
 # --- Configuration ---
@@ -121,14 +73,6 @@ class NemotronVoicechatInferenceWrapper:
         if not isinstance(model_cfg, DictConfig):
             model_cfg = OmegaConf.create(model_cfg)
 
-
-        logging.info(f"pythonpath: {sys.path}")
-
-
-        logging.info(f"before setting - torch.backends.cudnn.allow_tf32: {torch.backends.cudnn.allow_tf32}")
-        logging.info(f"before setting - torch.backends.cuda.matmul.allow_tf32: {torch.backends.cuda.matmul.allow_tf32}")
-        logging.info(f"before setting - torch.get_float32_matmul_precision(): {torch.get_float32_matmul_precision()}")
-
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.set_float32_matmul_precision("medium")
@@ -161,10 +105,6 @@ class NemotronVoicechatInferenceWrapper:
                 "FlashAttention), so results may differ slightly from non-deterministic mode. "
                 "Inference will also be slower."
             )
-
-        logging.info(f"torch.backends.cudnn.allow_tf32: {torch.backends.cudnn.allow_tf32}")
-        logging.info(f"torch.backends.cuda.matmul.allow_tf32: {torch.backends.cuda.matmul.allow_tf32}")
-        logging.info(f"torch.get_float32_matmul_precision(): {torch.get_float32_matmul_precision()}")
 
         self.model_cfg = model_cfg
 
@@ -206,6 +146,7 @@ class NemotronVoicechatInferenceWrapper:
         logging.info(f"Decode audio: {self.decode_audio}")
         logging.info(f"Engine type: {model_cfg.get('engine_type', 'native')}")
         logging.info(f"Sampling - top_p: {model_cfg.get('top_p', 1.0)}, repetition_penalty: {model_cfg.get('repetition_penalty', 1.0)}, temperature: {model_cfg.get('temperature', 1.0)}")
+        logging.info(f"Float32 matmul precision: {torch.get_float32_matmul_precision()}")
         logging.info("=" * 70)
 
         # Cached TTS helpers populated during initialization/warmup
@@ -213,7 +154,6 @@ class NemotronVoicechatInferenceWrapper:
         self.generation_config = None
         self.first_tts_code_input = None
         self.first_tts_past_key_values_input = None
-
 
         self.model = None
         self.model_llm_interface = None
@@ -266,9 +206,6 @@ class NemotronVoicechatInferenceWrapper:
         self._initialize_model()
 
         logging.info("NemotronVoicechatInferenceWrapper initialized successfully.")
-
-        logging.info(f"{self.model.stt_model.perception.encoder._cfg = }")
-        logging.info(f"{self.model.stt_model.perception.encoder.streaming_cfg = }")
 
     @staticmethod
     def _resolve_dtype(compute_dtype):
@@ -330,14 +267,13 @@ class NemotronVoicechatInferenceWrapper:
     def _initialize_model(self):
         """Initialize the NemotronVoiceChat model from an HF checkpoint."""
         logging.info("Initializing model structure...")
-        start_DuplexS2S_init = time.time()
+        start_model_init = time.time()
 
         self.model = NemotronVoiceChat.from_pretrained(
             self.model_path,
             local_files_only=True,
         )
-        logging.info(f"Time taken to initialize NemotronVoiceChat: {time.time() - start_DuplexS2S_init} seconds")
-        logging.info("  Model structure initialized")
+        logging.info(f"NemotronVoiceChat initialized in {time.time() - start_model_init:.1f}s")
 
         if self.use_vllm_eartts:
             # Use object.__setattr__ to bypass PyTorch's module registration
@@ -374,10 +310,9 @@ class NemotronVoicechatInferenceWrapper:
         self.model.to(self.device)
         self.model.eval()
 
-        # Convert only the S2S components to the configured dtype, not the TTS model
-        logging.info(f"Converting S2S components to {self.dtype} (keeping TTS in float32)...")
-        if self.model.stt_model.llm is not None:
-            self.model.stt_model.llm = self.model.stt_model.llm.to(self.dtype)
+        # Convert some S2S components to the configured dtype
+        logging.info(f"Converting some S2S components to {self.dtype} (keeping perception & TTS in float32)...")
+        self.model.stt_model.llm = self.model.stt_model.llm.to(self.dtype)
         self.model.stt_model.lm_head = self.model.stt_model.lm_head.to(self.dtype)
         self.model.stt_model.embed_tokens = self.model.stt_model.embed_tokens.to(self.dtype)
         self.model.stt_model.asr_head = self.model.stt_model.asr_head.to(self.dtype)
@@ -385,14 +320,6 @@ class NemotronVoicechatInferenceWrapper:
         if self.model.stt_model.function_head is not None:
             self.model.stt_model.function_head = self.model.stt_model.function_head.to(self.dtype)
             logging.info("function_head converted to %s", self.dtype)
-        #self.model.stt_model.perception = self.model.stt_model.perception.to(self.dtype)
-        logging.info("S2S components converted, TTS kept in float32")
-        logging.info("new update, perception also is kept in float32")
-
-        # commenting this out to avoid error when try vllm tts
-        # and anyway - when sticking to "native", saw no difference in output
-        # with and without this call
-        #self.model.on_train_epoch_start()
 
         # torch.compile for native TTS backbone
         use_tts_torch_compile = bool(self.model_cfg.get("use_tts_torch_compile", False))
@@ -414,29 +341,21 @@ class NemotronVoicechatInferenceWrapper:
 
         self.tokenizer = self.model.stt_model.tokenizer
 
-
-        # allow overrides/additions from the self.model_cfg of nemotron_voicechat_inference_wrapper,
-        # into the model cfg that is read from config.json of the model.
-        # Specifically, this is so that we can specify inference_pad_boost, ... etc.
-        for key in (
+        # Allow overrides from wrapper config into the model config (e.g. logit boosts).
+        _BOOST_KEYS = (
             "inference_pad_boost",
             "inference_bos_boost",
             "inference_eos_boost",
             "inference_user_pad_boost",
             "inference_user_bos_boost",
             "inference_user_eos_boost",
-        ):
+        )
+        for key in _BOOST_KEYS:
             val = self.model_cfg.get(key, None)
             if val is not None:
                 OmegaConf.update(self.model.stt_model.cfg, key, val)
-
-        # Print inference boost values
-        logging.info(f"inference_eos_boost: {self.model.stt_model.cfg.get('inference_eos_boost', None)}")
-        logging.info(f"inference_bos_boost: {self.model.stt_model.cfg.get('inference_bos_boost', None)}")
-        logging.info(f"inference_pad_boost: {self.model.stt_model.cfg.get('inference_pad_boost', None)}")
-        logging.info(f"inference_user_pad_boost: {self.model.stt_model.cfg.get('inference_user_pad_boost', None)}")
-        logging.info(f"inference_user_bos_boost: {self.model.stt_model.cfg.get('inference_user_bos_boost', None)}")
-        logging.info(f"inference_user_eos_boost: {self.model.stt_model.cfg.get('inference_user_eos_boost', None)}")
+        boost_values = {k: self.model.stt_model.cfg.get(k, None) for k in _BOOST_KEYS}
+        logging.info(f"Inference logit boosts: {boost_values}")
 
         # Wrap model with appropriate interface (Native or vLLM)
         if self.use_vllm_llm:
@@ -669,7 +588,6 @@ class NemotronVoicechatInferenceWrapper:
         self.first_context_subword_id = init_inputs["subword_ids"][:, -1].unsqueeze(-1)
         self.first_tts_code_input = code.detach().clone()
         self.first_tts_past_key_values_input = self._clone_cache(outputs.past_key_values)
-
 
         logging.info("TTS warmup state prepared")
 
@@ -1136,14 +1054,4 @@ class NemotronVoicechatInferenceWrapper:
                 if not (agent_text_window == self.model.stt_model.text_eos_id).any():
                     gen_text[batch_idx, t] = self.model.stt_model.text_eos_id
                     logging.info(f"Forced turn-taking at frame {t}: inserted agent EOS (reason: user started speaking)")
-
-def main():
-    raise RuntimeError(
-        "This module cannot be called directly. "
-        "Use examples/speechlm2/nemo_inference_pipelines/s2s_streaming_infer.py instead."
-    )
-
-
-if __name__ == "__main__":
-    sys.exit(main())
 
