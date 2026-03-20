@@ -265,7 +265,7 @@ class NemotronVoicechatInferenceWrapper:
 
         # If using vLLM for LLM, delete native LLM BEFORE moving to device to save memory
         if self.use_vllm_llm:
-            logging.info("\nDeleting native LLM before GPU transfer (will use vLLM instead)...")
+            logging.info("Deleting native LLM before GPU transfer (will use vLLM instead)...")
             if hasattr(self.model.stt_model, 'llm') and self.model.stt_model.llm is not None:
                 # Delete all submodules of LLM to free memory
                 for name, child in list(self.model.stt_model.llm.named_children()):
@@ -329,7 +329,7 @@ class NemotronVoicechatInferenceWrapper:
 
         # Wrap model with appropriate interface (Native or vLLM)
         if self.use_vllm_llm:
-            logging.info("\nWrapping model with VllmLLMModel interface...")
+            logging.info("Wrapping model with VllmLLMModel interface...")
             if self.vllm_llm_config is None:
                 raise ValueError("vllm_llm_config must be provided when engine_type contains 'vllm_llm'")
 
@@ -378,7 +378,7 @@ class NemotronVoicechatInferenceWrapper:
 
             logging.info("VllmLLMModel interface created")
         else:
-            logging.info("\nWrapping model with NativeModel interface...")
+            logging.info("Wrapping model with NativeModel interface...")
             self.model_llm_interface = create_model(
                 model=self.model,
                 engine_type="native",
@@ -392,7 +392,7 @@ class NemotronVoicechatInferenceWrapper:
         if hasattr(self.model, 'tts_model'):
             self.target_fps = self.model.tts_model.target_fps
             self.target_sample_rate = self.model.tts_model.target_sample_rate
-            logging.info(f"\nTTS model initialized: target_fps={self.target_fps}, sample_rate={self.target_sample_rate}")
+            logging.info(f"TTS model initialized: target_fps={self.target_fps}, sample_rate={self.target_sample_rate}")
             if self.decode_audio:
                 self._prepare_tts_initial_state()
         else:
