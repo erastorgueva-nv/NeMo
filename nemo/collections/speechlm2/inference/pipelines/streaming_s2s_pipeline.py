@@ -232,7 +232,6 @@ class StreamingS2SPipeline(S2SPipelineInterface):
             num_frames_per_chunk=self.num_frames_per_chunk,
             frame_idx=context.frame_idx,
             gen_text=context.gen_text,
-            audio_toks_buffer=context.audio_toks_buffer,
             input_embeds_history=context.input_embeds_history,
             dynamic_cache=context.dynamic_cache,
             past_key_values=context.past_key_values,

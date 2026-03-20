@@ -29,7 +29,6 @@ class StreamingDecodeState:
     gen_text: torch.Tensor
     gen_asr_text: torch.Tensor
     gen_function_text: Optional[torch.Tensor]
-    audio_toks_buffer: Optional[torch.Tensor]
     input_embeds_history: List[torch.Tensor]
     dynamic_cache: Any  # DynamicCache or HybridMambaAttentionDynamicCache
     past_key_values: Any
@@ -76,7 +75,6 @@ class S2SContextManager:
             gen_text=decode_state["gen_text"],
             gen_asr_text=decode_state["gen_asr_text"],
             gen_function_text=decode_state["gen_function_text"],
-            audio_toks_buffer=decode_state["audio_toks_buffer"],
             input_embeds_history=decode_state["input_embeds_history"],
             dynamic_cache=decode_state["dynamic_cache"],
             past_key_values=decode_state["past_key_values"],
@@ -177,8 +175,6 @@ class S2SContextManager:
 
         if step_result.get("dynamic_cache") is not None:
             context.dynamic_cache = step_result["dynamic_cache"]
-        if "audio_toks_buffer" in step_result:
-            context.audio_toks_buffer = step_result["audio_toks_buffer"]
         if "input_embeds_history" in step_result:
             context.input_embeds_history = step_result["input_embeds_history"]
         if "past_key_values" in step_result:

@@ -49,7 +49,6 @@ class TritonPythonModel:
             s2s.engine_type            -> S2S_ENGINE_TYPE (default: native)
             s2s.system_prompt          -> S2S_SYSTEM_PROMPT (default: none)
             s2s.tts_system_prompt      -> S2S_TTS_SYSTEM_PROMPT (default: none)
-            s2s.use_codec_cache        -> S2S_USE_CODEC_CACHE (default: true)
             streaming.chunk_size_in_secs -> S2S_CHUNK_SIZE_IN_SECS (default: 0.08)
             streaming.buffer_size_in_secs -> S2S_BUFFER_SIZE_IN_SECS (default: 5.6)
         """
@@ -62,7 +61,6 @@ class TritonPythonModel:
             "s2s.engine_type":            ("S2S_ENGINE_TYPE", "native"),
             "s2s.system_prompt":          ("S2S_SYSTEM_PROMPT", None),
             "s2s.tts_system_prompt":      ("S2S_TTS_SYSTEM_PROMPT", None),
-            "s2s.use_codec_cache":        ("S2S_USE_CODEC_CACHE", True),
             "streaming.chunk_size_in_secs": ("S2S_CHUNK_SIZE_IN_SECS", 0.08),
             "streaming.buffer_size_in_secs": ("S2S_BUFFER_SIZE_IN_SECS", 5.6),
         }

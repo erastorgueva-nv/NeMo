@@ -526,7 +526,6 @@ def run_parity_harness(args) -> dict[str, Any]:
         "s2s.use_perception_cache": args.use_perception_cache,
         "s2s.use_perception_cudagraph": args.use_perception_cudagraph,
         "s2s.use_llm_cache": args.use_llm_cache,
-        "s2s.use_codec_cache": args.use_codec_cache,
         "s2s.deterministic": args.deterministic,
         "s2s.top_p": args.top_p,
         "s2s.repetition_penalty": args.repetition_penalty,
@@ -540,7 +539,6 @@ def run_parity_harness(args) -> dict[str, Any]:
             "s2s.use_perception_cache": False,
             "s2s.use_perception_cudagraph": False,
             "s2s.use_llm_cache": False,
-            "s2s.use_codec_cache": False,
             "s2s.deterministic": True,
             "s2s.top_p": 1.0,
             "s2s.repetition_penalty": 1.0,
@@ -644,7 +642,6 @@ def run_parity_harness(args) -> dict[str, Any]:
         "engine_type": inference_cfg.s2s.get("engine_type"),
         "use_perception_cache": bool(inference_cfg.s2s.get("use_perception_cache", False)),
         "use_llm_cache": bool(inference_cfg.s2s.get("use_llm_cache", False)),
-        "use_codec_cache": bool(inference_cfg.s2s.get("use_codec_cache", False)),
         "deterministic": bool(inference_cfg.s2s.get("deterministic", False)),
         "model_dtypes": _collect_model_dtypes(wrapper),
         "comparison": _compare_outputs(offline, incremental),
@@ -715,7 +712,6 @@ def build_argparser() -> argparse.ArgumentParser:
     _bool_arg(parser, "--use_perception_cache", "Override perception cache usage.")
     _bool_arg(parser, "--use_perception_cudagraph", "Override perception CUDA-graph usage.")
     _bool_arg(parser, "--use_llm_cache", "Override LLM cache usage.")
-    _bool_arg(parser, "--use_codec_cache", "Override codec cache usage.")
     _bool_arg(parser, "--deterministic", "Override deterministic mode.")
     parser.add_argument("--top_p", type=float, default=None, help="Override top-p.")
     parser.add_argument("--repetition_penalty", type=float, default=None, help="Override repetition penalty.")

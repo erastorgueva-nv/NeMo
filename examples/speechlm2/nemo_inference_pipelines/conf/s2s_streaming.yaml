@@ -58,11 +58,8 @@ s2s:
   # ========================
   # Inference settings
   # ========================
-  codec_token_history_size: 60                # Sliding-window buffer size; ignored when use_codec_cache is true
   use_perception_cache: true                  # Enable cache-aware streaming for perception encoder
   use_perception_cudagraph: true              # Enable CUDA graph-accelerated perception encoder
-  use_codec_cache: true                       # Incremental codec decode to remove clicking sounds and wasted computation
-                                              # (when true, codec_token_history_size is unused)
   use_llm_cache: true                         # Use KV cache for the STT LLM (DynamicCache or HybridMambaAttentionDynamicCache)
 
   # TTS speedup flags (default to false; enable to speed up native inference)
