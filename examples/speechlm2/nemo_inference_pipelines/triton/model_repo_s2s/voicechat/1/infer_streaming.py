@@ -262,8 +262,8 @@ class TritonPythonModel:
             state = self.pipeline.get_or_create_state(stream_id)
             audio = state.audio_buffer
             
-            full_text = state.get_output_text()
-            full_asr_text = state.get_output_asr_text()
+            full_text = state.output_text_str
+            full_asr_text = state.output_asr_text_str
             
             if stream_id not in self.text_positions:
                 self.text_positions[stream_id] = 0
@@ -279,7 +279,7 @@ class TritonPythonModel:
             
             generations.append((audio, incremental_text, incremental_asr_text))
             
-            state.cleanup_after_response()
+            state.clear_audio_buffer()
             
             if frame.is_last:
                 self.pipeline.delete_state(stream_id)

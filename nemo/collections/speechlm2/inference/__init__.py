@@ -11,3 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from nemo.collections.speechlm2.inference.factory.s2s_pipeline_builder import S2SPipelineBuilder
+from nemo.collections.speechlm2.inference.model_wrappers.decode_state import (
+    InferenceStepResult,
+    StreamingDecodeState,
+)
+from nemo.collections.speechlm2.inference.pipelines.streaming_s2s_pipeline import StreamingS2SPipeline
+from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
+from nemo.collections.speechlm2.inference.utils.pipeline_utils import PipelineOutput

@@ -12,31 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
 from queue import Queue
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from nemo.utils import logging
 
-if TYPE_CHECKING:
-    from nemo.collections.speechlm2.inference.model_wrappers.perception_cache import PerceptionCacheState
-
-
-@dataclass
-class StreamingDecodeState:
-    frame_idx: int
-    gen_text: torch.Tensor
-    gen_asr_text: torch.Tensor
-    gen_function_text: Optional[torch.Tensor]
-    input_embeds_history: List[torch.Tensor]
-    dynamic_cache: Any  # DynamicCache or HybridMambaAttentionDynamicCache
-    past_key_values: Any
-    code: Optional[torch.Tensor]
-    subword_mask: Optional[torch.Tensor]
-    perception_cache: Optional["PerceptionCacheState"] = None
-    codec_cache: Any = None
-    cache_position_offset: int = 0
+from nemo.collections.speechlm2.inference.model_wrappers.decode_state import (
+    InferenceStepResult,
+    StreamingDecodeState,
+)
 
 
 class S2SContextManager:
@@ -69,21 +54,7 @@ class S2SContextManager:
         """Allocate a fresh context backed by the realtime inference model."""
         if not hasattr(self.s2s_model, "create_decode_state"):
             raise RuntimeError("s2s_model must provide create_decode_state(max_len)")
-        decode_state = self.s2s_model.create_decode_state(self.max_len)
-        return StreamingDecodeState(
-            frame_idx=decode_state["frame_idx"],
-            gen_text=decode_state["gen_text"],
-            gen_asr_text=decode_state["gen_asr_text"],
-            gen_function_text=decode_state["gen_function_text"],
-            input_embeds_history=decode_state["input_embeds_history"],
-            dynamic_cache=decode_state["dynamic_cache"],
-            past_key_values=decode_state["past_key_values"],
-            code=decode_state["code"],
-            subword_mask=decode_state["subword_mask"],
-            perception_cache=decode_state["perception_cache"],
-            codec_cache=decode_state["codec_cache"],
-            cache_position_offset=decode_state["cache_position_offset"],
-        )
+        return self.s2s_model.create_decode_state(self.max_len)
 
     def _ensure_slot(self, stream_id: int) -> int:
         if stream_id not in self.streamidx2slotidx:
@@ -121,10 +92,17 @@ class S2SContextManager:
     def update_context(
         self,
         stream_ids: List[int],
-        step_result: Dict[str, Any],
+        step_result: InferenceStepResult,
         num_frames: int,
     ) -> None:
-        """Persist model outputs back into the cached context."""
+        """Advance frame counter and set subword mask after an inference step.
+
+        All cache and tensor mutations (dynamic_cache, past_key_values, code,
+        perception_cache, codec_cache, gen_text, gen_asr_text, etc.) are
+        already applied in-place on the ``StreamingDecodeState`` by
+        ``infer_one_step``.  This method only bumps ``frame_idx`` and marks
+        the subword mask for the newly generated frames.
+        """
         if len(stream_ids) == 0:
             return
         if len(stream_ids) != 1:
@@ -147,48 +125,10 @@ class S2SContextManager:
                 "Context maximum length exceeded. Consider increasing `streaming.max_len` in the configuration."
             )
 
-        predicted_tokens = step_result.get("predicted_text_tokens")
-        if predicted_tokens is not None:
-            if predicted_tokens.dim() == 1:
-                token_slice = predicted_tokens.unsqueeze(0)
-            else:
-                token_slice = predicted_tokens[0:1]
-            context.gen_text[:, start_idx:end_idx] = token_slice.to(context.gen_text.device)
-
-        asr_predicted_tokens = step_result.get("asr_predicted_text_tokens")
-        if asr_predicted_tokens is not None:
-            if asr_predicted_tokens.dim() == 1:
-                asr_token_slice = asr_predicted_tokens.unsqueeze(0)
-            else:
-                asr_token_slice = asr_predicted_tokens[0:1]
-            context.gen_asr_text[:, start_idx:end_idx] = asr_token_slice.to(context.gen_asr_text.device)
-
-        func_predicted_tokens = step_result.get("function_predicted_text_tokens")
-        if func_predicted_tokens is not None and context.gen_function_text is not None:
-            if func_predicted_tokens.dim() == 1:
-                func_token_slice = func_predicted_tokens.unsqueeze(0)
-            else:
-                func_token_slice = func_predicted_tokens[0:1]
-            context.gen_function_text[:, start_idx:end_idx] = func_token_slice.to(context.gen_function_text.device)
-
         context.frame_idx = end_idx
 
-        if step_result.get("dynamic_cache") is not None:
-            context.dynamic_cache = step_result["dynamic_cache"]
-        if "input_embeds_history" in step_result:
-            context.input_embeds_history = step_result["input_embeds_history"]
-        if "past_key_values" in step_result:
-            context.past_key_values = step_result["past_key_values"]
-        if "code" in step_result:
-            context.code = step_result["code"]
         if context.subword_mask is not None:
             context.subword_mask[:, start_idx:end_idx] = True
-        if "perception_cache" in step_result and step_result["perception_cache"] is not None:
-            context.perception_cache = step_result["perception_cache"]
-        if "codec_cache" in step_result and step_result["codec_cache"] is not None:
-            context.codec_cache = step_result["codec_cache"]
-        if "cache_position_offset" in step_result:
-            context.cache_position_offset = step_result["cache_position_offset"]
 
     def reset_slots(self, stream_ids: List[int], eos_flags: List[bool]) -> None:
         """Release contexts for streams that signalled end-of-stream."""

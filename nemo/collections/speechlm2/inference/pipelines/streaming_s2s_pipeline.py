@@ -141,16 +141,12 @@ class StreamingS2SPipeline(S2SPipelineInterface):
     # ------------------------------------------------------------------
     def create_state(self) -> S2SStreamingState:
         """Create new empty state."""
-        num_audio_codebooks = getattr(self.s2s_model.model, "_num_codebooks", 1)
-        dtype = getattr(self.s2s_model, "compute_dtype", torch.float32)
-        state = S2SStreamingState(
+        dtype = getattr(self.s2s_model, "dtype", torch.float32)
+        return S2SStreamingState(
             device=self.device,
             dtype=dtype,
-            max_len=self.max_len,
-            num_audio_codebooks=num_audio_codebooks,
             output_sample_rate=self.output_sample_rate,
         )
-        return state
 
 
     # ------------------------------------------------------------------
@@ -178,7 +174,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                 if isinstance(candidate, str) and candidate:
                     asr_piece = candidate
 
-            state.update_state(sample_audio, output_text=piece, output_asr_text=asr_piece)
+            state.append_step_output(sample_audio, text=piece, asr_text=asr_piece)
 
 
     def inner_generate_step(self, frames: List[Frame], buffers: List[Tensor], left_paddings: List[int], ready_feats: List[bool]):
@@ -230,28 +226,17 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         result = self.s2s_model.infer_one_step(
             audio_input=audio_buffer,
             num_frames_per_chunk=self.num_frames_per_chunk,
-            frame_idx=context.frame_idx,
-            gen_text=context.gen_text,
-            input_embeds_history=context.input_embeds_history,
-            dynamic_cache=context.dynamic_cache,
-            past_key_values=context.past_key_values,
-            code=context.code,
-            subword_mask=context.subword_mask,
-            gen_asr_text=context.gen_asr_text,
-            gen_function_text=context.gen_function_text,
+            state=context,
             request_id=request_id,
-            perception_cache=context.perception_cache,
             has_prompt=has_prompt,
-            codec_cache=context.codec_cache,
-            cache_position_offset=context.cache_position_offset,
             return_debug=self.collect_debug,
         )
 
-        if self.collect_debug and "debug" in result:
+        if self.collect_debug and result.debug is not None:
             state = self.get_or_create_state(stream_ids[0])
             if not hasattr(state, "debug_steps"):
                 state.debug_steps = []
-            state.debug_steps.append(result["debug"])
+            state.debug_steps.append(result.debug)
 
         # Persist updated cache & clean finished streams
         self.context_manager.update_context(stream_ids, result, self.num_frames_per_chunk)
@@ -280,7 +265,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                 # It will be cleaned up in close_session()
         
         # Log audio and attach text to state
-        self.log_output(frames, result["decoded_audio_new"], ready_feats, result["predicted_text_strs"], result.get("asr_predicted_text_strs"))
+        self.log_output(frames, result.decoded_audio, ready_feats, result.predicted_text_strs, result.asr_predicted_text_strs)
 
     def prefill_for_new_stream(self, stream_id: int, system_prompt: str | None = None) -> bool:
         """Prepare the pipeline for a new stream by resetting context and prefilling the system prompt.
@@ -402,7 +387,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                 if hasattr(state, "finalize"):
                     state.finalize()
                 # Concatenate emitted chunks and squeeze (B=1,C=1) to mono waveform
-                generated_audio = torch.cat(state.speech_frames, dim=-1)
+                generated_audio = state.audio_buffer
                 # Ensure 1D mono waveform and float32 dtype for soundfile
                 if generated_audio.dim() == 3 and generated_audio.size(0) == 1 and generated_audio.size(1) == 1:
                     generated_audio = generated_audio.squeeze(0).squeeze(0)
@@ -452,7 +437,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                 sf.write(stereo_path, stereo.detach().cpu().numpy(), self.output_sample_rate)
 
                 # Save accumulated text
-                text_out = state.get_output_text() if hasattr(state, "get_output_text") else ""
+                text_out = state.output_text_str
                 if isinstance(text_out, str):
                     try:
                         with open(os.path.join(txt_dir, f"{base}.txt"), "w", encoding="utf-8") as f:
@@ -461,7 +446,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                         pass
 
                 # Save accumulated ASR text
-                asr_text_out = state.get_output_asr_text() if hasattr(state, "get_output_asr_text") else ""
+                asr_text_out = state.output_asr_text_str
                 if isinstance(asr_text_out, str) and asr_text_out:
                     try:
                         with open(os.path.join(txt_dir, f"{base}_asr.txt"), "w", encoding="utf-8") as f:
@@ -607,15 +592,11 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
         for idx in range(len(audio_filepaths)):
             state = self.get_or_create_state(idx)
-            text_value = state.get_output_text() if hasattr(state, "get_output_text") else ""
-            if not text_value:
-                text_value = saved_paths_by_stream.get(idx, "")
+            text_value = state.output_text_str or saved_paths_by_stream.get(idx, "")
             texts.append(text_value)
             audio_paths.append(saved_paths_by_stream.get(idx))
-            per_stream_words = state.get_output_words() if hasattr(state, "get_output_words") else []
-            words.append(per_stream_words)
-            asr_text_value = state.get_output_asr_text() if hasattr(state, "get_output_asr_text") else ""
-            asr_texts.append(asr_text_value)
+            words.append(list(state.output_words))
+            asr_texts.append(state.output_asr_text_str)
 
             token_data = state.get_token_tensors()
             if token_data is not None:
@@ -690,14 +671,14 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
         Note on TTS prefill codes:
             The TTS prefill generates output codes, but these should NOT be used
-            to initialize context.code for inference. The batch approach uses
+            to initialize context.tts_code for inference. The batch approach uses
             first_tts_code_input (INPUT codes from speaker reference) instead.
             Using prefill OUTPUT codes causes audio quality issues (mumbling).
         
         Returns:
             Optional[torch.Tensor]: The TTS prefill output codes if vLLM EarTTS prefill
             happened, None otherwise. These are returned for logging/debugging but
-            should NOT be used to update context.code.
+            should NOT be used to update context.tts_code.
         """
         request_id = self._request_id_for_stream(stream_id)
         engine_type = getattr(self.s2s_model, "engine_type", "native")
@@ -758,11 +739,11 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         
         else:
             context, _ = self.context_manager.get_context([stream_id])
-            if context.dynamic_cache is not None:
+            if context.llm_cache is not None:
                 # Native cache mode: process prompt through LLM to update KV cache
                 with torch.no_grad():
                     cache_pos = torch.arange(prompt_len, device=self.s2s_model.device)
-                    llm_cache = context.dynamic_cache
+                    llm_cache = context.llm_cache
                     ans = self.s2s_model.model_llm_interface(
                         prompt_embedded,
                         cache=llm_cache,
@@ -770,8 +751,8 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                         generated_tokens=None,
                         current_step=0
                     )
-                    context.dynamic_cache = ans.get("cache", llm_cache)
-                context.cache_position_offset = prompt_len
+                    context.llm_cache = ans.get("cache", llm_cache)
+                context.llm_cache_position_offset = prompt_len
                 logging.info(f"System prompt processed, cache updated ({prompt_len} tokens, offset={prompt_len})")
             else:
                 for t in range(prompt_len):

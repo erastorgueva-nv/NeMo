@@ -66,12 +66,6 @@ s2s:
   use_tts_torch_compile: false                # Compile TTS backbone with torch.compile (mode='default')
   use_tts_subword_cache: false                # Cache CharAwareSubwordEncoder embeddings (skip backbone for repeated tokens)
 
-  # Deterministic inference (native engine only). Ensures identical results across
-  # runs by disabling FlashAttention and forcing deterministic CUDA algorithms.
-  # Trade-offs: slower inference, might be worse results than non-deterministic mode, since
-  # non-deterministic mode was used in training.
-  deterministic: false
-
   # sampling parameters. if set all to 1.0, it will be greedy decoding.
   top_p: 0.5
   repetition_penalty: 1.1
@@ -89,12 +83,18 @@ s2s:
   tts_system_prompt: null              # TTS system prompt - conditions TTS generation style
                                        # Requires a checkpoint trained with individual TTS prompts
 
-
-
-# ========================
-# Pipeline settings
-# ========================
-matmul_precision: medium                     # Matrix multiplication precision: highest, high, medium
+  # ========================
+  # Precision & determinism
+  # ========================
+  # These defaults match what was used during model training.
+  matmul_precision: medium               # Matrix multiplication precision: highest, high, medium
+  allow_tf32: true                       # Allow TF32 for cuDNN and CUDA matmul (Ampere+ GPUs).
+                                         # Set to false for stricter float32 precision.
+  # Deterministic inference (native engine only). Ensures identical results across
+  # runs by disabling FlashAttention and forcing deterministic CUDA algorithms.
+  # Trade-offs: slower inference, might produce worse results than non-deterministic mode,
+  # since non-deterministic mode was used in training.
+  deterministic: false
 
 streaming:
   input_sample_rate: 16000                          # Audio sample rate in Hz
