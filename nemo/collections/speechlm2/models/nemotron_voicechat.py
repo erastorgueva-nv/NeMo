@@ -361,15 +361,34 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
         if missing_keys:
             logging.warning(f"{len(missing_keys)} keys in checkpoint not found in model")
 
-        # Fail if any parameters/buffers are still on meta device — this means
-        # the checkpoint is missing weights the model requires.
-        meta_remaining = [n for n, p in self.named_parameters() if p.is_meta]
-        meta_remaining += [n for n, b in self.named_buffers() if b.is_meta]
-        if meta_remaining:
+        # Fail if any *parameters* are still on meta device — those genuinely
+        # need weights from the checkpoint and their absence is an error.
+        meta_params = [n for n, p in self.named_parameters() if p.is_meta]
+        if meta_params:
             raise RuntimeError(
-                f"{len(meta_remaining)} tensors still on meta device after checkpoint load "
-                f"(missing from checkpoint): {meta_remaining[:20]}"
+                f"{len(meta_params)} parameters still on meta device after checkpoint load "
+                f"(missing from checkpoint): {meta_params[:20]}"
             )
+
+        # Buffers on meta device are typically non-persistent computed values
+        # (e.g. rotary_emb.inv_freq registered with persistent=False) that
+        # save_pretrained / safetensors intentionally omit.  Reinitialize
+        # them by moving the owning module to CPU then back, which triggers
+        # the buffer's factory function.
+        meta_buffers = [(n, b) for n, b in self.named_buffers() if b.is_meta]
+        if meta_buffers:
+            logging.info(
+                f"Reinitializing {len(meta_buffers)} non-persistent meta buffer(s): "
+                f"{[n for n, _ in meta_buffers[:10]]}"
+            )
+            for buf_name, buf in meta_buffers:
+                parts = buf_name.split(".")
+                module = self
+                for part in parts[:-1]:
+                    module = getattr(module, part)
+                module.to_empty(device="cpu")
+                module.to(device="cpu")
+            logging.info("Meta buffers reinitialised on CPU")
 
         gc.collect()
 
@@ -527,6 +546,7 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
         incremental_audio_decoding: bool = False,
         generation_config: dict = None,
         guidance_enabled: bool = True,
+        return_logits: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Runs full offline duplex speech-to-speech inference.
@@ -575,6 +595,12 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
             guidance_enabled (bool, optional):
                 Enables classifier-free guidance.
 
+            return_logits (bool, optional):
+                When True, collect per-step text and ASR logits and
+                include them in the returned dict as ``"text_logits"``
+                (B, T, V_text) and ``"asr_logits"`` (B, T, V_asr).
+                Useful for parity testing against incremental inference.
+
         Returns:
             dict[str, torch.Tensor]:
 
@@ -598,6 +624,12 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
                     Tensor (B,) — waveform lengths in samples
                     (if decode_audio=True).
 
+                • "text_logits" (only when return_logits=True):
+                    Tensor (B, T, V_text) — per-step text head logits.
+
+                • "asr_logits" (only when return_logits=True):
+                    Tensor (B, T, V_asr) — per-step ASR head logits.
+
         Notes:
             • Uses streaming inference backend of DuplexSTTModel.
             • Uses autoregressive codec generation from DuplexEARTTS.
@@ -614,6 +646,10 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
 
         B = inference_state["B"]
         T = inference_state["T"]
+
+        if return_logits:
+            _text_logits = [ans["text_logits"][:, -1].detach().cpu()]
+            _asr_logits = [ans["asr_logits"][:, -1].detach().cpu()] if "asr_logits" in ans else []
 
         # if speaker_name is provided uses it, if not uses the speaker_audio provided, if speaker_audio is None load it from inference_speaker_reference
         if speaker_audio is None:
@@ -662,7 +698,12 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
         # Autoregressive loop
         for t in range(1, T):
             # do one step inference on Duplex STT model
-            _ = self.stt_model.streaming_inference._step_inference(t, inference_state, ans)
+            ans = self.stt_model.streaming_inference._step_inference(t, inference_state, ans)
+
+            if return_logits:
+                _text_logits.append(ans["text_logits"][:, -1].detach().cpu())
+                if "asr_logits" in ans:
+                    _asr_logits.append(ans["asr_logits"][:, -1].detach().cpu())
 
             # do one step inference on Duplex TTS model
             # current subword id is always seem
@@ -718,6 +759,11 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
                     )
             ans["audio"] = audio_pred.squeeze(1)
             ans["audio_len"] = audio_pred_len
+
+        if return_logits:
+            ans["text_logits"] = torch.stack(_text_logits, dim=1)
+            if _asr_logits:
+                ans["asr_logits"] = torch.stack(_asr_logits, dim=1)
 
         return ans
 

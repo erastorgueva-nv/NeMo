@@ -158,8 +158,8 @@ class StreamingS2SPipeline(S2SPipelineInterface):
             if not ready_feats[idx]:
                 continue
             state = self.get_or_create_state(frame.stream_id)
-            # audio_wave is [B, S]; take sample idx
-            sample_audio = audio_wave[idx:idx+1, ...]
+            # audio_wave is [B, S]; take sample idx (None when decode_audio=False)
+            sample_audio = audio_wave[idx:idx+1, ...] if audio_wave is not None else None
             # Determine text piece for this index
             piece = None
             if text_pieces and idx < len(text_pieces):
