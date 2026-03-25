@@ -23,7 +23,7 @@ import torch
 import torchaudio
 from omegaconf import OmegaConf, DictConfig
 
-from nemo.utils import logging
+from nemo.utils import logging, str_to_dtype
 from transformers import DynamicCache
 
 from nemo.collections.speechlm2.models.nemotron_voicechat import NemotronVoiceChat
@@ -109,13 +109,17 @@ class NemotronVoicechatInferenceWrapper:
         self.tts_system_prompt = model_cfg.get("tts_system_prompt", None)
         logging.info(f"TTS system prompt: {self.tts_system_prompt}")
 
-        compute_dtype = model_cfg.get("compute_dtype", "bfloat16")
-        self.dtype = self._resolve_dtype(compute_dtype)
+        self.dtype = str_to_dtype(model_cfg.get("compute_dtype", "bfloat16"))
 
-        self.device = self._resolve_device(
-            device=model_cfg.get("device"),
-            device_id=model_cfg.get("device_id"),
-        )
+        device = model_cfg.get("device")
+        device_id = model_cfg.get("device_id")
+        if device is None:
+            self.device = DEFAULT_DEVICE
+        else:
+            device_str = str(device)
+            if device_id is not None and device_str.startswith("cuda") and ":" not in device_str:
+                device_str = f"{device_str}:{device_id}"
+            self.device = torch.device(device_str)
 
         logging.info("=" * 70)
         logging.info("INITIALIZING REALTIME STREAMING INFERENCE")
@@ -129,6 +133,11 @@ class NemotronVoicechatInferenceWrapper:
         logging.info(f"Precision (configured): matmul_precision={matmul_precision}, allow_tf32={allow_tf32}, deterministic={self._deterministic}")
         logging.info(f"Precision (effective): float32_matmul_precision={torch.get_float32_matmul_precision()}, cudnn.allow_tf32={torch.backends.cudnn.allow_tf32}, cuda.matmul.allow_tf32={torch.backends.cuda.matmul.allow_tf32}")
         logging.info("=" * 70)
+
+        # Profiling: when True, insert torch.cuda.synchronize() around each
+        # stage for accurate per-stage wall-clock timing.  Disabled by default
+        # to avoid unnecessary GPU stalls in production.
+        self._profile_timing = bool(model_cfg.get("profile_timing", False))
 
         # Cached TTS helpers populated during initialization/warmup
         self.first_context_subword_id = None
@@ -172,63 +181,6 @@ class NemotronVoicechatInferenceWrapper:
         self._initialize_model()
 
         logging.info("NemotronVoicechatInferenceWrapper initialized successfully.")
-
-    @staticmethod
-    def _resolve_dtype(compute_dtype):
-        if isinstance(compute_dtype, torch.dtype):
-            return compute_dtype
-        if compute_dtype is None:
-            return torch.bfloat16
-        if isinstance(compute_dtype, str):
-            key = compute_dtype.lower()
-            mapping = {
-                "bfloat16": torch.bfloat16,
-                "bf16": torch.bfloat16,
-                "float16": torch.float16,
-                "fp16": torch.float16,
-                "half": torch.float16,
-                "float32": torch.float32,
-                "fp32": torch.float32,
-                "full": torch.float32,
-            }
-            if key in mapping:
-                return mapping[key]
-        raise ValueError(f"Unsupported compute_dtype: {compute_dtype}")
-
-    @staticmethod
-    def _resolve_device(device=None, device_id=None):
-        if isinstance(device, torch.device):
-            resolved_device = device
-        else:
-            if device is None:
-                resolved_device = DEFAULT_DEVICE
-            else:
-                device_str = str(device)
-                base = device_str
-                if device_id is not None and device_str.startswith("cuda") and ":" not in device_str:
-                    base = f"{device_str}:{device_id}"
-                resolved_device = torch.device(base)
-        return resolved_device
-
-    def _samples_per_audio_output_frame(self):
-        rate = getattr(self, "target_sample_rate", None)
-        if rate is None:
-            cfg_rate = None
-            try:
-                cfg_rate = self.model_cfg.get("tts_sample_rate", None)
-            except Exception:
-                cfg_rate = None
-            if cfg_rate is None:
-                try:
-                    cfg_rate = self.model_cfg.get("output_sample_rate", None)
-                except Exception:
-                    cfg_rate = None
-            if cfg_rate is not None:
-                rate = float(cfg_rate)
-        if rate is None:
-            rate = TTS_SAMPLE_RATE
-        samples = int(float(rate) * FRAME_SIZE_SEC)
-        return samples
 
     def _initialize_model(self):
         """Initialize the NemotronVoiceChat model from an HF checkpoint."""
@@ -596,220 +548,80 @@ class NemotronVoicechatInferenceWrapper:
         frame_idx = state.frame_idx
 
         start_time_one_step = time.time()
-        use_cache = state.llm_cache is not None
-        batch_size = state.gen_text.shape[0]
+        use_llm_cache = state.llm_cache is not None
+        B = state.gen_text.shape[0]
 
-        predicted_tokens = torch.empty((batch_size, num_frames_per_chunk), dtype=state.gen_text.dtype, device=state.gen_text.device)
-        asr_predicted_tokens = torch.empty((batch_size, num_frames_per_chunk), dtype=state.gen_text.dtype, device=state.gen_text.device)
-        function_predicted_tokens = torch.empty((batch_size, num_frames_per_chunk), dtype=state.gen_text.dtype, device=state.gen_text.device)
-        debug_text_logits = []
-        debug_asr_logits = []
-        debug_input_embeds = []
-        selected_frame_indices = []
+        predicted_tokens = torch.empty((B, num_frames_per_chunk), dtype=state.gen_text.dtype, device=state.gen_text.device)
+        asr_predicted_tokens = torch.empty((B, num_frames_per_chunk), dtype=state.gen_text.dtype, device=state.gen_text.device)
+        function_predicted_tokens = None
+        if self.model.stt_model.function_head is not None:
+            function_predicted_tokens = torch.empty((B, num_frames_per_chunk), dtype=state.gen_text.dtype, device=state.gen_text.device)
+
+        debug_text_logits, debug_asr_logits, debug_input_embeds, selected_frame_indices = [], [], [], []
 
         # --- Stage 1: Perception ---
         source_encoded, state.perception_cache = self._run_perception(
             audio_input, frame_idx, num_frames_per_chunk, state.perception_cache,
         )
         total_encoded_frames = source_encoded.shape[1]
-
         if self.use_perception_cache and state.perception_cache is not None and state.perception_cache.is_initialized():
-            # With cache: we get exactly num_frames_per_chunk output frames — use all directly
+            # With cache: we get exactly num_frames_per_chunk output frames
             base_frame_index = 0
         else:
-            # Without cache: Use the second-to-last encoded frame (-2) as the "newest" frame embedding.
-            # This is because the model expects the chunk sizes to be size 10ms, 80ms, 80ms, 80ms, ....,
-            # but we pass in always 80ms, 80ms, 80ms....
-            # e.g.
-            # (1) if we pass in just one 80ms chunk -> the model treats it as 10ms, then 70ms with 10ms silence padding at the end.
-            # (2) if we pass 80ms, 80ms -> the model treats it as 10ms, 80ms, 70ms with 10ms silence padding at the end.
-            # => we do not want to use the final embedding due to containing silence padding. We want to use the second-to-last embedding.
-            newest_frame_index = total_encoded_frames - 2
-            base_frame_index = max(newest_frame_index - (num_frames_per_chunk - 1), 0)
+            # Without cache: use the second-to-last encoded frame as the
+            # "newest" because the model expects 10ms / 80ms / 80ms ... framing
+            # but we always feed 80ms chunks, so the final frame contains
+            # silence padding.
+            newest = total_encoded_frames - 2
+            base_frame_index = max(newest - (num_frames_per_chunk - 1), 0)
 
         # --- Stage 2: Per-frame generation loop ---
         new_input_embeds = []
         new_codes_for_decode = []
         for frame_offset in range(num_frames_per_chunk):
             current_frame_idx = frame_idx + frame_offset
-            current_frame_index = min(base_frame_index + frame_offset, total_encoded_frames - 1)
+            current_frame_index = min(base_frame_index + frame_offset, source_encoded.shape[1] - 1)
             selected_frame_indices.append(current_frame_index)
-            current_frame_embedding = source_encoded[:, current_frame_index:current_frame_index + 1, :]
+            frame_embedding = source_encoded[:, current_frame_index:current_frame_index + 1, :]
 
-            current_input_emb = current_frame_embedding.clone()
-            current_input_emb *= self.model.stt_model.cfg.get("duplex_user_channel_weight", 1.0)
-
-            has_fc = state.gen_function_text is not None
-
-            if current_frame_idx == 0 and not has_prompt:
-                # Only add BOS if there's no prompt (BOS is already in prompt's position 0)
-                current_input_emb += self._get_bos_embedding() * self.model.stt_model.cfg.get(
-                    "duplex_text_channel_weight", 1.0
-                )
-                current_input_emb += self._get_asr_bos_embedding() * self.model.stt_model.cfg.get(
-                    "duplex_asr_text_weight", 1.0
-                )
-                if has_fc:
-                    pad_id = self.model.stt_model.text_pad_id
-                    fc_pad_token = torch.full((1,), fill_value=pad_id, device=self.device, dtype=torch.long)
-                    current_input_emb += self.model.stt_model.embed_tokens(fc_pad_token).to(dtype=self.dtype)
-            elif current_frame_idx == 0 and has_prompt:
-                # With prompt: first audio frame uses pad embedding (like offline_inference)
-                pad_id = self.model.stt_model.text_pad_id
-                pad_token = torch.full((1,), fill_value=pad_id, device=self.device, dtype=torch.long)
-                pad_emb = self.model.stt_model.embed_tokens(pad_token).to(dtype=self.dtype)
-                pad_asr_emb = self.model.stt_model.embed_asr_tokens(pad_token).to(dtype=self.dtype)
-                current_input_emb += pad_emb
-                current_input_emb += pad_asr_emb
-                if has_fc:
-                    current_input_emb += self.model.stt_model.embed_tokens(pad_token).to(dtype=self.dtype)
-            else:
-                # t > 0: add embeddings from model's own predictions at t-1
-                last_token_emb = self.model.stt_model.embed_tokens(
-                    state.gen_text[:, current_frame_idx - 1]
-                ) * self.model.stt_model.cfg.get("duplex_text_channel_weight", 1.0)
-                last_asr_token_emb = self.model.stt_model.embed_asr_tokens(
-                    state.gen_asr_text[:, current_frame_idx - 1]
-                ) * self.model.stt_model.cfg.get("duplex_asr_text_weight", 1.0)
-                current_input_emb += last_token_emb + last_asr_token_emb
-                if has_fc:
-                    last_fc_token_emb = self.model.stt_model.embed_tokens(state.gen_function_text[:, current_frame_idx - 1])
-                    current_input_emb += last_fc_token_emb.to(dtype=self.dtype)
+            input_emb = self._build_input_embedding(
+                frame_embedding, current_frame_idx, state, has_prompt,
+            )
             if return_debug:
-                debug_input_embeds.append(current_input_emb.detach().cpu())
+                debug_input_embeds.append(input_emb.detach().cpu())
 
-            start_stt_model = time.time()
+            ans = self._run_llm_step(
+                input_emb, state, frame_offset, effective_request_id,
+                current_frame_idx, use_llm_cache, return_debug, new_input_embeds,
+            )
 
-            if use_cache or self.use_vllm_llm:
-                if self.use_vllm_llm:
-                    ans = self.model_llm_interface(
-                        current_input_emb,
-                        request_id=effective_request_id,
-                        generated_tokens=state.gen_text,
-                        current_step=current_frame_idx
-                    )
-                else:
-                    cache_pos = torch.tensor(
-                        [state.llm_cache_position_offset + frame_offset], device=self.device
-                    )
-                    ans = self.model_llm_interface(
-                        current_input_emb,
-                        cache=state.llm_cache,
-                        cache_position=cache_pos,
-                        generated_tokens=state.gen_text,
-                        current_step=current_frame_idx,
-                        return_logits=return_debug,
-                    )
-                state.llm_cache = ans["cache"]
-            else:
-                new_input_embeds.append(current_input_emb)
-                full_input_embeds = torch.cat(state.input_embeds_history + new_input_embeds, dim=1)
-                ans = self.model_llm_interface(
-                    full_input_embeds,
-                    cache=None,
-                    generated_tokens=state.gen_text,
-                    current_step=current_frame_idx,
-                    return_logits=return_debug,
-                )
-
-            torch.cuda.synchronize()
-            time_stt_model = time.time() - start_stt_model
-            logging.info(f"Time taken for stt_model: {time_stt_model:.3f}s")
-
-            predicted_token = ans["predicted_token"]
-            asr_predicted_token = ans["asr_predicted_token"]
             if return_debug and "text_logits" in ans:
                 debug_text_logits.append(ans["text_logits"][:, -1].detach().cpu())
             if return_debug and "asr_logits" in ans and ans["asr_logits"] is not None:
                 debug_asr_logits.append(ans["asr_logits"][:, -1].detach().cpu())
 
-            state.gen_text[:, current_frame_idx] = predicted_token
-            predicted_tokens[:, frame_offset] = predicted_token
-
-            state.gen_asr_text[:, current_frame_idx] = asr_predicted_token
-            asr_predicted_tokens[:, frame_offset] = asr_predicted_token
+            state.gen_text[:, current_frame_idx] = ans["predicted_token"]
+            predicted_tokens[:, frame_offset] = ans["predicted_token"]
+            state.gen_asr_text[:, current_frame_idx] = ans["asr_predicted_token"]
+            asr_predicted_tokens[:, frame_offset] = ans["asr_predicted_token"]
 
             if "function_predicted_token" in ans:
-                function_predicted_tokens[:, frame_offset] = ans["function_predicted_token"]
+                if function_predicted_tokens is not None:
+                    function_predicted_tokens[:, frame_offset] = ans["function_predicted_token"]
                 if state.gen_function_text is not None:
                     state.gen_function_text[:, current_frame_idx] = ans["function_predicted_token"]
 
-            # Apply forced turn taking based on ASR results
             self._maybe_apply_forced_turn_taking(current_frame_idx, state.gen_text, state.gen_asr_text)
-            # Update predicted_tokens with any changes made by forced turn taking
             predicted_tokens[:, frame_offset] = state.gen_text[:, current_frame_idx]
 
             if self.decode_audio:
-                current_subword_id = state.gen_text[:, current_frame_idx].unsqueeze(-1)
-
-                if current_frame_idx == 0:
-                    if self.first_context_subword_id is None:
-                        raise RuntimeError("first_context_subword_id is not initialized. Ensure TTS warmup ran successfully.")
-                    prev_subword_id = self.first_context_subword_id
-                else:
-                    prev_subword_id = state.gen_text[:, current_frame_idx-1].unsqueeze(-1)
-
-                current_subword_mask = state.subword_mask[:, current_frame_idx].unsqueeze(-1)
-
-                if self.generation_config is None:
-                    raise RuntimeError("generation_config is not initialized. Ensure TTS warmup ran successfully.")
-
-                start_tts_model = time.time()
-                inputs = {
-                    "current_subword_id": current_subword_id,
-                    "prev_subword_id": prev_subword_id,
-                    "current_subword_mask": current_subword_mask,
-                    "prev_audio_tokens": state.tts_code,
-                    "past_key_values": state.tts_past_key_values,
-                    "guidance_enabled": True,
-                    "generation_config": self.generation_config,
-                    "ignore_eos_flag_stop": True,
-                }
-                if self.use_vllm_eartts:
-                    inputs["request_id"] = effective_request_id
-
-                state.tts_code, state.tts_past_key_values = self.model.tts_model.infer_codes_one_step(**inputs)
-
-                torch.cuda.synchronize()
-                time_tts_model = time.time() - start_tts_model
-                logging.info(f"Time taken for tts_model: {time_tts_model:.3f}s")
-
-                new_codes_for_decode.append(state.tts_code.clone())
-
-                # Potentially overwrite the audio token with silence tokens (for feeding to the audio token predictor)
-                if self.model.cfg.get('inference_force_speech_silence_on_eos', None):
-                    silence_codes = self.model.tts_model.codec_silence_tokens.view(1, 1, -1).expand(state.tts_code.shape)
-                    state.tts_code = torch.where(
-                        current_subword_id.unsqueeze(-1) == self.model.tts_model.text_eos_id,
-                        silence_codes,
-                        state.tts_code,
-                    )
+                new_code = self._run_tts_step(
+                    state, current_frame_idx, effective_request_id,
+                )
+                new_codes_for_decode.append(new_code)
 
         # --- Stage 3: Audio decode ---
-        decoded_audio_new = None
-        if self.decode_audio:
-            logging.info(f"\nDecoding audio for {frame_idx}-th frame  ({num_frames_per_chunk=})")
-
-            start_time_decode = time.time()
-            with fp32_precision(), torch.no_grad():
-                new_codes_tensor = torch.cat(new_codes_for_decode, dim=1)
-                if hasattr(self.model.tts_model, '_control_codes'):
-                    from nemo.collections.speechlm2.models.duplex_ear_tts import replace_control_speech_codes
-                    new_codes_tensor = replace_control_speech_codes(
-                        new_codes_tensor,
-                        self.model.tts_model._control_codes,
-                        getattr(self.model.tts_model, 'codec_silence_tokens', None),
-                    )
-                new_code_len = torch.tensor(
-                    [new_codes_tensor.shape[1]], dtype=torch.long, device=self.device
-                )
-                decoded_audio_new, _ = self.model.tts_model.audio_codec.decode(
-                    new_codes_tensor, new_code_len, cache=state.tts_codec_cache,
-                )
-
-            torch.cuda.synchronize()
-            time_audio_codec = time.time() - start_time_decode
-            logging.info(f"Time taken for audio_codec: {time_audio_codec:.3f}s")
+        decoded_audio_new = self._decode_audio(new_codes_for_decode, state, frame_idx, num_frames_per_chunk)
 
         # --- Stage 4: Token -> string conversion ---
         predicted_text_strs = self._tokens_to_strings(predicted_tokens)
@@ -819,14 +631,15 @@ class NemotronVoicechatInferenceWrapper:
         logging.info(f'frame {frame_idx}: AGENT txt: {predicted_text_strs}')
 
         # --- Update remaining state fields ---
-        if not use_cache:
+        if not use_llm_cache:
             state.input_embeds_history = state.input_embeds_history + new_input_embeds
-        if use_cache:
+        if use_llm_cache:
             state.llm_cache_position_offset += num_frames_per_chunk
 
-        torch.cuda.synchronize()
-        time_for_one_step = time.time() - start_time_one_step
-        logging.info(f'frame {frame_idx}: Time taken for one step: {time_for_one_step:.3f}s')
+        if self._profile_timing:
+            torch.cuda.synchronize()
+            time_for_one_step = time.time() - start_time_one_step
+            logging.info(f'frame {frame_idx}: Time taken for one step: {time_for_one_step:.3f}s')
 
         debug = None
         if return_debug:
@@ -840,16 +653,229 @@ class NemotronVoicechatInferenceWrapper:
                 "asr_logits": torch.stack(debug_asr_logits, dim=1) if debug_asr_logits else None,
             }
 
-        func_tokens = function_predicted_tokens if self.model.stt_model.function_head is not None else None
         return InferenceStepResult(
             predicted_text_tokens=predicted_tokens,
             asr_predicted_text_tokens=asr_predicted_tokens,
             predicted_text_strs=predicted_text_strs,
             asr_predicted_text_strs=asr_predicted_text_strs,
             decoded_audio=decoded_audio_new,
-            function_predicted_text_tokens=func_tokens,
+            function_predicted_text_tokens=function_predicted_tokens,
             debug=debug,
         )
+
+    # ------------------------------------------------------------------
+    # infer_one_step sub-stages
+    # ------------------------------------------------------------------
+
+    def _build_input_embedding(
+        self,
+        frame_embedding: torch.Tensor,
+        current_frame_idx: int,
+        state: StreamingDecodeState,
+        has_prompt: bool,
+    ) -> torch.Tensor:
+        """Compose the LLM input embedding for a single frame.
+
+        Combines the perception embedding (user channel) with the text /
+        ASR / function-call channel embeddings from the previous step.
+        At frame 0 this is either BOS (no prompt) or pad (after prompt).
+
+        IMPORTANT: The arithmetic order here must match offline_inference
+        exactly (floating-point addition is not associative).  For t > 0
+        the text and ASR embeddings are summed first, then added to the
+        perception embedding in a single ``+=``.  For t == 0 the sequential
+        ``+=`` pattern matches the offline path.
+        """
+        stt = self.model.stt_model
+        emb = frame_embedding.clone()
+        emb *= stt.cfg.get("duplex_user_channel_weight", 1.0)
+
+        has_fc = state.gen_function_text is not None
+
+        if current_frame_idx == 0 and not has_prompt:
+            emb += self._get_bos_embedding() * stt.cfg.get("duplex_text_channel_weight", 1.0)
+            emb += self._get_asr_bos_embedding() * stt.cfg.get("duplex_asr_text_weight", 1.0)
+            if has_fc:
+                pad_token = torch.full((1,), fill_value=stt.text_pad_id, device=self.device, dtype=torch.long)
+                emb += stt.embed_tokens(pad_token).to(dtype=self.dtype)
+
+        elif current_frame_idx == 0 and has_prompt:
+            pad_token = torch.full((1,), fill_value=stt.text_pad_id, device=self.device, dtype=torch.long)
+            emb += stt.embed_tokens(pad_token).to(dtype=self.dtype)
+            emb += stt.embed_asr_tokens(pad_token).to(dtype=self.dtype)
+            if has_fc:
+                emb += stt.embed_tokens(pad_token).to(dtype=self.dtype)
+
+        else:
+            # Sum text + ASR first, then add once (must match offline operation order)
+            prev = current_frame_idx - 1
+            last_token_emb = stt.embed_tokens(
+                state.gen_text[:, prev]
+            ) * stt.cfg.get("duplex_text_channel_weight", 1.0)
+            last_asr_token_emb = stt.embed_asr_tokens(
+                state.gen_asr_text[:, prev]
+            ) * stt.cfg.get("duplex_asr_text_weight", 1.0)
+            emb += last_token_emb + last_asr_token_emb
+            if has_fc:
+                emb += stt.embed_tokens(state.gen_function_text[:, prev]).to(dtype=self.dtype)
+
+        return emb
+
+    def _run_llm_step(
+        self,
+        input_emb: torch.Tensor,
+        state: StreamingDecodeState,
+        frame_offset: int,
+        request_id: str,
+        current_frame_idx: int,
+        use_llm_cache: bool,
+        return_debug: bool,
+        new_input_embeds: list,
+    ) -> dict:
+        """Run one LLM forward pass (native cache, vLLM, or full-history).
+
+        Updates ``state.llm_cache`` in-place for cached paths.  For the
+        no-cache fallback, appends to *new_input_embeds* (list, mutated).
+        """
+        start_stt_model = time.time()
+
+        if use_llm_cache or self.use_vllm_llm:
+            if self.use_vllm_llm:
+                ans = self.model_llm_interface(
+                    input_emb,
+                    request_id=request_id,
+                    generated_tokens=state.gen_text,
+                    current_step=current_frame_idx,
+                )
+            else:
+                cache_pos = torch.tensor(
+                    [state.llm_cache_position_offset + frame_offset], device=self.device,
+                )
+                ans = self.model_llm_interface(
+                    input_emb,
+                    cache=state.llm_cache,
+                    cache_position=cache_pos,
+                    generated_tokens=state.gen_text,
+                    current_step=current_frame_idx,
+                    return_logits=return_debug,
+                )
+            state.llm_cache = ans["cache"]
+        else:
+            new_input_embeds.append(input_emb)
+            full_input_embeds = torch.cat(state.input_embeds_history + new_input_embeds, dim=1)
+            ans = self.model_llm_interface(
+                full_input_embeds,
+                cache=None,
+                generated_tokens=state.gen_text,
+                current_step=current_frame_idx,
+                return_logits=return_debug,
+            )
+
+        if self._profile_timing:
+            torch.cuda.synchronize()
+            time_stt_model = time.time() - start_stt_model
+            logging.info(f"Time taken for stt_model: {time_stt_model:.3f}s")
+
+        return ans
+
+    def _run_tts_step(
+        self,
+        state: StreamingDecodeState,
+        current_frame_idx: int,
+        request_id: str,
+    ) -> torch.Tensor:
+        """Run one TTS code-generation step.
+
+        Mutates ``state.tts_code`` and ``state.tts_past_key_values`` in-place.
+        Returns the new code tensor (cloned) for later batch decoding.
+        """
+        current_subword_id = state.gen_text[:, current_frame_idx].unsqueeze(-1)
+
+        if current_frame_idx == 0:
+            if self.first_context_subword_id is None:
+                raise RuntimeError("first_context_subword_id is not initialized. Ensure TTS warmup ran successfully.")
+            prev_subword_id = self.first_context_subword_id
+        else:
+            prev_subword_id = state.gen_text[:, current_frame_idx - 1].unsqueeze(-1)
+
+        current_subword_mask = state.subword_mask[:, current_frame_idx].unsqueeze(-1)
+
+        if self.generation_config is None:
+            raise RuntimeError("generation_config is not initialized. Ensure TTS warmup ran successfully.")
+
+        start_tts_model = time.time()
+        inputs = {
+            "current_subword_id": current_subword_id,
+            "prev_subword_id": prev_subword_id,
+            "current_subword_mask": current_subword_mask,
+            "prev_audio_tokens": state.tts_code,
+            "past_key_values": state.tts_past_key_values,
+            "guidance_enabled": True,
+            "generation_config": self.generation_config,
+            "ignore_eos_flag_stop": True,
+        }
+        if self.use_vllm_eartts:
+            inputs["request_id"] = request_id
+
+        state.tts_code, state.tts_past_key_values = self.model.tts_model.infer_codes_one_step(**inputs)
+
+        if self._profile_timing:
+            torch.cuda.synchronize()
+            time_tts_model = time.time() - start_tts_model
+            logging.info(f"Time taken for tts_model: {time_tts_model:.3f}s")
+
+        new_code = state.tts_code.clone()
+
+        if self.model.cfg.get('inference_force_speech_silence_on_eos', None):
+            silence_codes = self.model.tts_model.codec_silence_tokens.view(1, 1, -1).expand(state.tts_code.shape)
+            state.tts_code = torch.where(
+                current_subword_id.unsqueeze(-1) == self.model.tts_model.text_eos_id,
+                silence_codes,
+                state.tts_code,
+            )
+
+        return new_code
+
+    def _decode_audio(
+        self,
+        new_codes_for_decode: list[torch.Tensor],
+        state: StreamingDecodeState,
+        frame_idx: int,
+        num_frames_per_chunk: int,
+    ) -> Optional[torch.Tensor]:
+        """Decode accumulated TTS codes into a waveform.
+
+        Returns the decoded audio tensor or *None* when ``decode_audio``
+        is disabled or no codes were produced.
+        """
+        if not self.decode_audio or not new_codes_for_decode:
+            return None
+
+        logging.info(f"Decoding audio for {frame_idx}-th frame  ({num_frames_per_chunk=})")
+
+        start_time_decode = time.time()
+        with fp32_precision(), torch.no_grad():
+            new_codes_tensor = torch.cat(new_codes_for_decode, dim=1)
+            if hasattr(self.model.tts_model, '_control_codes'):
+                from nemo.collections.speechlm2.models.duplex_ear_tts import replace_control_speech_codes
+                new_codes_tensor = replace_control_speech_codes(
+                    new_codes_tensor,
+                    self.model.tts_model._control_codes,
+                    getattr(self.model.tts_model, 'codec_silence_tokens', None),
+                )
+            new_code_len = torch.tensor(
+                [new_codes_tensor.shape[1]], dtype=torch.long, device=self.device,
+            )
+            decoded_audio, _ = self.model.tts_model.audio_codec.decode(
+                new_codes_tensor, new_code_len, cache=state.tts_codec_cache,
+            )
+
+        if self._profile_timing:
+            torch.cuda.synchronize()
+            time_audio_codec = time.time() - start_time_decode
+            logging.info(f"Time taken for audio_codec: {time_audio_codec:.3f}s")
+
+        return decoded_audio
 
     def _run_perception(
         self,
@@ -876,9 +902,11 @@ class NemotronVoicechatInferenceWrapper:
                 return_encoder_emb=True,
             )
 
-        torch.cuda.synchronize()
-        time_perception = time.time() - start_perception
-        logging.info(f"Time taken for perception: {time_perception:.3f}s")
+        if self._profile_timing:
+            torch.cuda.synchronize()
+            time_perception = time.time() - start_perception
+            logging.info(f"Time taken for perception: {time_perception:.3f}s")
+
         source_encoded = source_encoded.to(self.dtype)
         return source_encoded, perception_cache
 

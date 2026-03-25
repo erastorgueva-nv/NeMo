@@ -50,6 +50,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         # ------------------------------------------------------------------
         self.s2s_model = s2s_model
         self.device = self.s2s_model.device
+        self.decode_audio = self.s2s_model.decode_audio
         self.collect_debug = False
 
         # ------------------------------------------------------------------
@@ -65,7 +66,6 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                 "StreamingS2SPipeline currently supports only single-stream inference "
                 "(streaming.batch_size must be 1)."
             )
-        
 
         # ------------------------------------------------------------------
         # Chunk & buffer sizes
@@ -136,7 +136,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
         super().__init__()
 
-    # --------------------------------  ----------------------------------
+    # ------------------------------------------------------------------
     # State helpers
     # ------------------------------------------------------------------
     def create_state(self) -> S2SStreamingState:
@@ -177,7 +177,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
             state.append_step_output(sample_audio, text=piece, asr_text=asr_piece)
 
 
-    def inner_generate_step(self, frames: List[Frame], buffers: List[Tensor], left_paddings: List[int], ready_feats: List[bool]):
+    def inner_generate_step(self, frames: List[Frame], buffers: List[Tensor], ready_feats: List[bool]):
         """Generate speech for chunks in *batch* using a shared ContextManager."""
         if len(frames) == 0:
             return
@@ -217,11 +217,6 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         if audio_buffer.dim() == 1:
             audio_buffer = audio_buffer.unsqueeze(0)
         audio_buffer = audio_buffer.to(self.s2s_model.device, dtype=self.s2s_model.dtype)
-        
-        # Trim the buffer to exclude left padding (zeros at the beginning before buffer is filled)
-        left_pad = left_paddings[0]
-        if left_pad > 0:
-            audio_buffer = audio_buffer[:, left_pad:]
 
         result = self.s2s_model.infer_one_step(
             audio_input=audio_buffer,
@@ -270,7 +265,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
     def prefill_for_new_stream(self, stream_id: int, system_prompt: str | None = None) -> bool:
         """Prepare the pipeline for a new stream by resetting context and prefilling the system prompt.
 
-        This is the public API for prefill-only calls (e.g. from the Triton backend)
+        This is the public API for prefill-only calls (e.g. from a server backend)
         that need to initialize TTS speaker embeddings and/or inject a system prompt
         into the LLM KV cache *without* processing any audio.
 
@@ -349,7 +344,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         prompt in ``options``, this is treated as a **prefill-only** request:
         the context manager and system prompt are initialized but no audio
         inference runs.  This is the unified protocol used by both the CLI
-        (``run()``) and the Triton backend.
+        (``run()``) and server backends.
         """
         # Detect prefill-only frame: is_first + zero-length audio
         if (len(frames) == 1
@@ -363,10 +358,13 @@ class StreamingS2SPipeline(S2SPipelineInterface):
             return
 
         buffers, left_paddings = self.bufferer.update(frames)
+        # This is a workaround for the fact that the audio buffer does left
+        # padding, but the rest of the code requires no padding at all.
+        buffers = [b[lp:] for b, lp in zip(buffers, left_paddings)]
         ready_feats = [True] * len(frames)
 
         with torch.no_grad(), torch.inference_mode():
-            self.inner_generate_step(frames, buffers, left_paddings, ready_feats)
+            self.inner_generate_step(frames, buffers, ready_feats)
         
     # ------------------------------------------------------------------
     # Finalization helpers
@@ -377,66 +375,63 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         audio_filepaths: List[str],
         saved_paths_by_stream: dict[int, str],
     ) -> None:
-        """Finalize any streams that ended in this batch and save their audio."""
+        """Finalize any streams that ended in this batch and save their outputs."""
         for frame in frames:
             if frame.is_last:
                 stream_id = frame.stream_id
                 state = self.get_or_create_state(stream_id)
 
-                # Flush remaining buffered samples and assemble waveform
                 if hasattr(state, "finalize"):
                     state.finalize()
-                # Concatenate emitted chunks and squeeze (B=1,C=1) to mono waveform
-                generated_audio = state.audio_buffer
-                # Ensure 1D mono waveform and float32 dtype for soundfile
-                if generated_audio.dim() == 3 and generated_audio.size(0) == 1 and generated_audio.size(1) == 1:
-                    generated_audio = generated_audio.squeeze(0).squeeze(0)
-                elif generated_audio.dim() == 2 and generated_audio.size(0) == 1:
-                    generated_audio = generated_audio.squeeze(0)
-                generated_audio = generated_audio.to(torch.float32)
 
-                # Build output paths in subdirectories under output_dir
                 in_path = audio_filepaths[stream_id]
                 base = os.path.splitext(os.path.basename(in_path))[0]
-
-                wav_dir = os.path.join(self.output_dir, "wav")
-                stereo_dir = os.path.join(self.output_dir, "stereo")
                 txt_dir = os.path.join(self.output_dir, "txt")
-                os.makedirs(wav_dir, exist_ok=True)
-                os.makedirs(stereo_dir, exist_ok=True)
                 os.makedirs(txt_dir, exist_ok=True)
 
-                out_path = os.path.join(wav_dir, f"{base}.wav")
+                out_path = None
+                if self.decode_audio:
+                    # Squeeze (B=1,C=1) to 1D mono waveform for soundfile
+                    generated_audio = state.audio_buffer
+                    if generated_audio.dim() == 3 and generated_audio.size(0) == 1 and generated_audio.size(1) == 1:
+                        generated_audio = generated_audio.squeeze(0).squeeze(0)
+                    elif generated_audio.dim() == 2 and generated_audio.size(0) == 1:
+                        generated_audio = generated_audio.squeeze(0)
+                    generated_audio = generated_audio.to(torch.float32)
 
-                # Write audio to disk
-                if generated_audio.numel() > 0:
-                    sf.write(out_path, generated_audio.detach().cpu().numpy(), self.output_sample_rate)
+                    wav_dir = os.path.join(self.output_dir, "wav")
+                    stereo_dir = os.path.join(self.output_dir, "stereo")
+                    os.makedirs(wav_dir, exist_ok=True)
+                    os.makedirs(stereo_dir, exist_ok=True)
 
-                # Also save a stereo file with input (ch0) and output (ch1)
-                # Load input with librosa (handles mono conversion and resampling)
-                input_np, _ = librosa.load(in_path, sr=self.output_sample_rate, mono=True)
-                input_audio = torch.from_numpy(input_np).to(torch.float32)
-                gen_cpu = generated_audio.detach().cpu().to(input_audio.dtype)
+                    out_path = os.path.join(wav_dir, f"{base}.wav")
+                    if generated_audio.numel() > 0:
+                        sf.write(out_path, generated_audio.detach().cpu().numpy(), self.output_sample_rate)
 
-                # Prepend silence to output channel to account for
-                # the one-chunk processing delay: the server can't
-                # produce output until it has received a full input chunk.
-                delay_samples = int(self.chunk_size_in_secs * self.output_sample_rate)
-                silence = torch.zeros(delay_samples, dtype=gen_cpu.dtype)
-                gen_cpu = torch.cat([silence, gen_cpu], dim=-1)
+                    # Save a stereo file with input (ch0) and output (ch1)
+                    input_np, _ = librosa.load(in_path, sr=self.output_sample_rate, mono=True)
+                    input_audio = torch.from_numpy(input_np).to(torch.float32)
+                    gen_cpu = generated_audio.detach().cpu().to(input_audio.dtype)
 
-                gen_len = int(gen_cpu.shape[-1])
-                in_len = int(input_audio.shape[-1])
-                max_len = max(gen_len, in_len)
-                if in_len < max_len:
-                    input_audio = torch.cat([input_audio, torch.zeros(max_len - in_len, dtype=input_audio.dtype)], dim=-1)
-                if gen_len < max_len:
-                    gen_cpu = torch.cat([gen_cpu, torch.zeros(max_len - gen_len, dtype=gen_cpu.dtype)], dim=-1)
-                stereo = torch.stack([input_audio, gen_cpu], dim=0).transpose(0, 1)
-                stereo_path = os.path.join(stereo_dir, f"{base}_input_output.wav")
-                sf.write(stereo_path, stereo.detach().cpu().numpy(), self.output_sample_rate)
+                    # Prepend silence to output channel to account for the one-chunk
+                    # processing delay: the server can't produce output until it has
+                    # received a full input chunk.
+                    delay_samples = int(self.chunk_size_in_secs * self.output_sample_rate)
+                    silence = torch.zeros(delay_samples, dtype=gen_cpu.dtype)
+                    gen_cpu = torch.cat([silence, gen_cpu], dim=-1)
 
-                # Save accumulated text
+                    # Pad the shorter channel so both have equal length
+                    gen_len = int(gen_cpu.shape[-1])
+                    in_len = int(input_audio.shape[-1])
+                    max_len = max(gen_len, in_len)
+                    if in_len < max_len:
+                        input_audio = torch.cat([input_audio, torch.zeros(max_len - in_len, dtype=input_audio.dtype)], dim=-1)
+                    if gen_len < max_len:
+                        gen_cpu = torch.cat([gen_cpu, torch.zeros(max_len - gen_len, dtype=gen_cpu.dtype)], dim=-1)
+                    stereo = torch.stack([input_audio, gen_cpu], dim=0).transpose(0, 1)
+                    stereo_path = os.path.join(stereo_dir, f"{base}_input_output.wav")
+                    sf.write(stereo_path, stereo.detach().cpu().numpy(), self.output_sample_rate)
+
                 text_out = state.output_text_str
                 if isinstance(text_out, str):
                     try:
@@ -445,7 +440,6 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                     except Exception:
                         pass
 
-                # Save accumulated ASR text
                 asr_text_out = state.output_asr_text_str
                 if isinstance(asr_text_out, str) and asr_text_out:
                     try:
@@ -455,8 +449,8 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                         pass
 
                 saved_paths_by_stream[stream_id] = out_path
-
-                # Keep state until outputs are assembled; will be cleared on close_session
+                # Keep state in _state_pool until _build_pipeline_output;
+                # it will be cleared on close_session().
 
 
     # ------------------------------------------------------------------
@@ -499,7 +493,6 @@ class StreamingS2SPipeline(S2SPipelineInterface):
             batch_size=self.batch_size,
             pad_last_frame=True,
         )
-        
         streamer.set_audio_filepaths(audio_filepaths, options)
         streamer.set_progress_bar(progress_bar)
 
@@ -512,68 +505,112 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
         self.open_session()
         for frames in streamer:
-            # Unified prefill protocol: if the first frame of a new stream
-            # carries a system prompt, emit a zero-length prefill frame first.
-            if (len(frames) == 1
-                    and frames[0].is_first
-                    and frames[0].options is not None
-                    and hasattr(frames[0].options, "system_prompt")
-                    and frames[0].options.system_prompt):
-                prefill_frame = Frame(
-                    samples=torch.empty(0),
-                    stream_id=frames[0].stream_id,
-                    is_first=True,
-                    is_last=False,
-                    options=frames[0].options,
-                )
-                self.generate_step([prefill_frame])
-
-            # If padding is configured, intercept last frames so the
-            # bufferer/context stay alive for the silence-padding phase.
-            # Padding is generated immediately (same iteration) to avoid
-            # the next stream's setup destroying this stream's context.
-            pad_targets: dict[int, float] = {}
-            if self.pad_audio_to_sec or self.pad_silence_ratio or self.pad_audio_by_sec:
-                processed_frames = []
-                for frame in frames:
-                    if frame.is_last:
-                        elapsed = streamer.elapsed_durations[frame.stream_id]
-                        remaining = self._padding_remaining_secs(elapsed)
-                        if remaining > 0:
-                            processed_frames.append(Frame(
-                                samples=frame.samples,
-                                stream_id=frame.stream_id,
-                                is_first=frame.is_first,
-                                is_last=False,
-                                length=frame.length,
-                                options=frame.options,
-                            ))
-                            pad_targets[frame.stream_id] = remaining
-                            continue
-                    processed_frames.append(frame)
-                frames = processed_frames
-
+            self._maybe_prefill(frames)
+            frames, pad_targets = self._apply_padding(frames, streamer)
             self.generate_step(frames)
             self._finalize_and_save_finished_streams(frames, audio_filepaths, saved_paths_by_stream)
+            self._generate_silence_padding(pad_targets, chunk_samples, audio_filepaths, saved_paths_by_stream)
 
-            # Generate silence padding before the next iteration adds a new stream
-            for stream_id, remaining_secs in pad_targets.items():
-                num_pad_frames = max(1, round(remaining_secs / self.chunk_size_in_secs))
-                for i in range(num_pad_frames):
-                    is_last = (i == num_pad_frames - 1)
-                    silence_frame = Frame(
-                        samples=torch.zeros(chunk_samples),
-                        stream_id=stream_id,
-                        is_first=False,
-                        is_last=is_last,
-                        length=chunk_samples,
+        output = self._build_pipeline_output(audio_filepaths, saved_paths_by_stream)
+        self.close_session()
+        return output
+
+    # ------------------------------------------------------------------
+    # run() helpers
+    # ------------------------------------------------------------------
+
+    def _maybe_prefill(self, frames: List[Frame]) -> None:
+        """If the first frame of a new stream carries a system prompt, emit a
+        zero-length prefill frame through ``generate_step`` before inference
+        begins.  This is the unified prefill protocol used by both ``run()``
+        and server backends.
+        """
+        if (len(frames) == 1
+                and frames[0].is_first
+                and frames[0].options is not None
+                and hasattr(frames[0].options, "system_prompt")
+                and frames[0].options.system_prompt):
+            prefill_frame = Frame(
+                samples=torch.empty(0),
+                stream_id=frames[0].stream_id,
+                is_first=True,
+                is_last=False,
+                options=frames[0].options,
+            )
+            self.generate_step([prefill_frame])
+
+    def _apply_padding(
+        self,
+        frames: List[Frame],
+        streamer: ContinuousBatchedFrameStreamer,
+    ) -> tuple[List[Frame], dict[int, float]]:
+        """If padding is configured, intercept last frames so the bufferer and
+        context stay alive for the silence-padding phase.  Returns the
+        (possibly modified) frames and a dict mapping ``stream_id`` to the
+        remaining seconds of silence to append.
+        """
+        pad_targets: dict[int, float] = {}
+        if not (self.pad_audio_to_sec or self.pad_silence_ratio or self.pad_audio_by_sec):
+            return frames, pad_targets
+
+        processed_frames = []
+        for frame in frames:
+            if frame.is_last:
+                elapsed = streamer.elapsed_durations[frame.stream_id]
+                remaining = self._padding_remaining_secs(elapsed)
+                if remaining > 0:
+                    processed_frames.append(Frame(
+                        samples=frame.samples,
+                        stream_id=frame.stream_id,
+                        is_first=frame.is_first,
+                        is_last=False,
+                        length=frame.length,
+                        options=frame.options,
+                    ))
+                    pad_targets[frame.stream_id] = remaining
+                    continue
+            processed_frames.append(frame)
+        return processed_frames, pad_targets
+
+    def _generate_silence_padding(
+        self,
+        pad_targets: dict[int, float],
+        chunk_samples: int,
+        audio_filepaths: List[str],
+        saved_paths_by_stream: dict[int, str],
+    ) -> None:
+        """Generate silence-padding frames for streams that need them.
+
+        Must run in the same iteration as the real last frame to avoid the next
+        stream's setup destroying this stream's context.
+        """
+        for stream_id, remaining_secs in pad_targets.items():
+            num_pad_frames = max(1, round(remaining_secs / self.chunk_size_in_secs))
+            for i in range(num_pad_frames):
+                is_last = (i == num_pad_frames - 1)
+                silence_frame = Frame(
+                    samples=torch.zeros(chunk_samples),
+                    stream_id=stream_id,
+                    is_first=False,
+                    is_last=is_last,
+                    length=chunk_samples,
+                )
+                self.generate_step([silence_frame])
+                if is_last:
+                    self._finalize_and_save_finished_streams(
+                        [silence_frame], audio_filepaths, saved_paths_by_stream
                     )
-                    self.generate_step([silence_frame])
-                    if is_last:
-                        self._finalize_and_save_finished_streams(
-                            [silence_frame], audio_filepaths, saved_paths_by_stream
-                        )
-        # Build outputs before closing the session
+
+    def _build_pipeline_output(
+        self,
+        audio_filepaths: List[str],
+        saved_paths_by_stream: dict[int, str],
+    ) -> PipelineOutput:
+        """Assemble final ``PipelineOutput`` from accumulated per-stream state.
+
+        Must be called *before* ``close_session()`` since it reads from the
+        state pool.
+        """
         texts = []
         words = []
         asr_texts = []
@@ -637,8 +674,6 @@ class StreamingS2SPipeline(S2SPipelineInterface):
             for idx in range(len(audio_filepaths)):
                 state = self.get_or_create_state(idx)
                 debug_data.append(getattr(state, "debug_steps", []))
-
-        self.close_session()
 
         return PipelineOutput(
             texts=texts,

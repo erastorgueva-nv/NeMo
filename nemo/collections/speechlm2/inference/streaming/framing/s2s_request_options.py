@@ -21,7 +21,7 @@ class S2SRequestOptions:
 
     Attached to the first ``Frame`` of each stream via the ``options``
     field so that the pipeline can read per-stream configuration at the
-    start of every new audio file / Triton sequence.
+    start of every new audio stream.
     """
 
     system_prompt: str | None = None

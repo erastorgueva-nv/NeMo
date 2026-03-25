@@ -37,7 +37,6 @@ Run from the NeMo repo root (use ``-s`` to see live progress)::
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import time
@@ -60,57 +59,38 @@ from nemo.collections.speechlm2.inference.pipelines.streaming_s2s_pipeline impor
 from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
 from nemo.collections.speechlm2.models import NemotronVoiceChat
 
+_CONF_YAML = os.path.join(
+    os.path.dirname(__file__),
+    "../../../examples/speechlm2/nemo_inference_pipelines/conf/s2s_streaming.yaml",
+)
+
 # ---------------------------------------------------------------------------
-# Comparison helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-def compare_logits(
-    a: torch.Tensor,
-    b: torch.Tensor,
-) -> dict[str, Any]:
-    """Prefix-aware comparison of two ``(B, T, V)`` logit tensors."""
-    a = a.detach().cpu().float()
-    b = b.detach().cpu().float()
-    prefix_len = min(a.shape[1], b.shape[1])
-    if prefix_len == 0:
-        return {"prefix_len": 0, "match": True, "max_abs_diff": 0.0, "mean_abs_diff": 0.0}
-    ap, bp = a[:, :prefix_len], b[:, :prefix_len]
-    diff = (ap - bp).abs()
-    reduce_dims = tuple(i for i in range(diff.dim()) if i != 1)
-    per_step_max = diff.amax(dim=reduce_dims) if reduce_dims else diff
-    first_diff_step = None
-    nonzero = (per_step_max > 0).nonzero(as_tuple=False)
-    if nonzero.numel() > 0:
-        first_diff_step = int(nonzero[0].item())
-    return {
-        "prefix_len": prefix_len,
-        "match": bool(torch.equal(ap, bp)),
-        "max_abs_diff": float(diff.max()),
-        "mean_abs_diff": float(diff.mean()),
-        "first_diff_step": first_diff_step,
-    }
-
-
-def compare_tokens(
+def _compare_tensors(
     a: torch.Tensor | None,
     b: torch.Tensor | None,
 ) -> dict[str, Any]:
-    """Compare two ``(B, T)`` token tensors with prefix-aware logic."""
+    """Prefix-aware comparison of two tensors (tokens or logits, any shape)."""
     if a is None or b is None:
         return {"match": None, "note": "one or both tensors missing"}
-    a, b = a.detach().cpu(), b.detach().cpu()
-    prefix_len = min(a.shape[-1], b.shape[-1])
-    if prefix_len == 0:
+    a, b = a.detach().cpu().float(), b.detach().cpu().float()
+    T = min(a.shape[1], b.shape[1])
+    if T == 0:
         return {"prefix_len": 0, "match": True}
-    ap, bp = a[..., :prefix_len], b[..., :prefix_len]
-    match = bool(torch.equal(ap, bp))
-    first_diff_index = None
+    ap, bp = a[:, :T], b[:, :T]
+    diff = (ap - bp).abs()
+    match = bool(diff.max() == 0)
+    result: dict[str, Any] = {"prefix_len": T, "match": match, "max_abs_diff": float(diff.max())}
     if not match:
-        diffs = (ap != bp).flatten().nonzero(as_tuple=False)
-        if diffs.numel() > 0:
-            first_diff_index = int(diffs[0].item())
-    return {"prefix_len": prefix_len, "match": match, "first_diff_index": first_diff_index}
+        reduce = tuple(i for i in range(diff.dim()) if i != 1)
+        per_step = diff.amax(dim=reduce) if reduce else diff.squeeze()
+        nonzero = (per_step > 0).nonzero(as_tuple=False)
+        if nonzero.numel():
+            result["first_diff_step"] = int(nonzero[0].item())
+    return result
 
 
 def _merge_incremental_debug_steps(steps: list[dict[str, Any]]) -> dict[str, Any]:
@@ -125,43 +105,36 @@ def _merge_incremental_debug_steps(steps: list[dict[str, Any]]) -> dict[str, Any
     }
 
 
+def _load_and_pad_audio(
+    audio_path: str, device: torch.device, dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Load audio, zero-pad to a whole number of 80 ms frames, return ``(audio, lens)``."""
+    import librosa
+
+    audio_np, _ = librosa.load(audio_path, sr=SAMPLE_RATE)
+    padded_len = math.ceil(len(audio_np) / FRAME_SIZE_SAMPLES) * FRAME_SIZE_SAMPLES
+    audio = torch.nn.functional.pad(
+        torch.tensor(audio_np, device=device, dtype=dtype).unsqueeze(0),
+        (0, max(0, padded_len - len(audio_np))),
+    )
+    return audio, torch.tensor([audio.shape[1]], device=device, dtype=torch.long)
+
+
 def run_parity_check(
     pipeline: StreamingS2SPipeline,
     audio_path: str,
     *,
     system_prompt: str | None = None,
 ) -> dict[str, Any]:
-    """Run offline and pipeline-based incremental inference, return comparison.
-
-    The offline path calls :meth:`NemotronVoiceChat.offline_inference`
-    (the same code path used by ``nemotron_voicechat_eval.py``).
-    The incremental path runs through :meth:`StreamingS2SPipeline.run`,
-    which is the real production code path (buffering, framing, prefill).
+    """Run offline and incremental inference on the same audio, return comparison.
 
     Only STT-level tokens and logits are compared; TTS is irrelevant for
     the core parity invariant.
     """
-    import librosa
-
     wrapper = pipeline.s2s_model
-    t0 = time.time()
-    logging.info("=" * 60)
-    logging.info("PARITY CHECK  --  offline vs. incremental (pipeline)")
-    logging.info("=" * 60)
-    logging.info(f"Audio : {audio_path}")
-    logging.info(f"Prompt: {system_prompt or '(none)'}")
+    audio, audio_lens = _load_and_pad_audio(audio_path, wrapper.device, wrapper.dtype)
 
-    logging.info("Loading audio ...")
-    audio_np, _ = librosa.load(audio_path, sr=SAMPLE_RATE)
-    total_frames = math.ceil(len(audio_np) / FRAME_SIZE_SAMPLES)
-    padded_len = total_frames * FRAME_SIZE_SAMPLES
-    audio = torch.tensor(audio_np, device=wrapper.device, dtype=wrapper.dtype).unsqueeze(0)
-    if audio.shape[1] < padded_len:
-        audio = torch.nn.functional.pad(audio, (0, padded_len - audio.shape[1]))
-    audio_lens = torch.tensor([audio.shape[1]], device=wrapper.device, dtype=torch.long)
-    logging.info(f"  {len(audio_np)} samples (padded to {audio.shape[1]}), {total_frames} frames, {len(audio_np)/SAMPLE_RATE:.2f}s")
-
-    # -- prompt tokens for offline --
+    # Prompt tokens for the offline path
     prompt_tokens = prompt_token_lens = None
     if system_prompt:
         tok = wrapper.tokenizer
@@ -169,20 +142,19 @@ def run_parity_check(
         prompt_tokens = torch.tensor(ids, device=wrapper.device, dtype=torch.long).unsqueeze(0)
         prompt_token_lens = torch.tensor([len(ids)], device=wrapper.device, dtype=torch.long)
 
-    # -- ensure speaker info for offline_inference's mandatory TTS init --
+    # offline_inference requires speaker info for TTS init
     if wrapper.speaker_name is not None:
         OmegaConf.update(wrapper.model.cfg, "inference_speaker_name", wrapper.speaker_name, force_add=True)
     elif wrapper.speaker_reference:
         OmegaConf.update(wrapper.model.cfg, "inference_speaker_reference", wrapper.speaker_reference, force_add=True)
     speaker_kw: dict[str, Any] = {}
-    cfg = wrapper.model.cfg
-    if not cfg.get("inference_speaker_name", None) and not cfg.get("inference_speaker_reference", None):
+    if not wrapper.model.cfg.get("inference_speaker_name") and not wrapper.model.cfg.get("inference_speaker_reference"):
         speaker_kw["speaker_audio"] = torch.randn(1, 22050, device=wrapper.device)
         speaker_kw["speaker_audio_lens"] = torch.tensor([22050], device=wrapper.device, dtype=torch.long)
 
-    # ---- Offline path (eval.py code path) ----
-    logging.info("Running offline_inference (with return_logits=True) ...")
-    t_offline = time.time()
+    # -- Offline --
+    logging.info("Running offline_inference ...")
+    t0 = time.time()
     offline = wrapper.model.offline_inference(
         input_signal=audio,
         input_signal_lens=audio_lens,
@@ -192,66 +164,36 @@ def run_parity_check(
         return_logits=True,
         **speaker_kw,
     )
-    logging.info(f"  offline_inference done in {time.time() - t_offline:.2f}s")
+    logging.info(f"  offline done in {time.time() - t0:.2f}s")
 
-    # ---- Incremental path (pipeline.run) ----
+    # -- Incremental --
     logging.info("Running incremental inference (pipeline.run) ...")
-    t_incr = time.time()
+    t0 = time.time()
     pipeline.collect_debug = True
     pipeline_output = pipeline.run(
         [audio_path],
         options=[S2SRequestOptions(system_prompt=system_prompt)],
     )
-    logging.info(f"  pipeline.run done in {time.time() - t_incr:.2f}s")
+    logging.info(f"  incremental done in {time.time() - t0:.2f}s")
 
-    # Extract tokens and logits from pipeline output
     inc_tokens = pipeline_output.token_texts[0] if pipeline_output.token_texts else None
     inc_asr_tokens = pipeline_output.token_asr_texts[0] if pipeline_output.token_asr_texts else None
+    inc_debug = _merge_incremental_debug_steps(
+        pipeline_output.debug_data[0] if pipeline_output.debug_data and pipeline_output.debug_data[0] else []
+    )
 
-    incremental_debug = {}
-    if pipeline_output.debug_data and pipeline_output.debug_data[0]:
-        incremental_debug = _merge_incremental_debug_steps(pipeline_output.debug_data[0])
-
-    # ---- Build comparison report ----
-    logging.info("Comparing outputs ...")
+    # -- Compare --
     report: dict[str, Any] = {
-        "audio_path": audio_path,
-        "total_frames": total_frames,
-        "system_prompt": system_prompt,
-        "offline_text": offline.get("text", [""])[0],
-        "token_comparison": compare_tokens(offline.get("tokens_text"), inc_tokens),
-        "asr_token_comparison": compare_tokens(offline.get("tokens_text_src"), inc_asr_tokens),
+        "token_comparison": _compare_tensors(offline.get("tokens_text"), inc_tokens),
+        "asr_token_comparison": _compare_tensors(offline.get("tokens_text_src"), inc_asr_tokens),
     }
-
-    off_tl = offline.get("text_logits")
-    inc_tl = incremental_debug.get("text_logits")
-    if off_tl is not None and inc_tl is not None:
-        report["text_logit_comparison"] = compare_logits(off_tl, inc_tl)
-
-    off_al = offline.get("asr_logits")
-    inc_al = incremental_debug.get("asr_logits")
-    if off_al is not None and inc_al is not None:
-        report["asr_logit_comparison"] = compare_logits(off_al, inc_al)
-
-    # ---- Summary ----
-    elapsed = time.time() - t0
-    logging.info("-" * 60)
-    logging.info("PARITY CHECK SUMMARY")
-    logging.info("-" * 60)
-    tc = report.get("token_comparison", {})
-    ac = report.get("asr_token_comparison", {})
-    logging.info(f"  Text tokens match : {tc.get('match')}  (prefix_len={tc.get('prefix_len')})")
-    logging.info(f"  ASR tokens match  : {ac.get('match')}  (prefix_len={ac.get('prefix_len')})")
-    for tag, key in [("Text logits", "text_logit_comparison"), ("ASR logits", "asr_logit_comparison")]:
-        lc = report.get(key, {})
-        if lc:
-            logging.info(
-                f"  {tag:16s}: match={lc.get('match')}, "
-                f"max_abs_diff={lc.get('max_abs_diff', 0):.6e}, "
-                f"mean_abs_diff={lc.get('mean_abs_diff', 0):.6e}"
-            )
-    logging.info(f"  Total time: {elapsed:.2f}s")
-    logging.info("=" * 60)
+    for key, off_key, inc_key in [
+        ("text_logit_comparison", "text_logits", "text_logits"),
+        ("asr_logit_comparison", "asr_logits", "asr_logits"),
+    ]:
+        off_t, inc_t = offline.get(off_key), inc_debug.get(inc_key)
+        if off_t is not None and inc_t is not None:
+            report[key] = _compare_tensors(off_t, inc_t)
 
     return report
 
@@ -262,45 +204,18 @@ def assert_parity(
     strict: bool = True,
     atol: float = 0.0,
 ) -> None:
-    """Raise :class:`AssertionError` if parity checks in *report* fail.
-
-    Args:
-        report: Dict returned by :func:`run_parity_check`.
-        strict: When ``True``, also assert logit-level match.
-        atol: Absolute tolerance for logit comparison (only used when *strict*).
-    """
+    """Raise ``AssertionError`` if parity checks in *report* fail."""
     failures: list[str] = []
-
-    tc = report.get("token_comparison", {})
-    if tc.get("match") is False:
-        failures.append(f"text tokens diverge at index {tc.get('first_diff_index')}")
-
-    ac = report.get("asr_token_comparison", {})
-    if ac.get("match") is False:
-        failures.append(f"ASR tokens diverge at index {ac.get('first_diff_index')}")
-
+    for key in ("token_comparison", "asr_token_comparison"):
+        c = report.get(key, {})
+        if c.get("match") is False:
+            failures.append(f"{key}: diverge at step {c.get('first_diff_step')}")
     if strict:
         for key in ("text_logit_comparison", "asr_logit_comparison"):
-            lc = report.get(key, {})
-            if lc and lc.get("match") is False:
-                max_diff = lc.get("max_abs_diff", float("inf"))
-                if max_diff > atol:
-                    failures.append(
-                        f"{key}: max_abs_diff={max_diff:.6e} > atol={atol:.6e}, "
-                        f"first diff at step {lc.get('first_diff_step')}"
-                    )
-
-    if failures:
-        detail = json.dumps(
-            {k: v for k, v in report.items() if k != "debug"},
-            indent=2,
-            default=str,
-        )
-        raise AssertionError(
-            "Offline/incremental parity failed:\n  - "
-            + "\n  - ".join(failures)
-            + f"\n\nFull report:\n{detail}"
-        )
+            c = report.get(key, {})
+            if c.get("match") is False and c.get("max_abs_diff", 0) > atol:
+                failures.append(f"{key}: max_abs_diff={c['max_abs_diff']:.2e} > atol={atol:.2e}")
+    assert not failures, "Parity failed:\n  " + "\n  ".join(failures)
 
 
 # ---------------------------------------------------------------------------
@@ -483,47 +398,44 @@ def _build_parity_pipeline(
     *,
     speaker_name: str | None = None,
 ) -> StreamingS2SPipeline:
-    """Build a :class:`StreamingS2SPipeline` configured for strict parity testing."""
+    """Build a :class:`StreamingS2SPipeline` configured for strict parity testing.
+
+    Loads ``s2s_streaming.yaml`` as the base config and applies
+    parity-specific overrides (deterministic, float32, no caches, greedy).
+    """
     import librosa
 
     audio_np, _ = librosa.load(audio_path, sr=SAMPLE_RATE)
     total_frames = math.ceil(len(audio_np) / FRAME_SIZE_SAMPLES)
     chunk_secs = total_frames * FRAME_SIZE_SAMPLES / SAMPLE_RATE
 
-    speaker_kw = {}
+    cfg = OmegaConf.load(_CONF_YAML)
+    overrides = {
+        "audio_file": audio_path,
+        "output_dir": output_dir,
+        "s2s": {
+            "model_path": model_path,
+            "engine_type": "native",
+            "compute_dtype": "float32",
+            "deterministic": True,
+            "decode_audio": False,
+            "use_perception_cache": False,
+            "use_perception_cudagraph": False,
+            "use_llm_cache": False,
+            "system_prompt": None,
+            "top_p": 1.0,
+            "repetition_penalty": 1.0,
+            "temperature": 0.0,
+        },
+        "streaming": {
+            "chunk_size_in_secs": chunk_secs,
+            "buffer_size_in_secs": max(71 * 0.08, chunk_secs),
+        },
+    }
     if speaker_name:
-        speaker_kw["speaker_name"] = speaker_name
-
-    pipeline_cfg = OmegaConf.create(
-        {
-            "output_dir": output_dir,
-            "s2s": {
-                "model_path": model_path,
-                **speaker_kw,
-                "compute_dtype": "float32",
-                "engine_type": "native",
-                "deterministic": True,
-                "use_perception_cache": False,
-                "use_perception_cudagraph": False,
-                "use_llm_cache": False,
-                "top_p": 1.0,
-                "repetition_penalty": 1.0,
-                "temperature": 0.0,
-                "decode_audio": False,
-            },
-            "streaming": {
-                "input_sample_rate": SAMPLE_RATE,
-                "output_sample_rate": 22050,
-                "batch_size": 1,
-                "att_context_size": [70, 0],
-                "chunk_size_in_secs": chunk_secs,
-                "buffer_size_in_secs": max(71 * 0.08, chunk_secs),
-                "request_type": "frame",
-                "max_len": 8192,
-            },
-        }
-    )
-    return S2SPipelineBuilder.build_pipeline(pipeline_cfg)
+        overrides["s2s"]["speaker_name"] = speaker_name
+    cfg = OmegaConf.merge(cfg, OmegaConf.create(overrides))
+    return S2SPipelineBuilder.build_pipeline(cfg)
 
 
 # ---------------------------------------------------------------------------
