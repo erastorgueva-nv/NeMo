@@ -18,12 +18,11 @@
 tiny model with random weights (no checkpoint needed, requires only a GPU).
 
 ``test_parity_real_checkpoint`` does the same on a real exported checkpoint
-and is skipped unless
-the following environment variables point to a real exported checkpoint::
+and is skipped unless ``PARITY_CHECKPOINT_PATH`` is set::
 
     PARITY_CHECKPOINT_PATH=/path/to/exported/checkpoint
-    PARITY_AUDIO_PATH=/path/to/test.wav
-    PARITY_SPEAKER_NAME=<name>          # optional
+    PARITY_AUDIO_PATH=/path/to/test.wav  # optional, defaults to force_align_test.mp3
+    PARITY_SPEAKER_NAME=<name>           # optional
 
 Run from the NeMo repo root (use ``-s`` to see live progress)::
 
@@ -31,7 +30,7 @@ Run from the NeMo repo root (use ``-s`` to see live progress)::
     CUDA_VISIBLE_DEVICES=0 pytest tests/collections/speechlm2/test_offline_incremental_parity.py -v -s
 
     # include integration test
-    PARITY_CHECKPOINT_PATH=... PARITY_AUDIO_PATH=... \\
+    PARITY_CHECKPOINT_PATH=... \\
         CUDA_VISIBLE_DEVICES=0 pytest tests/collections/speechlm2/test_offline_incremental_parity.py -v -s
 """
 
@@ -62,6 +61,11 @@ from nemo.collections.speechlm2.models import NemotronVoiceChat
 _CONF_YAML = os.path.join(
     os.path.dirname(__file__),
     "../../../examples/speechlm2/nemo_inference_pipelines/conf/s2s_streaming.yaml",
+)
+_FORCE_ALIGN_AUDIO = os.path.join(
+    os.path.dirname(__file__),
+    "test_data",
+    "force_align_test.mp3",
 )
 
 # ---------------------------------------------------------------------------
@@ -183,6 +187,11 @@ def run_parity_check(
     )
 
     # -- Compare --
+    # offline_inference returns logits for ALL positions (including prompt),
+    # while the incremental path only produces logits for audio positions.
+    # Trim the prompt prefix from offline logits so the two are aligned.
+    prompt_len = prompt_tokens.shape[1] if prompt_tokens is not None else 0
+
     report: dict[str, Any] = {
         "token_comparison": _compare_tensors(offline.get("tokens_text"), inc_tokens),
         "asr_token_comparison": _compare_tensors(offline.get("tokens_text_src"), inc_asr_tokens),
@@ -192,6 +201,8 @@ def run_parity_check(
         ("asr_logit_comparison", "asr_logits", "asr_logits"),
     ]:
         off_t, inc_t = offline.get(off_key), inc_debug.get(inc_key)
+        if off_t is not None and prompt_len > 0:
+            off_t = off_t[:, prompt_len:]
         if off_t is not None and inc_t is not None:
             report[key] = _compare_tensors(off_t, inc_t)
 
@@ -391,12 +402,16 @@ def _tiny_voicechat_config() -> dict:
     }
 
 
+_MOCK_SYSTEM_PROMPT = "This is a mock prompt for the test"
+
+
 def _build_parity_pipeline(
     model_path: str,
     audio_path: str,
     output_dir: str,
     *,
     speaker_name: str | None = None,
+    system_prompt: str | None = _MOCK_SYSTEM_PROMPT,
 ) -> StreamingS2SPipeline:
     """Build a :class:`StreamingS2SPipeline` configured for strict parity testing.
 
@@ -415,21 +430,21 @@ def _build_parity_pipeline(
         "output_dir": output_dir,
         "s2s": {
             "model_path": model_path,
-            "engine_type": "native",
-            "compute_dtype": "float32",
-            "deterministic": True,
-            "decode_audio": False,
-            "use_perception_cache": False,
-            "use_perception_cudagraph": False,
-            "use_llm_cache": False,
-            "system_prompt": None,
-            "top_p": 1.0,
-            "repetition_penalty": 1.0,
-            "temperature": 0.0,
+            "engine_type": "native",        # offline model can only be run with "native" - no vllm support
+            "compute_dtype": "float32",     # online code would only cast some layers to "compute_dtype" => let's keep everything in float32 for parity
+            "deterministic": False,         # "deterministic" doesn't seem to be necessary for results to match, so let's go without it
+            "decode_audio": False,          # parity test is only for comparing text outputs, not audio 
+            "use_perception_cache": False,      # results are slightly different with & without cache. offline does not use perception cache
+            "use_perception_cudagraph": False,  # because not using perception cache
+            "use_llm_cache": False,             # llm cache on/off will affect results. Offline code does not currently support llm cache.
+            "system_prompt": system_prompt,     # use a system prompt to make test more "difficult"
+            "top_p": 1.0,                       # greedy decoding because offline decoding does not support sampling parameters
+            "repetition_penalty": 1.0,          # greedy decoding because offline decoding does not support sampling parameters
+            "temperature": 1.0,                 # greedy decoding because offline decoding does not support sampling parameters
         },
         "streaming": {
             "chunk_size_in_secs": chunk_secs,
-            "buffer_size_in_secs": max(71 * 0.08, chunk_secs),
+            "buffer_size_in_secs": max(71 * 0.08, chunk_secs), # buffer size needs to be equal or longer than the audio input to guarantee parity
         },
     }
     if speaker_name:
@@ -469,7 +484,7 @@ def test_parity_tiny_model(tmp_path):
     torch.cuda.empty_cache()
 
     pipeline = _build_parity_pipeline(model_dir, audio_path, str(tmp_path / "output"))
-    report = run_parity_check(pipeline, audio_path)
+    report = run_parity_check(pipeline, audio_path, system_prompt=_MOCK_SYSTEM_PROMPT)
     assert_parity(report, strict=True, atol=0.0)
 
 
@@ -480,11 +495,10 @@ def test_parity_tiny_model(tmp_path):
 
 def _real_checkpoint_available() -> bool:
     path = os.environ.get("PARITY_CHECKPOINT_PATH", "")
-    audio = os.environ.get("PARITY_AUDIO_PATH", "")
-    return bool(path) and os.path.isdir(path) and bool(audio) and os.path.isfile(audio)
+    return bool(path) and os.path.isdir(path)
 
 
-@pytest.mark.skipif(not _real_checkpoint_available(), reason="set PARITY_CHECKPOINT_PATH and PARITY_AUDIO_PATH")
+@pytest.mark.skipif(not _real_checkpoint_available(), reason="set PARITY_CHECKPOINT_PATH")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 def test_parity_real_checkpoint():
     """Parity check using a real exported checkpoint.
@@ -492,17 +506,17 @@ def test_parity_real_checkpoint():
     Configure via environment variables::
 
         PARITY_CHECKPOINT_PATH=/path/to/exported/checkpoint
-        PARITY_AUDIO_PATH=/path/to/test.wav
-        PARITY_SPEAKER_NAME=<name>          # optional
+        PARITY_AUDIO_PATH=/path/to/test.wav  # optional, defaults to force_align_test.mp3
+        PARITY_SPEAKER_NAME=<name>           # optional
     """
     import tempfile
 
     ckpt = os.environ["PARITY_CHECKPOINT_PATH"]
-    audio = os.environ["PARITY_AUDIO_PATH"]
+    audio = os.environ.get("PARITY_AUDIO_PATH") or _FORCE_ALIGN_AUDIO
     speaker = os.environ.get("PARITY_SPEAKER_NAME")
 
     pipeline = _build_parity_pipeline(
         ckpt, audio, tempfile.mkdtemp(prefix="parity-"), speaker_name=speaker,
     )
-    report = run_parity_check(pipeline, audio)
+    report = run_parity_check(pipeline, audio, system_prompt=_MOCK_SYSTEM_PROMPT)
     assert_parity(report, strict=True, atol=0.0)
