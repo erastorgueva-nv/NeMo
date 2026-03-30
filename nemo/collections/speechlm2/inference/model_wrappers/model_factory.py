@@ -162,7 +162,17 @@ class ModelInterface(ABC):
                 indices_to_remove = sorted_indices[sorted_indices_to_remove]
                 batch_logits[indices_to_remove] = float('-inf')
 
-            # Sample from the filtered distribution
+            # Fall back to greedy if logits contain NaN or inf
+            if batch_logits.isnan().any() or batch_logits.isinf().any():
+                logging.warning(
+                    f"_sample_text_token: logits contain NaN or inf at step {current_step}, batch {b}: "
+                    f"nan={batch_logits.isnan().sum().item()}, "
+                    f"inf={batch_logits.isinf().sum().item()}, "
+                    f"min={batch_logits[~batch_logits.isnan()].min().item() if not batch_logits.isnan().all() else 'all_nan'}, "
+                    f"max={batch_logits[~batch_logits.isnan()].max().item() if not batch_logits.isnan().all() else 'all_nan'}"
+                )
+                sampled_tokens[b] = greedy_tokens[b]
+                continue
             probs = torch.softmax(batch_logits, dim=-1)
             sampled_tokens[b] = torch.multinomial(probs, num_samples=1).item()
 

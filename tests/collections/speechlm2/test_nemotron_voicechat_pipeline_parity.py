@@ -27,23 +27,22 @@ and is skipped unless ``PARITY_CHECKPOINT_PATH`` is set::
 Run from the NeMo repo root (use ``-s`` to see live progress)::
 
     # unit tests only
-    CUDA_VISIBLE_DEVICES=0 pytest tests/collections/speechlm2/test_offline_incremental_parity.py -v -s
+    CUDA_VISIBLE_DEVICES=0 pytest tests/collections/speechlm2/test_nemotron_voicechat_pipeline_parity.py -v -s
 
     # include integration test
     PARITY_CHECKPOINT_PATH=... \\
-        CUDA_VISIBLE_DEVICES=0 pytest tests/collections/speechlm2/test_offline_incremental_parity.py -v -s
+        CUDA_VISIBLE_DEVICES=0 pytest tests/collections/speechlm2/test_nemotron_voicechat_pipeline_parity.py -v -s
 """
 
 from __future__ import annotations
 
 import math
 import os
+import tempfile
 import time
 from typing import Any
 
-import numpy as np
 import pytest
-import soundfile as sf
 import torch
 from omegaconf import OmegaConf
 
@@ -56,7 +55,6 @@ from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_infe
 )
 from nemo.collections.speechlm2.inference.pipelines.streaming_s2s_pipeline import StreamingS2SPipeline
 from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
-from nemo.collections.speechlm2.models import NemotronVoiceChat
 
 _CONF_YAML = os.path.join(
     os.path.dirname(__file__),
@@ -67,6 +65,7 @@ _FORCE_ALIGN_AUDIO = os.path.join(
     "test_data",
     "force_align_test.mp3",
 )
+_MOCK_SYSTEM_PROMPT = "This is a mock prompt for the test"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -138,7 +137,6 @@ def run_parity_check(
     wrapper = pipeline.s2s_model
     audio, audio_lens = _load_and_pad_audio(audio_path, wrapper.device, wrapper.dtype)
 
-    # Prompt tokens for the offline path
     prompt_tokens = prompt_token_lens = None
     if system_prompt:
         tok = wrapper.tokenizer
@@ -146,7 +144,6 @@ def run_parity_check(
         prompt_tokens = torch.tensor(ids, device=wrapper.device, dtype=torch.long).unsqueeze(0)
         prompt_token_lens = torch.tensor([len(ids)], device=wrapper.device, dtype=torch.long)
 
-    # offline_inference requires speaker info for TTS init
     if wrapper.speaker_name is not None:
         OmegaConf.update(wrapper.model.cfg, "inference_speaker_name", wrapper.speaker_name, force_add=True)
     elif wrapper.speaker_reference:
@@ -229,189 +226,13 @@ def assert_parity(
     assert not failures, "Parity failed:\n  " + "\n  ".join(failures)
 
 
-# ---------------------------------------------------------------------------
-# Tiny-model configuration (derived from test_nemotron_voicechat.py)
-# ---------------------------------------------------------------------------
-
-_pretrained_llm = "TinyLlama/TinyLlama_v1.1"
-if os.path.exists("/home/TestData/speechlm/pretrained_models"):
-    _pretrained_llm = "/home/TestData/speechlm/pretrained_models/TinyLlama--TinyLlama_v1.1"
-
-
-def _tiny_voicechat_config() -> dict:
-    """Return a minimal NemotronVoiceChat config with random weights."""
-    return {
-        "model": {
-            "scoring_asr": "stt_en_fastconformer_transducer_large",
-            "stt": {
-                "model": {
-                    "pretrained_llm": _pretrained_llm,
-                    "pretrained_weights": False,
-                    "predict_user_text": True,
-                    "audio_loss_weight": 1,
-                    "text_loss_weight": 3,
-                    "source_sample_rate": 16000,
-                    "validation_save_path": "/tmp/test_parity_stt_logs",
-                    "perception": {
-                        "_target_": "nemo.collections.speechlm2.modules.perception.AudioPerceptionModule",
-                        "preprocessor": {
-                            "_target_": "nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor",
-                            "features": 80,
-                        },
-                        "encoder": {
-                            "_target_": "nemo.collections.asr.modules.ConformerEncoder",
-                            "feat_in": 80,
-                            "d_model": 512,
-                            "n_heads": 8,
-                            "n_layers": 1,
-                            "subsampling_factor": 8,
-                        },
-                        "modality_adapter": {
-                            "_target_": "nemo.collections.speechlm2.modules.perception.IdentityConnector",
-                            "d_model": 512,
-                        },
-                        "output_dim": 2048,
-                    },
-                    "optimizer": {"_target_": "torch.optim.AdamW"},
-                },
-                "data": {"source_sample_rate": 16000},
-                "exp_manager": {"explicit_log_dir": "/tmp/test_parity_stt_logs"},
-            },
-            "speech_generation": {
-                "model": {
-                    "pretrained_lm_name": _pretrained_llm,
-                    "pretrained_ae_dir": None,
-                    "pretrained_tts_model": None,
-                    "scoring_asr": "stt_en_fastconformer_transducer_large",
-                    "freeze_params": [r"^audio_codec\..+$", r"^embed_tokens\..+$"],
-                    "bos_token": "<s>",
-                    "eos_token": "</s>",
-                    "pad_token": "<SPECIAL_12>",
-                    "audio_codec_run_dtype": "float32",
-                    "prevent_freeze_params": [],
-                    "audio_save_path": "",
-                    "inference_guidance_scale": 0.5,
-                    "inference_noise_scale": 0.8,
-                    "inference_top_p_or_k": 0.8,
-                    "inference_guidance_enabled": False,
-                    "subword_mask_exactly_as_eartts": False,
-                    "context_hidden_mask_exactly_as_eartts": False,
-                    "optimizer": {
-                        "_target_": "torch.optim.AdamW",
-                        "lr": 4e-5,
-                        "betas": [0.9, 0.98],
-                        "weight_decay": 0,
-                        "foreach": True,
-                    },
-                    "lr_scheduler": {
-                        "_target_": "nemo.core.optim.lr_scheduler.InverseSquareRootAnnealing",
-                        "warmup_steps": 2500,
-                        "min_lr": 1e-6,
-                        "max_steps": 100_000_000,
-                    },
-                    "codec_config": {
-                        "latent_size": 512,
-                        "n_fft": 16,
-                        "hop_length": 4,
-                        "base_hidden_size": 384,
-                        "channel_mult": [1, 2, 4],
-                        "rates": [7, 7, 9],
-                        "num_blocks": 3,
-                        "kernel_size": 7,
-                        "groups": 1,
-                        "codebook_size": 1024,
-                        "num_quantizers": 31,
-                        "wav_to_token_ratio": 1764,
-                    },
-                    "tts_config": {
-                        "use_gated_fusion_for_text_audio": True,
-                        "disable_eos_prediction": True,
-                        "use_bos_eos_emb": True,
-                        "use_subword_flag_emb": True,
-                        "num_delay_speech_tokens": 2,
-                        "backbone_type": "gemma3_text",
-                        "backbone_model_class": None,
-                        "backbone_config_class": None,
-                        "backbone_config": {
-                            "hidden_size": 1152,
-                            "intermediate_size": 4608,
-                            "num_hidden_layers": 1,
-                            "num_attention_heads": 16,
-                            "num_key_value_heads": 16,
-                            "head_dim": 72,
-                            "attention_dropout": 0.1,
-                            "use_cache": False,
-                        },
-                        "latent_size": 512,
-                        "codebook_size": 1024,
-                        "num_quantizers": 31,
-                        "context_hidden_size": None,
-                        "cas_config": {
-                            "backbone_type": "t5gemma",
-                            "backbone_model_class": None,
-                            "backbone_config_class": None,
-                            "backbone_config": {
-                                "is_encoder_decoder": False,
-                                "encoder": {
-                                    "hidden_size": 1152,
-                                    "intermediate_size": 4608,
-                                    "num_hidden_layers": 1,
-                                    "num_attention_heads": 16,
-                                    "num_key_value_heads": 16,
-                                    "head_dim": 72,
-                                    "use_cache": False,
-                                    "attention_dropout": 0.1,
-                                },
-                            },
-                        },
-                        "mog_head_config": {
-                            "intermediate_size": 4608,
-                            "num_layers": 3,
-                            "low_rank": 64,
-                            "num_predictions": 1024,
-                            "min_log_std": -4.0,
-                            "eps": 1e-6,
-                        },
-                        "p_uncond": 0.1,
-                        "label_smoothing": 0.01,
-                        "max_training_rate": 0.8,
-                        "quantizer_dropout": 0.5,
-                        "random_target_masking": False,
-                        "exponent": 3.0,
-                    },
-                },
-                "data": {
-                    "add_text_bos_and_eos_in_each_turn": True,
-                    "add_audio_prompt": True,
-                    "audio_prompt_duration": 3.0,
-                    "frame_length": 0.08,
-                    "source_sample_rate": 16000,
-                    "target_sample_rate": 22050,
-                },
-                "exp_manager": {"explicit_log_dir": "/tmp/test_parity_tts_logs"},
-            },
-        },
-        "data": {
-            "frame_length": 0.08,
-            "source_sample_rate": 16000,
-            "target_sample_rate": 22050,
-            "input_roles": ["user", "User"],
-            "output_roles": ["agent", "Assistant", "assistant", "Agent"],
-        },
-        "exp_manager": {"explicit_log_dir": "/tmp/test_parity_logs"},
-    }
-
-
-_MOCK_SYSTEM_PROMPT = "This is a mock prompt for the test"
-
-
 def _build_parity_pipeline(
     model_path: str,
     audio_path: str,
     output_dir: str,
     *,
     speaker_name: str | None = None,
-    system_prompt: str | None = _MOCK_SYSTEM_PROMPT,
+    system_prompt: str | None = None,
 ) -> StreamingS2SPipeline:
     """Build a :class:`StreamingS2SPipeline` configured for strict parity testing.
 
@@ -430,21 +251,21 @@ def _build_parity_pipeline(
         "output_dir": output_dir,
         "s2s": {
             "model_path": model_path,
-            "engine_type": "native",        # offline model can only be run with "native" - no vllm support
-            "compute_dtype": "float32",     # online code would only cast some layers to "compute_dtype" => let's keep everything in float32 for parity
-            "deterministic": False,         # "deterministic" doesn't seem to be necessary for results to match, so let's go without it
-            "decode_audio": False,          # parity test is only for comparing text outputs, not audio 
-            "use_perception_cache": False,      # results are slightly different with & without cache. offline does not use perception cache
-            "use_perception_cudagraph": False,  # because not using perception cache
-            "use_llm_cache": False,             # llm cache on/off will affect results. Offline code does not currently support llm cache.
-            "system_prompt": system_prompt,     # use a system prompt to make test more "difficult"
-            "top_p": 1.0,                       # greedy decoding because offline decoding does not support sampling parameters
-            "repetition_penalty": 1.0,          # greedy decoding because offline decoding does not support sampling parameters
-            "temperature": 1.0,                 # greedy decoding because offline decoding does not support sampling parameters
+            "engine_type": "native",
+            "compute_dtype": "float32",
+            "deterministic": True,
+            "decode_audio": False,
+            "use_perception_cache": False,
+            "use_perception_cudagraph": False,
+            "use_llm_cache": False,
+            "system_prompt": system_prompt,
+            "top_p": 1.0,
+            "repetition_penalty": 1.0,
+            "temperature": 1.0,
         },
         "streaming": {
             "chunk_size_in_secs": chunk_secs,
-            "buffer_size_in_secs": max(71 * 0.08, chunk_secs), # buffer size needs to be equal or longer than the audio input to guarantee parity
+            "buffer_size_in_secs": max(71 * 0.08, chunk_secs),
         },
     }
     if speaker_name:
@@ -454,36 +275,21 @@ def _build_parity_pipeline(
 
 
 # ---------------------------------------------------------------------------
-# Parity test -- tiny model (no real checkpoint needed)
+# Parity test -- tiny model (uses tiny_model_artifacts from conftest.py)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-def test_parity_tiny_model(tmp_path):
+def test_parity_tiny_model(tiny_model_artifacts):
     """Offline/incremental parity with a tiny random-weight model.
 
-    Saves the model as an HF checkpoint, then loads it through the real
-    ``S2SPipelineBuilder`` so the test exercises the same code path as
-    ``test_parity_real_checkpoint``.
+    Loads the model through the real ``S2SPipelineBuilder`` so the test
+    exercises the same code path as ``test_parity_real_checkpoint``.
     """
-    import json as _json
+    model_dir, audio_path, _ = tiny_model_artifacts
+    output_dir = tempfile.mkdtemp(prefix="parity-tiny-")
 
-    audio_path = str(tmp_path / "test_audio.wav")
-    sf.write(audio_path, np.random.RandomState(42).randn(16000).astype(np.float32), 16000)
-
-    cfg = _tiny_voicechat_config()
-    model = NemotronVoiceChat(cfg)
-    model.to("cuda")
-    model.eval()
-
-    model_dir = str(tmp_path / "model")
-    model.save_pretrained(model_dir)
-    with open(os.path.join(model_dir, "config.json"), "w") as f:
-        _json.dump(cfg, f)
-    del model
-    torch.cuda.empty_cache()
-
-    pipeline = _build_parity_pipeline(model_dir, audio_path, str(tmp_path / "output"))
+    pipeline = _build_parity_pipeline(model_dir, audio_path, output_dir, system_prompt=_MOCK_SYSTEM_PROMPT)
     report = run_parity_check(pipeline, audio_path, system_prompt=_MOCK_SYSTEM_PROMPT)
     assert_parity(report, strict=True, atol=0.0)
 
@@ -509,14 +315,13 @@ def test_parity_real_checkpoint():
         PARITY_AUDIO_PATH=/path/to/test.wav  # optional, defaults to force_align_test.mp3
         PARITY_SPEAKER_NAME=<name>           # optional
     """
-    import tempfile
-
     ckpt = os.environ["PARITY_CHECKPOINT_PATH"]
     audio = os.environ.get("PARITY_AUDIO_PATH") or _FORCE_ALIGN_AUDIO
     speaker = os.environ.get("PARITY_SPEAKER_NAME")
 
     pipeline = _build_parity_pipeline(
-        ckpt, audio, tempfile.mkdtemp(prefix="parity-"), speaker_name=speaker,
+        ckpt, audio, tempfile.mkdtemp(prefix="parity-"),
+        speaker_name=speaker, system_prompt=_MOCK_SYSTEM_PROMPT,
     )
     report = run_parity_check(pipeline, audio, system_prompt=_MOCK_SYSTEM_PROMPT)
     assert_parity(report, strict=True, atol=0.0)
