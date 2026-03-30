@@ -51,7 +51,7 @@ class S2SStreamingState:
 
     # Snapshots of full token-ID tensors, saved from StreamingDecodeState
     # before the decode context is destroyed at end-of-stream.
-    # Used for post-hoc tokens_to_str / tokens_to_str_raw conversion.
+    # Used for post-hoc tokens_to_str conversion.
     final_gen_text: Optional[torch.Tensor] = None
     final_gen_asr_text: Optional[torch.Tensor] = None
     final_gen_function_text: Optional[torch.Tensor] = None

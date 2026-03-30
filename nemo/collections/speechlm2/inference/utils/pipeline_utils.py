@@ -20,31 +20,6 @@ import torch
 from nemo.collections.asr.inference.utils.text_segment import Word
 
 
-def tokens_to_str_raw(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer, pad_id: int) -> list:
-    """Convert token IDs to text strings, preserving ALL special tokens including pad tokens.
-
-    Unlike ``tokens_to_str``, this function uses ``ids_to_tokens`` which preserves
-    special tokens and does NOT filter out any tokens (including pad tokens like
-    ``<SPECIAL_12>``).
-
-    Args:
-        tokens: Token IDs tensor (B, T).
-        lengths: Length of each sequence (B,).
-        tokenizer: Tokenizer for decoding.
-        pad_id: Pad token ID (kept for API compatibility with ``tokens_to_str``).
-
-    Returns:
-        List of decoded text strings with ALL special tokens preserved.
-    """
-    ans = []
-    for hyp_ids, hyp_len in zip(tokens.cpu(), lengths.cpu()):
-        hyp_ids = hyp_ids[:hyp_len]
-        toks = tokenizer.ids_to_tokens(hyp_ids.tolist())
-        toks = [tok.replace('Ġ', ' ') for tok in toks]
-        ans.append("".join(toks))
-    return ans
-
-
 def clean_pred_text(text: str) -> str:
     """Clean prediction text by removing special markers, timestamps, punctuation, and lowercasing.
 
@@ -57,7 +32,6 @@ def clean_pred_text(text: str) -> str:
     text = re.sub(r'<\$[\d.]+\$>', '', text)
     text = re.sub(r'<\|[\d.]+\|>', '', text)
     text = re.sub(r'<SPECIAL_12>', '', text)
-    text = text.replace('\u0120', ' ')
     text = text.lower()
     text = re.sub(r'[^\w\s]', '', text)
     return ' '.join(text.split())

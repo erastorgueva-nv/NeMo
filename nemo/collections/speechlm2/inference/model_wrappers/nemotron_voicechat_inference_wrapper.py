@@ -39,6 +39,7 @@ from nemo.collections.speechlm2.inference.model_wrappers.decode_state import (
     InferenceStepResult,
     StreamingDecodeState,
 )
+from nemo.collections.speechlm2.parts.text_utils import _decode_tokens_with_specials
 
 
 # --- Configuration ---
@@ -917,10 +918,17 @@ class NemotronVoicechatInferenceWrapper:
     def _tokens_to_strings(self, token_ids: torch.Tensor) -> list[str]:
         """Convert a [B, T] tensor of token IDs to a list of strings.
 
-        Uses tokens_to_text (convert_tokens_to_string) so byte-level BPE is
-        decoded properly (e.g. "Ã©" -> "é") and leading spaces from
-        Ġ-prefixed tokens are preserved for correct concatenation of
-        incremental chunks: " Musée" + " National" -> " Musée National".
+        Uses ``_decode_tokens_with_specials`` so byte-level BPE is decoded
+        properly (e.g. ``âĢĻ`` -> ``'``) via HF ``convert_tokens_to_string``.
+
+        Leading spaces are preserved in the output: in byte-level BPE,
+        word-initial tokens carry a space prefix that ``convert_tokens_to_string``
+        keeps intact.  So callers can concatenate successive chunk strings to
+        recover properly spaced text.  A leading space means "new word"; no
+        leading space means the token continues the previous word.  For
+        example, three chunks producing ``"Hi"``, ``" how can"``,
+        ``" I help"`` concatenate to ``"Hi how can I help"`` (not
+        ``"Hihow canI help"``).
 
         NOTE: multi-byte UTF-8 characters whose BPE tokens span two frames
         will show as replacement chars (U+FFFD) because each frame is decoded
@@ -928,10 +936,8 @@ class NemotronVoicechatInferenceWrapper:
         """
         result = []
         for tok_ids_b in token_ids:
-            tok_ids_b = tok_ids_b.tolist()
-            toks = self.tokenizer.ids_to_tokens(tok_ids_b)
-            toks = [t for t in toks if t != '<SPECIAL_12>']
-            result.append(self.tokenizer.tokens_to_text(toks))
+            toks = self.tokenizer.ids_to_tokens(tok_ids_b.tolist())
+            result.append(_decode_tokens_with_specials(toks, self.tokenizer, keep_pad=False))
         return result
 
     def abort_request(self, request_id: Optional[str]) -> bool:

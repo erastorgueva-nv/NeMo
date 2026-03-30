@@ -35,7 +35,7 @@ from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_infe
 from nemo.collections.speechlm2.parts.text_utils import tokens_to_str
 from nemo.collections.speechlm2.inference.streaming.state.s2s_context_manager import S2SContextManager
 from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
-from nemo.collections.speechlm2.inference.utils.pipeline_utils import PipelineOutput, tokens_to_str_raw
+from nemo.collections.speechlm2.inference.utils.pipeline_utils import PipelineOutput
 from nemo.utils import logging
 
 
@@ -237,7 +237,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         self.context_manager.update_context(stream_ids, result, self.num_frames_per_chunk)
 
         # Save full token tensors to state before the context is destroyed,
-        # so we can run tokens_to_str / tokens_to_str_raw post-hoc.
+        # so we can run tokens_to_str post-hoc.
         for stream_id, eos_flag in zip(stream_ids, eos_flags):
             if eos_flag:
                 ctx = self.context_manager.slot_contexts[
@@ -650,14 +650,14 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                     tokens_to_str(gen_asr_text, lengths, tokenizer=tokenizer, pad_id=pad_id, eval_text_turn_taking=True)[0]
                 )
                 raw_texts.append(
-                    tokens_to_str_raw(gen_text, lengths, tokenizer=tokenizer, pad_id=pad_id)[0]
+                    tokens_to_str(gen_text, lengths, tokenizer=tokenizer, pad_id=pad_id, keep_pad=True)[0]
                 )
                 raw_asr_texts.append(
-                    tokens_to_str_raw(gen_asr_text, lengths, tokenizer=tokenizer, pad_id=pad_id)[0]
+                    tokens_to_str(gen_asr_text, lengths, tokenizer=tokenizer, pad_id=pad_id, keep_pad=True)[0]
                 )
                 if gen_function_text is not None:
                     fc_text = tokens_to_str(gen_function_text, lengths, tokenizer=tokenizer, pad_id=pad_id, eval_text_turn_taking=False)[0]
-                    fc_text_raw = tokens_to_str_raw(gen_function_text, lengths, tokenizer=tokenizer, pad_id=pad_id)[0]
+                    fc_text_raw = tokens_to_str(gen_function_text, lengths, tokenizer=tokenizer, pad_id=pad_id, keep_pad=True)[0]
                     logging.info(f"Function calling channel: {fc_text}")
             else:
                 token_texts.append(None)
