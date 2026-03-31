@@ -27,8 +27,10 @@ def _decode_tokens_with_specials(
     Groups consecutive non-special tokens and decodes each group via
     ``tokenizer.tokens_to_text()`` (HF ``convert_tokens_to_string``), which
     properly reverses byte-level BPE encoding (e.g. ``âĢĻ`` -> ``'``).
-    Special tokens are never passed to ``convert_tokens_to_string`` — they
-    are either inserted as literal strings or dropped entirely.
+    Special tokens (BOS, EOS, PAD) are never passed to
+    ``convert_tokens_to_string``.  BOS/EOS are always kept as literal
+    strings so that turn boundaries are visible.  PAD tokens are kept
+    only when *keep_pad* is True.
 
     Args:
         token_strings: Raw token strings from ``tokenizer.ids_to_tokens()``.
@@ -38,11 +40,11 @@ def _decode_tokens_with_specials(
         keep_pad: If True, preserve all special tokens as literal strings
             in the output.  If False, strip them.
     """
-    # Build special-token set from explicit bos/eos/pad — same approach as
-    # filter_special_tokens() and model_factory._extract_special_token_ids_from_nemo().
-    special_tokens = {pad_token_str}
     bos = getattr(tokenizer, 'bos_token', None)
     eos = getattr(tokenizer, 'eos_token', None)
+
+    # All tokens that must not go through convert_tokens_to_string.
+    special_tokens = {pad_token_str}
     if bos:
         special_tokens.add(bos)
     if eos:
@@ -56,7 +58,10 @@ def _decode_tokens_with_specials(
             if segment:
                 result_parts.append(tokenizer.tokens_to_text(segment))
                 segment = []
-            if keep_pad:
+            if tok == pad_token_str:
+                if keep_pad:
+                    result_parts.append(tok)
+            else:
                 result_parts.append(tok)
         else:
             segment.append(tok)
