@@ -16,25 +16,31 @@ import re
 from typing import List, Optional
 
 import torch
+from whisper_normalizer.english import EnglishTextNormalizer
 
 from nemo.collections.asr.inference.utils.text_segment import Word
 
+_whisper_normalizer = EnglishTextNormalizer()
+
 
 def clean_pred_text(text: str) -> str:
-    """Clean prediction text by removing special markers, timestamps, punctuation, and lowercasing.
+    """Clean prediction text for fair WER comparison.
 
-    Useful for fair WER comparison between predicted and ground-truth text.
+    First strips model-specific tokens (turn markers, timestamps, pad tokens)
+    that the Whisper normalizer doesn't know about, then applies
+    ``EnglishTextNormalizer`` — the same normalizer used by the offline eval
+    metrics in ``speechlm2.parts.metrics.wer``.
     """
     if not text:
         return ""
+    # Strip model-specific tokens
     text = text.lstrip('^')
     text = re.sub(r'</?s>', '', text)
     text = re.sub(r'<\$[\d.]+\$>', '', text)
     text = re.sub(r'<\|[\d.]+\|>', '', text)
     text = re.sub(r'<SPECIAL_12>', '', text)
-    text = text.lower()
-    text = re.sub(r'[^\w\s]', '', text)
-    return ' '.join(text.split())
+    # Normalize with Whisper's EnglishTextNormalizer (same as offline eval)
+    return _whisper_normalizer(text)
 
 
 class PipelineOutput:
