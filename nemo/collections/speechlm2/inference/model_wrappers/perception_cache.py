@@ -368,12 +368,10 @@ class PerceptionCacheManager:
         streaming_cfg = self.streaming_cfg
 
         audio_len = torch.tensor([audio_input.shape[1]], dtype=torch.long, device=self.device)
-        _t_start_preprocessor = time.time()
         processed_signal, _ = self.preprocessor(
             input_signal=audio_input,
             length=audio_len,
         )
-        logging.info(f"preprocessor time: {time.time() - _t_start_preprocessor:.3f}s")
 
         if isinstance(streaming_cfg.chunk_size, list):
             chunk_size_first = streaming_cfg.chunk_size[0]
@@ -408,13 +406,9 @@ class PerceptionCacheManager:
             )
         num_sub_steps = num_frames_per_chunk // base_step_size
 
-        start_time = time.time()
-
         encoded_chunks = []
 
         for sub_step in range(num_sub_steps):
-            sub_step_start_time = time.time()
-
             sub_frame_idx = frame_idx + (sub_step * base_step_size)
             is_first_sub_step = (sub_frame_idx == 0)
 
@@ -516,17 +510,12 @@ class PerceptionCacheManager:
 
                 encoded_chunk = perception.proj(encoded_adapted.transpose(1, 2))
 
-            torch.cuda.synchronize()
-            logging.info(f"  Sub-step {sub_step}/{num_sub_steps} (sub_frame_idx={sub_frame_idx}, first={is_first_sub_step}): {time.time() - sub_step_start_time:.4f}s")
             encoded_chunks.append(encoded_chunk)
 
         if len(encoded_chunks) > 1:
             encoded_chunk = torch.cat(encoded_chunks, dim=1)
         else:
             encoded_chunk = encoded_chunks[0]
-
-        torch.cuda.synchronize()
-        logging.info(f"Time taken for encoder ({num_sub_steps} sub-steps): {time.time() - start_time}")
 
         new_perception_cache = PerceptionCacheState(
             cache_last_channel=cache_last_channel,
