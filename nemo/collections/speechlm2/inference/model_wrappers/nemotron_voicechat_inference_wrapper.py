@@ -78,6 +78,12 @@ class NemotronVoicechatInferenceWrapper:
         matmul_precision = str(model_cfg.get("matmul_precision", "medium"))
         torch.set_float32_matmul_precision(matmul_precision)
 
+        # Deterministic mode: guarantees identical *text* outputs (from the STT/LLM
+        # heads) across runs for the same inputs, even when sampling is enabled
+        # (top_p < 1, temperature != 1, repetition_penalty != 1).  This works
+        # because we fix the global PyTorch RNG seeds and force all CUDA ops
+        # to use deterministic algorithm implementations.
+        # Not compatible with vLLM engines (raises an error below).
         self._deterministic = bool(model_cfg.get("deterministic", False))
         if self._deterministic:
             engine_type = model_cfg.get("engine_type", "native")

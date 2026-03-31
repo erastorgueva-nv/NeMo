@@ -80,6 +80,13 @@ class ModelInterface(ABC):
         self.repetition_penalty = repetition_penalty
         self.temperature = temperature
 
+        # Pre-built tensor for special-token filtering in repetition penalty.
+        # Lazily moved to the right device on first use (see _sample_text_token).
+        self._special_ids_tensor: Optional[torch.Tensor] = (
+            torch.tensor(sorted(self.special_token_ids), dtype=torch.long)
+            if self.special_token_ids else None
+        )
+
     def _sample_text_token(
         self,
         logits: torch.Tensor,
@@ -115,6 +122,10 @@ class ModelInterface(ABC):
         # For each batch, if greedy is special token, use greedy; otherwise sample
         sampled_tokens = greedy_tokens.clone()
 
+        # Ensure cached special-token tensor is on the right device (once).
+        if self._special_ids_tensor is not None and self._special_ids_tensor.device != device:
+            self._special_ids_tensor = self._special_ids_tensor.to(device)
+
         for b in range(B):
             # If greedy token is a special token, keep it (no sampling)
             if greedy_tokens[b].item() in self.special_token_ids:
@@ -123,30 +134,44 @@ class ModelInterface(ABC):
             # Not a special token - apply repetition penalty and sampling
             batch_logits = logits[b].clone()  # (V,)
 
-            # Apply repetition penalty
+            # Apply repetition penalty (vectorized, no Python loop)
             if self.repetition_penalty != 1.0 and current_step > 0:
-                prev_tokens = generated_tokens[b, :current_step]
-                unique_prev = prev_tokens.unique()
+                unique_prev = generated_tokens[b, :current_step].unique()
                 # Exclude special tokens from penalty
-                if self.special_token_ids:
-                    # Use unique_prev.device to ensure tensors are on the same device
-                    # (generated_tokens may be on a different device than logits, e.g., vLLM returns CPU logits)
-                    special_tensor = torch.tensor(list(self.special_token_ids), device=unique_prev.device)
-                    mask = ~torch.isin(unique_prev, special_tensor)
-                    unique_prev = unique_prev[mask]
+                if self._special_ids_tensor is not None:
+                    ids_t = self._special_ids_tensor
+                    if ids_t.device != unique_prev.device:
+                        ids_t = ids_t.to(unique_prev.device)
+                    unique_prev = unique_prev[~torch.isin(unique_prev, ids_t)]
 
-                for token_id in unique_prev:
-                    token_id = token_id.item()
-                    if batch_logits[token_id] > 0:
-                        batch_logits[token_id] = batch_logits[token_id] / self.repetition_penalty
-                    else:
-                        batch_logits[token_id] = batch_logits[token_id] * self.repetition_penalty
+                if unique_prev.numel() > 0:
+                    prev_logits = batch_logits[unique_prev]
+                    # Positive logits are divided, negative logits are multiplied
+                    # (same as the standard repetition_penalty convention)
+                    batch_logits[unique_prev] = torch.where(
+                        prev_logits > 0,
+                        prev_logits / self.repetition_penalty,
+                        prev_logits * self.repetition_penalty,
+                    )
 
             # Apply temperature scaling
             if self.temperature != 1.0:
                 batch_logits = batch_logits / self.temperature
 
-            # Apply top-p sampling
+            # Fall back to greedy if logits are non-finite before top-p
+            # (top-p intentionally introduces -inf, so check must happen first)
+            if not torch.isfinite(batch_logits).all():
+                logging.warning(
+                    f"_sample_text_token: logits contain NaN or inf at step {current_step}, batch {b}: "
+                    f"nan={batch_logits.isnan().sum().item()}, "
+                    f"inf={batch_logits.isinf().sum().item()}, "
+                    f"min={batch_logits[~batch_logits.isnan()].min().item() if not batch_logits.isnan().all() else 'all_nan'}, "
+                    f"max={batch_logits[~batch_logits.isnan()].max().item() if not batch_logits.isnan().all() else 'all_nan'}"
+                )
+                sampled_tokens[b] = greedy_tokens[b]
+                continue
+
+            # Apply top-p (nucleus) sampling
             if self.top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(batch_logits, descending=True)
                 sorted_probs = torch.softmax(sorted_logits, dim=-1)
@@ -162,17 +187,6 @@ class ModelInterface(ABC):
                 indices_to_remove = sorted_indices[sorted_indices_to_remove]
                 batch_logits[indices_to_remove] = float('-inf')
 
-            # Fall back to greedy if logits contain NaN or inf
-            if batch_logits.isnan().any() or batch_logits.isinf().any():
-                logging.warning(
-                    f"_sample_text_token: logits contain NaN or inf at step {current_step}, batch {b}: "
-                    f"nan={batch_logits.isnan().sum().item()}, "
-                    f"inf={batch_logits.isinf().sum().item()}, "
-                    f"min={batch_logits[~batch_logits.isnan()].min().item() if not batch_logits.isnan().all() else 'all_nan'}, "
-                    f"max={batch_logits[~batch_logits.isnan()].max().item() if not batch_logits.isnan().all() else 'all_nan'}"
-                )
-                sampled_tokens[b] = greedy_tokens[b]
-                continue
             probs = torch.softmax(batch_logits, dim=-1)
             sampled_tokens[b] = torch.multinomial(probs, num_samples=1).item()
 
