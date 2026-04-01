@@ -307,9 +307,11 @@ class TritonPythonModel:
     def execute(self, requests: Iterable) -> List[pb_utils.InferenceResponse]:
         """Execute the model and return the responses.
         
-        Zero-length audio with ``sequence_start=True`` and a ``system_prompt``
-        is treated as a prefill-only request by the pipeline (no fake audio
-        needed).  All other requests are normal audio generation.
+        Clients MUST send a prefill request (zero-length audio with
+        ``sequence_start=True``) before streaming audio.  The prefill
+        initializes the TTS speaker embedding and system prompt for the
+        session.  Sending audio on the first request without a prefill
+        will produce degraded speaker voice quality.
         
         Returns:
         - output_audio: float32 array of generated audio samples
@@ -329,7 +331,7 @@ class TritonPythonModel:
         responses = []
         for audio, text, asr_text in generations:
             if isinstance(audio, torch.Tensor):
-                audio_np = audio.detach().cpu().numpy().astype(np.float32)
+                audio_np = audio.detach().cpu().float().numpy()
                 if audio_np.ndim == 1:
                     audio_np = audio_np.reshape(1, -1)
             else:
