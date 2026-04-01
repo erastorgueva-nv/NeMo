@@ -27,10 +27,9 @@ Usage:
 from time import time
 
 import hydra
-import torch
-from jiwer import wer as compute_wer
 from omegaconf import DictConfig
 
+from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.collections.speechlm2.inference.factory.s2s_pipeline_builder import S2SPipelineBuilder
 from nemo.collections.speechlm2.inference.utils.audio_data import (
     calculate_duration,
@@ -68,22 +67,20 @@ def main(cfg: DictConfig):
     rtfx = data_dur / exec_dur if exec_dur > 0 else float('inf')
     logging.info(f"RTFX: {rtfx:.2f} ({data_dur:.2f}s / {exec_dur:.2f}s)")
 
-    # Compute WER when ground-truth texts are available
+    # Compute WER when ground-truth texts are available (micro-average,
+    # matching the offline eval in speechlm2.parts.metrics.asr_cer_wer)
     asr_texts = output.asr_texts_with_timestamps or [None] * len(audio_filepaths)
-    wer_scores = []
+    all_refs, all_hyps = [], []
     for gt, asr_text in zip(ground_truths, asr_texts):
         if gt and asr_text:
             cleaned_gt = clean_pred_text(gt)
             cleaned_pred = clean_pred_text(asr_text)
             if cleaned_gt.strip() and cleaned_pred.strip():
-                wer_scores.append(compute_wer(cleaned_gt, cleaned_pred))
-    if wer_scores:
-        avg_wer = sum(wer_scores) / len(wer_scores)
-        logging.info(
-            f"WER: avg={avg_wer:.4f} ({avg_wer * 100:.2f}%), "
-            f"n={len(wer_scores)}, "
-            f"min={min(wer_scores):.4f}, max={max(wer_scores):.4f}"
-        )
+                all_refs.append(cleaned_gt)
+                all_hyps.append(cleaned_pred)
+    if all_refs:
+        wer = word_error_rate(hypotheses=all_hyps, references=all_refs)
+        logging.info(f"WER: {wer:.4f} ({wer * 100:.2f}%), n={len(all_refs)}")
 
     output_dir = cfg.get("output_dir", "./generated")
     dump_output(audio_filepaths, output, output_dir, options, ground_truths)
