@@ -13,8 +13,6 @@
 # limitations under the License.
 
 import re
-from typing import List, Optional
-
 import torch
 from whisper_normalizer.english import EnglishTextNormalizer
 
@@ -50,19 +48,19 @@ class PipelineOutput:
 
     def __init__(
         self,
-        texts: Optional[List[str]] = None,
-        words: Optional[List[List[Word]]] = None,
-        asr_texts: Optional[List[str]] = None,
-        texts_with_timestamps: Optional[List[str]] = None,
-        asr_texts_with_timestamps: Optional[List[str]] = None,
-        raw_texts: Optional[List[str]] = None,
-        raw_asr_texts: Optional[List[str]] = None,
-        token_texts: Optional[List[torch.Tensor | None]] = None,
-        token_asr_texts: Optional[List[torch.Tensor | None]] = None,
-        token_function_texts: Optional[List[torch.Tensor | None]] = None,
-        token_lengths: Optional[List[int | None]] = None,
-        audio_filepaths: Optional[List[str | None]] = None,
-        debug_data: Optional[List[list]] = None,
+        texts: list[str] | None = None,
+        words: list[list[Word]] | None = None,
+        asr_texts: list[str] | None = None,
+        texts_with_timestamps: list[str] | None = None,
+        asr_texts_with_timestamps: list[str] | None = None,
+        raw_texts: list[str] | None = None,
+        raw_asr_texts: list[str] | None = None,
+        token_texts: list[torch.Tensor | None] | None = None,
+        token_asr_texts: list[torch.Tensor | None] | None = None,
+        token_function_texts: list[torch.Tensor | None] | None = None,
+        token_lengths: list[int | None] | None = None,
+        audio_filepaths: list[str | None] | None = None,
+        debug_data: list[list] | None = None,
     ):
         if texts is None and words is None:
             raise ValueError("At least one of the 'texts' or 'words' should be provided.")

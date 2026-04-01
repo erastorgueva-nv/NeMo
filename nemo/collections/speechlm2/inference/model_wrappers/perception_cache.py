@@ -23,7 +23,6 @@ instead of re-encoding the entire buffer.
 import copy
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
 import torch
 from omegaconf import OmegaConf
@@ -38,9 +37,9 @@ class PerceptionCacheState:
     Holds the cache tensors for the ASR encoder used in the perception module.
     This enables cache-aware streaming inference without needing the full audio buffer.
     """
-    cache_last_channel: Optional[torch.Tensor] = None
-    cache_last_time: Optional[torch.Tensor] = None
-    cache_last_channel_len: Optional[torch.Tensor] = None
+    cache_last_channel: torch.Tensor | None = None
+    cache_last_time: torch.Tensor | None = None
+    cache_last_channel_len: torch.Tensor | None = None
 
     def is_initialized(self) -> bool:
         """Check if the cache has been initialized."""
@@ -55,34 +54,34 @@ class PerceptionCUDAGraphState:
     Also holds static buffers for inputs/outputs to enable graph replay.
     """
     # CUDA graphs
-    graph_first: Optional[torch.cuda.CUDAGraph] = None
-    graph_subsequent: Optional[torch.cuda.CUDAGraph] = None
+    graph_first: torch.cuda.CUDAGraph | None = None
+    graph_subsequent: torch.cuda.CUDAGraph | None = None
 
     # Static input buffers (for copying data before graph replay)
-    static_mel_first: Optional[torch.Tensor] = None
-    static_mel_subsequent: Optional[torch.Tensor] = None
-    static_mel_len_first: Optional[torch.Tensor] = None
-    static_mel_len_subsequent: Optional[torch.Tensor] = None
+    static_mel_first: torch.Tensor | None = None
+    static_mel_subsequent: torch.Tensor | None = None
+    static_mel_len_first: torch.Tensor | None = None
+    static_mel_len_subsequent: torch.Tensor | None = None
 
     # Static cache input buffers
-    static_cache_channel_in: Optional[torch.Tensor] = None
-    static_cache_time_in: Optional[torch.Tensor] = None
-    static_cache_channel_len_in: Optional[torch.Tensor] = None
+    static_cache_channel_in: torch.Tensor | None = None
+    static_cache_time_in: torch.Tensor | None = None
+    static_cache_channel_len_in: torch.Tensor | None = None
 
     # Static output buffers (results are written here during replay)
-    static_encoded_first: Optional[torch.Tensor] = None
-    static_encoded_subsequent: Optional[torch.Tensor] = None
-    static_encoded_len_first: Optional[torch.Tensor] = None
-    static_encoded_len_subsequent: Optional[torch.Tensor] = None
+    static_encoded_first: torch.Tensor | None = None
+    static_encoded_subsequent: torch.Tensor | None = None
+    static_encoded_len_first: torch.Tensor | None = None
+    static_encoded_len_subsequent: torch.Tensor | None = None
 
     # Static cache output buffers - SEPARATE for first and subsequent graphs
     # (each graph writes to its own output tensors during replay)
-    static_cache_channel_out_first: Optional[torch.Tensor] = None
-    static_cache_time_out_first: Optional[torch.Tensor] = None
-    static_cache_channel_len_out_first: Optional[torch.Tensor] = None
-    static_cache_channel_out_subsequent: Optional[torch.Tensor] = None
-    static_cache_time_out_subsequent: Optional[torch.Tensor] = None
-    static_cache_channel_len_out_subsequent: Optional[torch.Tensor] = None
+    static_cache_channel_out_first: torch.Tensor | None = None
+    static_cache_time_out_first: torch.Tensor | None = None
+    static_cache_channel_len_out_first: torch.Tensor | None = None
+    static_cache_channel_out_subsequent: torch.Tensor | None = None
+    static_cache_time_out_subsequent: torch.Tensor | None = None
+    static_cache_channel_len_out_subsequent: torch.Tensor | None = None
 
     def is_captured(self) -> bool:
         """Check if graphs have been captured."""
@@ -108,7 +107,7 @@ class PerceptionCacheManager:
         self.subsampling_factor = None
         self.input_features = None
         self.sampling_frames = None
-        self.cudagraph_state: Optional[PerceptionCUDAGraphState] = None
+        self.cudagraph_state: PerceptionCUDAGraphState | None = None
 
     def setup(self) -> bool:
         """Setup cache-aware streaming for the perception encoder.
@@ -330,7 +329,7 @@ class PerceptionCacheManager:
         frame_idx: int,
         num_frames_per_chunk: int,
         perception_cache: PerceptionCacheState,
-    ) -> Tuple[torch.Tensor, PerceptionCacheState]:
+    ) -> tuple[torch.Tensor, PerceptionCacheState]:
         """
         Perform cache-aware perception encoding for streaming inference.
 

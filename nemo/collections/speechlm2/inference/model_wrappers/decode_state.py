@@ -32,7 +32,7 @@ pipeline import from here.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, List, Optional, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import torch
 
@@ -51,13 +51,13 @@ class StreamingDecodeState:
     frame_idx: int
     gen_text: torch.Tensor
     gen_asr_text: torch.Tensor
-    gen_function_text: Optional[torch.Tensor]
-    input_embeds_history: List[torch.Tensor]
+    gen_function_text: torch.Tensor | None
+    input_embeds_history: list[torch.Tensor]
     llm_cache: Any  # DynamicCache or HybridMambaAttentionDynamicCache
     tts_past_key_values: Any
-    tts_code: Optional[torch.Tensor]
-    subword_mask: Optional[torch.Tensor]
-    perception_cache: Optional["PerceptionCacheState"] = None
+    tts_code: torch.Tensor | None
+    subword_mask: torch.Tensor | None
+    perception_cache: "PerceptionCacheState" | None = None
     tts_codec_cache: Any = None
     llm_cache_position_offset: int = 0
 
@@ -75,6 +75,6 @@ class InferenceStepResult:
     asr_predicted_text_tokens: torch.Tensor
     predicted_text_strs: list[str]
     asr_predicted_text_strs: list[str]
-    decoded_audio: Optional[torch.Tensor] = None
-    function_predicted_text_tokens: Optional[torch.Tensor] = None
-    debug: Optional[dict] = None
+    decoded_audio: torch.Tensor | None = None
+    function_predicted_text_tokens: torch.Tensor | None = None
+    debug: dict | None = None

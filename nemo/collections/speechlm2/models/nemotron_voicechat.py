@@ -16,8 +16,6 @@ import json
 import os
 import warnings
 from pathlib import Path
-from typing import Optional, Union
-
 import torch
 from huggingface_hub import CONFIG_NAME
 from lightning import LightningModule
@@ -137,9 +135,9 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
 
     def save_pretrained(
         self,
-        save_directory: Union[str, Path],
+        save_directory: str | Path,
         **kwargs,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Save model and export LLM artifacts (tokenizer + perception config) for offline inference."""
         result = super().save_pretrained(save_directory, **kwargs)
 
@@ -181,13 +179,13 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
         cls,
         *,
         model_id: str,
-        revision: Optional[str],
-        cache_dir: Optional[Union[str, Path]],
+        revision: str | None,
+        cache_dir: str | Path | None,
         force_download: bool,
-        proxies: Optional[dict],
-        resume_download: Optional[bool],
+        proxies: dict | None,
+        resume_download: bool | None,
         local_files_only: bool,
-        token: Union[str, bool, None],
+        token: str | bool | None,
         map_location: str = "cpu",
         strict: bool = False,
         **model_kwargs,

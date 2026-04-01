@@ -18,7 +18,6 @@ import time
 
 import torch
 import librosa
-from typing import List, Optional
 from torch import Tensor
 import soundfile as sf
 from omegaconf import DictConfig
@@ -101,7 +100,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         # System prompt configuration
         # ------------------------------------------------------------------
         s2s_cfg = cfg.get("s2s", {})
-        self.system_prompt: Optional[str] = getattr(s2s_cfg, "system_prompt", None)
+        self.system_prompt: str | None = getattr(s2s_cfg, "system_prompt", None)
         if self.system_prompt:
             logging.info(f"System prompt configured: {self.system_prompt[:100]}{'...' if len(self.system_prompt) > 100 else ''}")
 
@@ -152,7 +151,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
     # ------------------------------------------------------------------
     # Output helpers
     # ------------------------------------------------------------------
-    def log_output(self, frames: List[Frame], audio_wave: Tensor, ready_feats: List[bool], text_pieces: List[str], asr_text_pieces: List[str] = None):
+    def log_output(self, frames: list[Frame], audio_wave: Tensor, ready_feats: list[bool], text_pieces: list[str], asr_text_pieces: list[str] = None):
         """Append generated audio waveform and text to per-stream state."""
         for idx, frame in enumerate(frames):
             if not ready_feats[idx]:
@@ -177,7 +176,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
             state.append_step_output(sample_audio, text=piece, asr_text=asr_piece)
 
 
-    def inner_generate_step(self, frames: List[Frame], buffers: List[Tensor], ready_feats: List[bool]):
+    def inner_generate_step(self, frames: list[Frame], buffers: list[Tensor], ready_feats: list[bool]):
         """Generate speech for chunks in *batch* using a shared ContextManager."""
         if len(frames) == 0:
             return
@@ -337,7 +336,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
         logging.info(f"Pipeline warmup complete in {time.time() - t0:.3f}s")
 
-    def generate_step(self, frames: List[Frame]):
+    def generate_step(self, frames: list[Frame]):
         """Main streaming API similar to *transcribe_step* in recognizers.
 
         If the batch contains a single zero-length first frame with a system
@@ -371,8 +370,8 @@ class StreamingS2SPipeline(S2SPipelineInterface):
     # ------------------------------------------------------------------
     def _finalize_and_save_finished_streams(
         self,
-        frames: List[Frame],
-        audio_filepaths: List[str],
+        frames: list[Frame],
+        audio_filepaths: list[str],
         saved_paths_by_stream: dict[int, str],
     ) -> None:
         """Finalize any streams that ended in this batch and save their outputs."""
@@ -471,9 +470,9 @@ class StreamingS2SPipeline(S2SPipelineInterface):
     # ------------------------------------------------------------------
     def run(
         self,
-        audio_filepaths: List[str],
-        options: List[S2SRequestOptions] | None = None,
-        progress_bar: Optional[ProgressBar] = None,
+        audio_filepaths: list[str],
+        options: list[S2SRequestOptions] | None = None,
+        progress_bar: ProgressBar | None = None,
     ) -> PipelineOutput:
         """Stream all *audio_filepaths* through the pipeline and save outputs.
 
@@ -519,7 +518,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
     # run() helpers
     # ------------------------------------------------------------------
 
-    def _maybe_prefill(self, frames: List[Frame]) -> None:
+    def _maybe_prefill(self, frames: list[Frame]) -> None:
         """If the first frame of a new stream carries a system prompt, emit a
         zero-length prefill frame through ``generate_step`` before inference
         begins.  This is the unified prefill protocol used by both ``run()``
@@ -541,9 +540,9 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
     def _apply_padding(
         self,
-        frames: List[Frame],
+        frames: list[Frame],
         streamer: ContinuousBatchedFrameStreamer,
-    ) -> tuple[List[Frame], dict[int, float]]:
+    ) -> tuple[list[Frame], dict[int, float]]:
         """If padding is configured, intercept last frames so the bufferer and
         context stay alive for the silence-padding phase.  Returns the
         (possibly modified) frames and a dict mapping ``stream_id`` to the
@@ -576,7 +575,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         self,
         pad_targets: dict[int, float],
         chunk_samples: int,
-        audio_filepaths: List[str],
+        audio_filepaths: list[str],
         saved_paths_by_stream: dict[int, str],
     ) -> None:
         """Generate silence-padding frames for streams that need them.
@@ -603,7 +602,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
     def _build_pipeline_output(
         self,
-        audio_filepaths: List[str],
+        audio_filepaths: list[str],
         saved_paths_by_stream: dict[int, str],
     ) -> PipelineOutput:
         """Assemble final ``PipelineOutput`` from accumulated per-stream state.
@@ -691,7 +690,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
             debug_data=debug_data if debug_data else None,
         )
 
-    def _prefill_system_prompt(self, stream_id: int, system_prompt: str | None = None) -> Optional[torch.Tensor]:
+    def _prefill_system_prompt(self, stream_id: int, system_prompt: str | None = None) -> torch.Tensor | None:
         """Prefill the system prompt for a new stream.
         
         This prepares the system prompt embeddings and processes them through
@@ -711,7 +710,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
             Using prefill OUTPUT codes causes audio quality issues (mumbling).
         
         Returns:
-            Optional[torch.Tensor]: The TTS prefill output codes if vLLM EarTTS prefill
+            torch.Tensor | None: The TTS prefill output codes if vLLM EarTTS prefill
             happened, None otherwise. These are returned for logging/debugging but
             should NOT be used to update context.tts_code.
         """

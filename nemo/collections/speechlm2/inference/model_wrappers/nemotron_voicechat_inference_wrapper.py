@@ -17,8 +17,6 @@ import gc
 import os
 import time
 import types
-from typing import Optional, Tuple
-
 import torch
 import torchaudio
 from omegaconf import OmegaConf, DictConfig
@@ -186,7 +184,7 @@ class NemotronVoicechatInferenceWrapper:
                 "use_perception_cudagraph requires use_perception_cache to be enabled. "
                 "Please also set use_perception_cache=True."
             )
-        self.perception_cache_mgr: Optional[PerceptionCacheManager] = None
+        self.perception_cache_mgr: PerceptionCacheManager | None = None
         self._use_perception_cudagraph = use_perception_cudagraph
 
         self._initialize_model()
@@ -385,7 +383,7 @@ class NemotronVoicechatInferenceWrapper:
     def _prepare_system_prompt_embeddings(
         self,
         system_prompt: str,
-    ) -> Tuple[Optional[torch.Tensor], int]:
+    ) -> tuple[torch.Tensor | None, int]:
         if not system_prompt or not system_prompt.strip():
             return None, 0
 
@@ -546,7 +544,7 @@ class NemotronVoicechatInferenceWrapper:
         num_frames_per_chunk: int,
         state: StreamingDecodeState,
         *,
-        request_id: Optional[str] = None,
+        request_id: str | None = None,
         has_prompt: bool = False,
         return_debug: bool = False,
     ) -> InferenceStepResult:
@@ -854,7 +852,7 @@ class NemotronVoicechatInferenceWrapper:
         state: StreamingDecodeState,
         frame_idx: int,
         num_frames_per_chunk: int,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         """Decode accumulated TTS codes into a waveform.
 
         Returns the decoded audio tensor or *None* when ``decode_audio``
@@ -894,8 +892,8 @@ class NemotronVoicechatInferenceWrapper:
         audio_input: torch.Tensor,
         frame_idx: int,
         num_frames_per_chunk: int,
-        perception_cache: Optional[PerceptionCacheState],
-    ) -> Tuple[torch.Tensor, Optional[PerceptionCacheState]]:
+        perception_cache: PerceptionCacheState | None,
+    ) -> tuple[torch.Tensor, PerceptionCacheState | None]:
         """Run the perception encoder and return (source_encoded, updated_cache)."""
         start_perception = time.time()
 
@@ -947,7 +945,7 @@ class NemotronVoicechatInferenceWrapper:
             result.append(_decode_tokens_with_specials(toks, self.tokenizer, keep_pad=False))
         return result
 
-    def abort_request(self, request_id: Optional[str]) -> bool:
+    def abort_request(self, request_id: str | None) -> bool:
         """
         Abort an in-flight vLLM streaming request if the backend supports it.
         """

@@ -13,8 +13,6 @@
 # limitations under the License.
 
 from queue import Queue
-from typing import Any, Dict, List, Optional, Tuple
-
 import torch
 from nemo.utils import logging
 
@@ -43,12 +41,12 @@ class S2SContextManager:
 
     def reset(self) -> None:
         """Reset all bookkeeping for a new streaming session."""
-        self.streamidx2slotidx: Dict[int, int] = {}
-        self.slotidx2streamidx: Dict[int, int] = {}
+        self.streamidx2slotidx: dict[int, int] = {}
+        self.slotidx2streamidx: dict[int, int] = {}
         self.free_slots = Queue(self.num_slots)
         for i in range(self.num_slots):
             self.free_slots.put(i)
-        self.slot_contexts: List[Optional[StreamingDecodeState]] = [None] * self.num_slots
+        self.slot_contexts: list[StreamingDecodeState | None] = [None] * self.num_slots
 
     def _create_context(self) -> StreamingDecodeState:
         """Allocate a fresh context backed by the realtime inference model."""
@@ -91,7 +89,7 @@ class S2SContextManager:
 
     def update_context(
         self,
-        stream_ids: List[int],
+        stream_ids: list[int],
         step_result: InferenceStepResult,
         num_frames: int,
     ) -> None:
@@ -130,7 +128,7 @@ class S2SContextManager:
         if context.subword_mask is not None:
             context.subword_mask[:, start_idx:end_idx] = True
 
-    def reset_slots(self, stream_ids: List[int], eos_flags: List[bool]) -> None:
+    def reset_slots(self, stream_ids: list[int], eos_flags: list[bool]) -> None:
         """Release contexts for streams that signalled end-of-stream."""
         if len(stream_ids) != len(eos_flags):
             raise ValueError("stream_ids and eos_flags must have the same length")
@@ -138,7 +136,7 @@ class S2SContextManager:
             if eos_flag and stream_id in self.streamidx2slotidx:
                 self.reset_slot(self.streamidx2slotidx[stream_id])
 
-    def get_context(self, stream_ids: List[int]) -> Tuple[StreamingDecodeState, Dict[int, int]]:
+    def get_context(self, stream_ids: list[int]) -> tuple[StreamingDecodeState, dict[int, int]]:
         """Return the cached context associated with the provided stream ids."""
         if len(stream_ids) == 0:
             return self._create_context(), {}

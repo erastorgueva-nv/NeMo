@@ -16,8 +16,6 @@ import os
 import re
 import warnings
 from pathlib import Path
-from typing import Optional, Union
-
 import torch
 from lightning import LightningModule
 from omegaconf import DictConfig
@@ -138,9 +136,9 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
     def save_pretrained(
         self,
-        save_directory: Union[str, Path],
+        save_directory: str | Path,
         **kwargs,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Save model and also export LLM artifacts (config + tokenizer) for offline inference."""
         result = super().save_pretrained(save_directory, **kwargs)
 

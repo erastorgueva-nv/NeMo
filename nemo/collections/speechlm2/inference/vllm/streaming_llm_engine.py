@@ -21,14 +21,13 @@ import os
 import json
 import torch
 import asyncio
-from typing import Optional, Dict, Any, AsyncGenerator, Tuple
+from typing import Any, AsyncGenerator
 from dataclasses import dataclass
 from enum import Enum
 
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.config.model import CustomInputSpec
 from vllm.attention.selector import _cached_get_attn_backend
 
 from nemo.utils import logging
@@ -44,8 +43,8 @@ class StreamStatus(Enum):
 class GenerationResult:
     token_id: int
     is_finished: bool
-    custom_outputs: Optional[Dict[str, torch.Tensor]] = None
-    finish_reason: Optional[str] = None
+    custom_outputs: dict[str, torch.Tensor] | None = None
+    finish_reason: str | None = None
     total_tokens: int = 0
 
 
@@ -55,7 +54,7 @@ class RequestState:
     request_id: str
     status: StreamStatus
     generated_tokens: list
-    generation_iterator: Optional[AsyncGenerator] = None
+    generation_iterator: AsyncGenerator | None = None
 
 
 class LLMStreamingEngine:
@@ -96,10 +95,10 @@ class LLMStreamingEngine:
         self.skip_tokenizer_init = skip_tokenizer_init
 
         # Engine state
-        self.engine: Optional[AsyncLLM] = None
+        self.engine: AsyncLLM | None = None
 
         # Request state tracking - supports multiple concurrent requests
-        self.requests: Dict[str, RequestState] = {}
+        self.requests: dict[str, RequestState] = {}
 
         # Default sampling parameters
         default_sampling = {
@@ -197,8 +196,8 @@ class LLMStreamingEngine:
         return True
 
     async def generate_next_token(self, input_tensors: list[torch.Tensor],
-                                        prompt_token_ids: Optional[list[int]] = None,
-                                        request_id: str = "speech_stream") -> Optional[GenerationResult]:
+                                        prompt_token_ids: list[int] | None = None,
+                                        request_id: str = "speech_stream") -> GenerationResult | None:
         """
         Generate the next token using the provided input embedding.
 
@@ -369,7 +368,7 @@ class LLMStreamingEngine:
         # Clear all request states
         self.requests.clear()
 
-    def get_status(self, request_id: Optional[str] = None) -> Dict[str, Any]:
+    def get_status(self, request_id: str | None = None) -> dict[str, Any]:
         """Get current status information.
 
         Args:

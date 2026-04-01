@@ -30,15 +30,13 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
-
 import torch
 from safetensors.torch import load_file, save_file
 from transformers import AutoConfig, AutoTokenizer
 from nemo.utils import logging
 
 
-def load_checkpoint(checkpoint_path: str) -> Dict[str, torch.Tensor]:
+def load_checkpoint(checkpoint_path: str) -> dict[str, torch.Tensor]:
     """
     Load checkpoint from safetensors or PyTorch format.
     
@@ -67,9 +65,9 @@ def load_checkpoint(checkpoint_path: str) -> Dict[str, torch.Tensor]:
 
 
 def filter_tensors(
-    state_dict: Dict[str, torch.Tensor],
-    prefixes_to_keep: List[str]
-) -> Dict[str, torch.Tensor]:
+    state_dict: dict[str, torch.Tensor],
+    prefixes_to_keep: list[str]
+) -> dict[str, torch.Tensor]:
     """
     Filter tensors to keep only those with specified prefixes.
     
@@ -95,9 +93,9 @@ def filter_tensors(
 def convert_nemo_to_hf_format(
     checkpoint_path: str,
     output_dir: str,
-    config_path: Optional[str] = None,
-    pretrained_llm: Optional[str] = None,
-    tensors_to_keep: Optional[List[str]] = None,
+    config_path: str | None = None,
+    pretrained_llm: str | None = None,
+    tensors_to_keep: list[str] | None = None,
     dtype: str = "float32",
 ) -> None:
     """

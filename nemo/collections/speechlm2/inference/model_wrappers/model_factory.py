@@ -33,11 +33,10 @@ Usage Example:
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any, Union, Set
+from typing import Any
 import math
 import os
 import torch
-from transformers import DynamicCache
 from dataclasses import dataclass, fields
 
 from nemo.utils import logging
@@ -54,7 +53,7 @@ class ModelInterface(ABC):
 
     def __init__(
         self,
-        special_token_ids: Optional[Set[int]] = None,
+        special_token_ids: set[int] | None = None,
         top_p: float = 1.0,
         repetition_penalty: float = 1.0,
         temperature: float = 1.0,
@@ -82,7 +81,7 @@ class ModelInterface(ABC):
 
         # Pre-built tensor for special-token filtering in repetition penalty.
         # Lazily moved to the right device on first use (see _sample_text_token).
-        self._special_ids_tensor: Optional[torch.Tensor] = (
+        self._special_ids_tensor: torch.Tensor | None = (
             torch.tensor(sorted(self.special_token_ids), dtype=torch.long)
             if self.special_token_ids else None
         )
@@ -198,9 +197,9 @@ class ModelInterface(ABC):
     def __call__(
         self,
         input_embeds: torch.Tensor,
-        cache: Optional[Any] = None,
+        cache: Any | None = None,
         **kwargs
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Perform model inference.
 
@@ -218,7 +217,7 @@ class ModelInterface(ABC):
         pass
 
     @abstractmethod
-    def to(self, device_or_dtype: Union[torch.device, torch.dtype]) -> 'ModelInterface':
+    def to(self, device_or_dtype: torch.device | torch.dtype) -> 'ModelInterface':
         """Move model to specified device or convert to specified dtype."""
         pass
 
@@ -268,9 +267,9 @@ class VllmLLMModel(ModelInterface):
         gpu_memory_utilization: float = 0.8,
         trust_remote_code: bool = True,
         dtype: str = "bfloat16",
-        engine_path: Optional[str] = None,
-        pretrained_llm: Optional[str] = None,
-        special_token_ids: Optional[Set[int]] = None,
+        engine_path: str | None = None,
+        pretrained_llm: str | None = None,
+        special_token_ids: set[int] | None = None,
         top_p: float = 1.0,
         repetition_penalty: float = 1.0,
         temperature: float = 1.0,
@@ -359,7 +358,7 @@ class VllmLLMModel(ModelInterface):
         logging.info("vLLM engine ready!")
 
     @staticmethod
-    def _get_special_token_ids_from_vllm_tokenizer(tokenizer) -> Set[int]:
+    def _get_special_token_ids_from_vllm_tokenizer(tokenizer) -> set[int]:
         """
         Extract special token IDs from a vLLM tokenizer.
         Looks for: '<s>' (bos), '</s>' (eos), '<SPECIAL_12>' (pad).
@@ -400,9 +399,9 @@ class VllmLLMModel(ModelInterface):
     def __call__(
         self,
         input_embeds: torch.Tensor,
-        request_id: Optional[str] = "request_id_1",
+        request_id: str | None = "request_id_1",
         **kwargs
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Perform inference using vLLM streaming engine.
 
@@ -430,10 +429,10 @@ class VllmLLMModel(ModelInterface):
 
     async def _async_inference(
         self,
-        inputs: Union[torch.Tensor, list[torch.Tensor]],
+        inputs: torch.Tensor | list[torch.Tensor],
         request_id: str,
         **kwargs
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Async inference using the streaming engine.
 
@@ -475,10 +474,10 @@ class VllmLLMModel(ModelInterface):
         input_embeds: torch.Tensor,
         request_id: str,
         decode_steps: int = 1,
-        prompt_token_ids: Optional[list] = None,
-        generated_tokens: Optional[torch.Tensor] = None,
+        prompt_token_ids: list | None = None,
+        generated_tokens: torch.Tensor | None = None,
         current_step: int = 0
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Process embeddings sequentially to generate text and ASR tokens.
 
@@ -556,7 +555,7 @@ class VllmLLMModel(ModelInterface):
         return ans
 
 
-    def to(self, device_or_dtype: Union[torch.device, torch.dtype]) -> 'VllmLLMModel':
+    def to(self, device_or_dtype: torch.device | torch.dtype) -> 'VllmLLMModel':
         """
         Move model to specified device or convert to specified dtype.
 
@@ -611,7 +610,7 @@ class VllmLLMModel(ModelInterface):
             self.engine.start_generation(request_id=request_id)
         )
 
-    def get_request_status(self, request_id: Optional[str] = None) -> Dict[str, Any]:
+    def get_request_status(self, request_id: str | None = None) -> dict[str, Any]:
         """
         Get status of a specific request or all requests.
 
@@ -637,7 +636,7 @@ class VllmLLMModel(ModelInterface):
 @dataclass
 class TTSGenerationResult:
     codes: torch.Tensor  # Generated acoustic tokens
-    past_key_values: Optional[Any]  # Updated cache (if applicable)
+    past_key_values: Any  # Updated cache (if applicable)
 
     def __getitem__(self, item: str | int):
         """Allows for accessing attributes by key or index."""
@@ -676,9 +675,9 @@ class VllmEARTTSModel(VllmLLMModel):
 
     def __call__(
         self,
-        inputs: Optional[Dict[str, torch.Tensor]] = None,
-        request_id: Optional[str] = None,
-        prompt_token_ids: Optional[list] = None,
+        inputs: dict[str, torch.Tensor] | None = None,
+        request_id: str | None = None,
+        prompt_token_ids: list | None = None,
         **kwargs
     ) -> TTSGenerationResult:
         """
@@ -729,10 +728,10 @@ class VllmEARTTSModel(VllmLLMModel):
 
     async def _process_inputs_to_outputs(
         self,
-        inputs: Dict[str, torch.Tensor],
+        inputs: dict[str, torch.Tensor],
         request_id: str,
-        prompt_token_ids: Optional[list] = None,
-    ) -> Dict[str, Any]:
+        prompt_token_ids: list | None = None,
+    ) -> dict[str, Any]:
         """
         Process embeddings sequentially to generate text and ASR tokens.
 
@@ -832,7 +831,7 @@ class NativeModel(ModelInterface):
     def __init__(
         self,
         model,
-        special_token_ids: Optional[Set[int]] = None,
+        special_token_ids: set[int] | None = None,
         top_p: float = 1.0,
         repetition_penalty: float = 1.0,
         temperature: float = 1.0,
@@ -888,13 +887,13 @@ class NativeModel(ModelInterface):
     def __call__(
         self,
         input_embeds: torch.Tensor,
-        cache: Optional[Any] = None,
-        cache_position: Optional[torch.Tensor] = None,
-        generated_tokens: Optional[torch.Tensor] = None,
+        cache: Any | None = None,
+        cache_position: torch.Tensor | None = None,
+        generated_tokens: torch.Tensor | None = None,
         current_step: int = 0,
         return_logits: bool = False,
         **kwargs
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Perform inference using the native model.
 
@@ -953,7 +952,7 @@ class NativeModel(ModelInterface):
         return ans
 
     @staticmethod
-    def _extract_special_token_ids_from_nemo(model) -> Set[int]:
+    def _extract_special_token_ids_from_nemo(model) -> set[int]:
         """
         Extract special token IDs from NeMo model's tokenizer.
 
@@ -987,7 +986,7 @@ class NativeModel(ModelInterface):
 
         return special_ids
 
-    def to(self, device_or_dtype: Union[torch.device, torch.dtype]) -> 'NativeModel':
+    def to(self, device_or_dtype: torch.device | torch.dtype) -> 'NativeModel':
         """Move underlying model to device or convert dtype."""
         self.model = self.model.to(device_or_dtype)
         return self
@@ -1025,8 +1024,8 @@ class NativeModel(ModelInterface):
 def create_model(
     model=None,
     engine_type: str = "native",
-    vllm_config: Optional[Dict[str, Any]] = None,
-    special_token_ids: Optional[Set[int]] = None,
+    vllm_config: dict[str, Any] | None = None,
+    special_token_ids: set[int] | None = None,
     top_p: float = 1.0,
     repetition_penalty: float = 1.0,
     temperature: float = 1.0,

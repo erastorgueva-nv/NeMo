@@ -14,11 +14,8 @@
 
 """Audio data loading and output serialization for S2S inference scripts."""
 
-from __future__ import annotations
-
 import json
 import os
-from typing import List
 
 import soundfile as sf
 
@@ -31,7 +28,7 @@ def prepare_audio_data(
     audio_file: str,
     default_system_prompt: str | None = None,
     sort_by_duration: bool = True,
-) -> tuple[List[str], List[S2SRequestOptions], List[str | None]]:
+) -> tuple[list[str], list[S2SRequestOptions], list[str | None]]:
     """Load audio filepaths and per-stream options from a folder, single file, or manifest.
 
     When the input is a JSON manifest, each line may contain::
@@ -48,8 +45,8 @@ def prepare_audio_data(
     if not os.path.isabs(audio_file):
         audio_file = os.path.abspath(audio_file)
 
-    options: List[S2SRequestOptions] = []
-    ground_truths: List[str | None] = []
+    options: list[S2SRequestOptions] = []
+    ground_truths: list[str | None] = []
 
     if os.path.isdir(audio_file):
         filepaths = [os.path.join(audio_file, x) for x in os.listdir(audio_file) if x.endswith(".wav")]
@@ -86,7 +83,7 @@ def prepare_audio_data(
     return filepaths, options, ground_truths
 
 
-def calculate_duration(audio_filepaths: List[str]) -> float:
+def calculate_duration(audio_filepaths: list[str]) -> float:
     """Calculate total duration of the given audio files in seconds."""
     total_dur = 0
     for audio_filepath in audio_filepaths:
@@ -96,7 +93,7 @@ def calculate_duration(audio_filepaths: List[str]) -> float:
 
 
 def calculate_padded_duration(
-    audio_filepaths: List[str],
+    audio_filepaths: list[str],
     pad_audio_to_sec: float | None = None,
     pad_silence_ratio: float | None = None,
     pad_audio_by_sec: float | None = None,
@@ -118,11 +115,11 @@ def calculate_padded_duration(
 
 
 def dump_output(
-    audio_filepaths: List[str],
+    audio_filepaths: list[str],
     output: PipelineOutput,
     output_dir: str,
-    options: List[S2SRequestOptions],
-    ground_truths: List[str | None],
+    options: list[S2SRequestOptions],
+    ground_truths: list[str | None],
 ) -> None:
     """Dump inference results to output_processed.json, output_raw.json, and per-file CTM.
 

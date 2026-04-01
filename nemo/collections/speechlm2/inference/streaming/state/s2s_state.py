@@ -13,11 +13,9 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import List, Optional
 
 import torch
 from nemo.collections.asr.inference.utils.text_segment import Word
-from nemo.utils import logging
 
 
 @dataclass
@@ -47,14 +45,14 @@ class S2SStreamingState:
     # Accumulated ASR (user) text
     output_asr_text_str: str = ""
     # Word-level timings for the agent response
-    output_words: List[Word] = field(default_factory=list)
+    output_words: list[Word] = field(default_factory=list)
 
     # Snapshots of full token-ID tensors, saved from StreamingDecodeState
     # before the decode context is destroyed at end-of-stream.
     # Used for post-hoc tokens_to_str conversion.
-    final_gen_text: Optional[torch.Tensor] = None
-    final_gen_asr_text: Optional[torch.Tensor] = None
-    final_gen_function_text: Optional[torch.Tensor] = None
+    final_gen_text: torch.Tensor | None = None
+    final_gen_asr_text: torch.Tensor | None = None
+    final_gen_function_text: torch.Tensor | None = None
     final_total_frames: int = 0
 
     def __post_init__(self) -> None:
@@ -110,7 +108,7 @@ class S2SStreamingState:
         gen_text: torch.Tensor,
         gen_asr_text: torch.Tensor,
         total_frames: int,
-        gen_function_text: Optional[torch.Tensor] = None,
+        gen_function_text: torch.Tensor | None = None,
     ) -> None:
         """Snapshot the full token-ID tensors from the decode context before it is destroyed."""
         self.final_gen_text = gen_text[:, :total_frames].clone().cpu()
@@ -121,7 +119,7 @@ class S2SStreamingState:
             if gen_function_text is not None else None
         )
 
-    def get_token_tensors(self) -> Optional[tuple]:
+    def get_token_tensors(self) -> tuple | None:
         """Return (gen_text, gen_asr_text, total_frames, gen_function_text) or None if not saved."""
         if self.final_gen_text is None:
             return None

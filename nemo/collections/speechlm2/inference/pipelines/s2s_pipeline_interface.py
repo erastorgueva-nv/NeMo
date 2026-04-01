@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, Any
+from typing import Any
 
 
 class S2SPipelineInterface:
@@ -28,7 +28,7 @@ class S2SPipelineInterface:
 
     def __init__(self) -> None:
         # Pool that holds per-stream state, keyed by ``stream_id``
-        self._state_pool: Dict[int, Any] = {}
+        self._state_pool: dict[int, Any] = {}
 
     # ------------------------------------------------------------------
     # State helpers
