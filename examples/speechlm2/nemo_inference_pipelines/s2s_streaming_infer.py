@@ -24,8 +24,6 @@ Usage:
         streaming.buffer_size_in_secs=5.6
 """
 
-from time import time
-
 import hydra
 from omegaconf import DictConfig
 
@@ -39,6 +37,7 @@ from nemo.collections.speechlm2.inference.utils.audio_data import (
 )
 from nemo.collections.speechlm2.inference.utils.pipeline_utils import clean_pred_text
 from nemo.utils import logging
+from nemo.utils.timers import SimpleTimer
 
 
 @hydra.main(config_path="./conf", config_name="s2s_streaming", version_base=None)
@@ -51,9 +50,11 @@ def main(cfg: DictConfig):
 
     pipeline = S2SPipelineBuilder.build_pipeline(cfg)
 
-    start = time()
+    timer = SimpleTimer()
+    timer.start()
     output = pipeline.run(audio_filepaths, options=options)
-    exec_dur = time() - start
+    timer.stop()
+    exec_dur = timer.total_sec()
     logging.info(f"Generated {len(audio_filepaths)} files in {exec_dur:.2f}s")
 
     # Log RTFX (accounts for padding when configured)
