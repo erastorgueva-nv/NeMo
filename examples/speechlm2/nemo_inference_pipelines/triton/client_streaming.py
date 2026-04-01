@@ -105,6 +105,7 @@ def send_sequence_end(client, sequence_id):
 
         outputs = [
             grpcclient.InferRequestedOutput("output_text"),
+            grpcclient.InferRequestedOutput("output_asr_text"),
             grpcclient.InferRequestedOutput("output_audio"),
         ]
 
@@ -115,7 +116,7 @@ def send_sequence_end(client, sequence_id):
             outputs=outputs,
             sequence_id=sequence_id,
             sequence_start=False,
-            sequence_end=True,  # This is the key - properly end the sequence
+            sequence_end=True,
         )
         logger.info("Sequence ended successfully")
         

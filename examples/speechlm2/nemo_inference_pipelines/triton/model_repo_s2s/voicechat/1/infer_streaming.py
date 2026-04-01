@@ -43,35 +43,45 @@ class TritonPythonModel:
         env vars, while sharing the same s2s_streaming.yaml used by the CLI.
 
         Env var mapping (cfg key -> env var, default):
-            s2s.model_path             -> S2S_MODEL_PATH (required)
-            s2s.llm_checkpoint_path    -> S2S_LLM_CHECKPOINT_PATH (required)
-            s2s.speaker_reference      -> S2S_SPEAKER_REFERENCE (required)
-            s2s.engine_type            -> S2S_ENGINE_TYPE (default: native)
-            s2s.system_prompt          -> S2S_SYSTEM_PROMPT (default: none)
-            s2s.tts_system_prompt      -> S2S_TTS_SYSTEM_PROMPT (default: none)
+            s2s.model_path               -> S2S_MODEL_PATH (required)
+            s2s.speaker_reference        -> S2S_SPEAKER_REFERENCE (optional)
+            s2s.speaker_name             -> S2S_SPEAKER_NAME (optional)
+            s2s.engine_type              -> S2S_ENGINE_TYPE (default: native)
+            s2s.deterministic            -> S2S_DETERMINISTIC (default: false)
+            s2s.use_llm_cache            -> S2S_USE_LLM_CACHE (default: true)
+            s2s.use_tts_subword_cache    -> S2S_USE_TTS_SUBWORD_CACHE (default: false)
+            s2s.system_prompt            -> S2S_SYSTEM_PROMPT (optional)
+            s2s.tts_system_prompt        -> S2S_TTS_SYSTEM_PROMPT (optional)
             streaming.chunk_size_in_secs -> S2S_CHUNK_SIZE_IN_SECS (default: 0.08)
             streaming.buffer_size_in_secs -> S2S_BUFFER_SIZE_IN_SECS (default: 5.6)
         """
         env_overrides = {
             # Required
-            "s2s.model_path":             ("S2S_MODEL_PATH", None),
-            "s2s.llm_checkpoint_path":    ("S2S_LLM_CHECKPOINT_PATH", None),
-            "s2s.speaker_reference":      ("S2S_SPEAKER_REFERENCE", None),
-            # Optional (with defaults)
-            "s2s.engine_type":            ("S2S_ENGINE_TYPE", "native"),
-            "s2s.system_prompt":          ("S2S_SYSTEM_PROMPT", None),
-            "s2s.tts_system_prompt":      ("S2S_TTS_SYSTEM_PROMPT", None),
+            "s2s.model_path":               ("S2S_MODEL_PATH", None),
+            # Speaker identity (set one or both)
+            "s2s.speaker_reference":        ("S2S_SPEAKER_REFERENCE", None),
+            "s2s.speaker_name":             ("S2S_SPEAKER_NAME", None),
+            # Engine & precision
+            "s2s.engine_type":              ("S2S_ENGINE_TYPE", "native"),
+            "s2s.deterministic":            ("S2S_DETERMINISTIC", False),
+            # Cache / speedup flags
+            "s2s.use_llm_cache":            ("S2S_USE_LLM_CACHE", True),
+            "s2s.use_tts_subword_cache":    ("S2S_USE_TTS_SUBWORD_CACHE", False),
+            # Prompts
+            "s2s.system_prompt":            ("S2S_SYSTEM_PROMPT", None),
+            "s2s.tts_system_prompt":        ("S2S_TTS_SYSTEM_PROMPT", None),
+            # Streaming
             "streaming.chunk_size_in_secs": ("S2S_CHUNK_SIZE_IN_SECS", 0.08),
-            "streaming.buffer_size_in_secs": ("S2S_BUFFER_SIZE_IN_SECS", 5.6),
+            "streaming.buffer_size_in_secs":("S2S_BUFFER_SIZE_IN_SECS", 5.6),
         }
         for cfg_key, (env_var, default) in env_overrides.items():
-            val = os.environ.get(env_var)
-            if val is not None:
-                if default is not None and isinstance(default, bool):
+            val = os.environ.get(env_var, "")
+            if val:
+                if isinstance(default, bool):
                     val = val.lower() in ("true", "1", "yes")
-                elif default is not None and isinstance(default, float):
+                elif isinstance(default, float):
                     val = float(val)
-                elif default is not None and isinstance(default, int):
+                elif isinstance(default, int):
                     val = int(val)
                 OmegaConf.update(cfg, cfg_key, val, force_add=True)
             elif default is not None:

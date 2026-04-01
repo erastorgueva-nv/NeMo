@@ -145,6 +145,8 @@ class ModelInterface(ABC):
                     unique_prev = unique_prev[~torch.isin(unique_prev, ids_t)]
 
                 if unique_prev.numel() > 0:
+                    if unique_prev.device != batch_logits.device:
+                        unique_prev = unique_prev.to(batch_logits.device)
                     prev_logits = batch_logits[unique_prev]
                     # Positive logits are divided, negative logits are multiplied
                     # (same as the standard repetition_penalty convention)

@@ -19,23 +19,26 @@
 # Fields marked ??? in the YAML are resolved from environment variables below.
 #
 # Usage:
-#   S2S_MODEL_PATH=/path/to/eartts_ckpt \
-#   S2S_LLM_CHECKPOINT_PATH=/path/to/llm_ckpt \
-#   S2S_SPEAKER_REFERENCE=/path/to/speaker.wav \
+#   S2S_MODEL_PATH=/path/to/hf_checkpoint \
+#   S2S_SPEAKER_NAME=MySpeaker \
 #   ./start_triton.sh
 #
 # Environment variables (required):
-#   S2S_MODEL_PATH              - Path to the EarTTS / S2S checkpoint
-#   S2S_LLM_CHECKPOINT_PATH     - Path to the LLM checkpoint
+#   S2S_MODEL_PATH              - Path to the HF-format checkpoint directory
+#
+# Environment variables (speaker identity — set at least one):
 #   S2S_SPEAKER_REFERENCE       - Path to a speaker reference .wav file
+#   S2S_SPEAKER_NAME            - Registered speaker name from the checkpoint
 #
 # Environment variables (optional):
 #   S2S_ENGINE_TYPE             - Engine type (default: native)
+#   S2S_DETERMINISTIC           - "true"/"false": deterministic mode (default: false)
+#   S2S_USE_LLM_CACHE           - "true"/"false": LLM KV cache (default: true)
+#   S2S_USE_TTS_SUBWORD_CACHE   - "true"/"false": TTS subword cache (default: false)
 #   S2S_SYSTEM_PROMPT           - LLM system prompt text (default: none)
-#   S2S_TTS_SYSTEM_PROMPT       - TTS system prompt, (default: none)
+#   S2S_TTS_SYSTEM_PROMPT       - TTS system prompt (default: none)
 #   S2S_CHUNK_SIZE_IN_SECS      - Chunk size in seconds, multiple of 0.08 (default: 0.08)
 #   S2S_BUFFER_SIZE_IN_SECS     - Audio buffer size in seconds (default: 5.6)
-#   S2S_USE_CODEC_CACHE         - "true"/"false": incremental codec decode (default: true)
 #   S2S_TRITON_CONFIG_PATH      - Override the YAML config file path
 #   MODEL_REPO_DIR              - Override the Triton model repository path
 
@@ -45,33 +48,45 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # backend (infer_streaming.py reads them via os.environ).
 
 # ========================
-# Model paths (required)
+# Model path (required)
 # ========================
-export S2S_MODEL_PATH="${S2S_MODEL_PATH:?Please set S2S_MODEL_PATH to the EarTTS / S2S checkpoint path}"
-export S2S_LLM_CHECKPOINT_PATH="${S2S_LLM_CHECKPOINT_PATH:?Please set S2S_LLM_CHECKPOINT_PATH to the LLM checkpoint path}"
-export S2S_SPEAKER_REFERENCE="${S2S_SPEAKER_REFERENCE:?Please set S2S_SPEAKER_REFERENCE to a speaker reference .wav file}"
+export S2S_MODEL_PATH="${S2S_MODEL_PATH:?Please set S2S_MODEL_PATH to the HF-format checkpoint directory}"
+
+# ========================
+# Speaker identity (set at least one)
+# ========================
+export S2S_SPEAKER_REFERENCE="${S2S_SPEAKER_REFERENCE:-}"
+export S2S_SPEAKER_NAME="${S2S_SPEAKER_NAME:-}"
+if [ -z "${S2S_SPEAKER_REFERENCE}" ] && [ -z "${S2S_SPEAKER_NAME}" ]; then
+    echo "ERROR: Set at least one of S2S_SPEAKER_REFERENCE or S2S_SPEAKER_NAME"
+    exit 1
+fi
 
 # ========================
 # Optional overrides
 # ========================
 export S2S_ENGINE_TYPE="${S2S_ENGINE_TYPE:-native}"
+export S2S_DETERMINISTIC="${S2S_DETERMINISTIC:-}"
+export S2S_USE_LLM_CACHE="${S2S_USE_LLM_CACHE:-}"
+export S2S_USE_TTS_SUBWORD_CACHE="${S2S_USE_TTS_SUBWORD_CACHE:-}"
 export S2S_SYSTEM_PROMPT="${S2S_SYSTEM_PROMPT:-}"
 export S2S_TTS_SYSTEM_PROMPT="${S2S_TTS_SYSTEM_PROMPT:-}"
 export S2S_CHUNK_SIZE_IN_SECS="${S2S_CHUNK_SIZE_IN_SECS:-0.08}"
 export S2S_BUFFER_SIZE_IN_SECS="${S2S_BUFFER_SIZE_IN_SECS:-5.6}"
-export S2S_USE_CODEC_CACHE="${S2S_USE_CODEC_CACHE:-true}"
 export S2S_TRITON_CONFIG_PATH="${S2S_TRITON_CONFIG_PATH:-${SCRIPT_DIR}/../conf/s2s_streaming.yaml}"
 export MODEL_REPO_DIR="${MODEL_REPO_DIR:-${SCRIPT_DIR}/model_repo_s2s}"
 
 
 echo "=== S2S Triton Server ==="
 echo "  S2S_MODEL_PATH:          ${S2S_MODEL_PATH}"
-echo "  S2S_LLM_CHECKPOINT_PATH: ${S2S_LLM_CHECKPOINT_PATH}"
-echo "  S2S_SPEAKER_REFERENCE:   ${S2S_SPEAKER_REFERENCE}"
+echo "  S2S_SPEAKER_REFERENCE:   ${S2S_SPEAKER_REFERENCE:-<not set>}"
+echo "  S2S_SPEAKER_NAME:        ${S2S_SPEAKER_NAME:-<not set>}"
 echo "  S2S_ENGINE_TYPE:         ${S2S_ENGINE_TYPE}"
+echo "  S2S_DETERMINISTIC:       ${S2S_DETERMINISTIC:-<default>}"
+echo "  S2S_USE_LLM_CACHE:       ${S2S_USE_LLM_CACHE:-<default>}"
+echo "  S2S_USE_TTS_SUBWORD_CACHE: ${S2S_USE_TTS_SUBWORD_CACHE:-<default>}"
 echo "  S2S_CHUNK_SIZE_IN_SECS:  ${S2S_CHUNK_SIZE_IN_SECS}"
 echo "  S2S_BUFFER_SIZE_IN_SECS: ${S2S_BUFFER_SIZE_IN_SECS}"
-echo "  S2S_USE_CODEC_CACHE:     ${S2S_USE_CODEC_CACHE}"
 echo "  S2S_SYSTEM_PROMPT:       ${S2S_SYSTEM_PROMPT:-<not set>}"
 echo "  S2S_TTS_SYSTEM_PROMPT:   ${S2S_TTS_SYSTEM_PROMPT:-<not set>}"
 echo "  MODEL_REPO_DIR:          ${MODEL_REPO_DIR}"

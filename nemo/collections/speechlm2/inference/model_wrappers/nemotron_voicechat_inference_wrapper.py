@@ -241,7 +241,8 @@ class NemotronVoicechatInferenceWrapper:
 
         # Convert some S2S components to the configured dtype
         logging.info(f"Converting some S2S components to {self.dtype} (keeping perception & TTS in float32)...")
-        self.model.stt_model.llm = self.model.stt_model.llm.to(self.dtype)
+        if self.model.stt_model.llm is not None:
+            self.model.stt_model.llm = self.model.stt_model.llm.to(self.dtype)
         self.model.stt_model.lm_head = self.model.stt_model.lm_head.to(self.dtype)
         self.model.stt_model.embed_tokens = self.model.stt_model.embed_tokens.to(self.dtype)
         self.model.stt_model.asr_head = self.model.stt_model.asr_head.to(self.dtype)
