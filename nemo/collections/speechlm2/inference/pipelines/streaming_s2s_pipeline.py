@@ -25,7 +25,6 @@ import math
 
 from nemo.collections.asr.inference.streaming.framing.request import Frame
 from nemo.collections.asr.inference.utils.enums import RequestType
-from nemo.collections.asr.inference.streaming.framing.multi_stream import ContinuousBatchedFrameStreamer
 from nemo.collections.asr.inference.streaming.buffering.audio_bufferer import BatchedAudioBufferer
 from nemo.collections.asr.inference.utils.progressbar import ProgressBar
 from nemo.collections.speechlm2.inference.pipelines.s2s_pipeline_interface import S2SPipelineInterface
@@ -34,6 +33,7 @@ from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_infe
 from nemo.collections.speechlm2.parts.text_utils import tokens_to_str
 from nemo.collections.speechlm2.inference.streaming.state.s2s_context_manager import S2SContextManager
 from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
+from nemo.collections.speechlm2.inference.streaming.framing.silence_padded_frame_streamer import SilencePaddedContinuousBatchedFrameStreamer
 from nemo.collections.speechlm2.inference.utils.pipeline_utils import PipelineOutput
 from nemo.utils import logging
 
@@ -525,99 +525,30 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         if options is None:
             options = [S2SRequestOptions() for _ in audio_filepaths]
 
-        streamer = ContinuousBatchedFrameStreamer(
+        streamer = SilencePaddedContinuousBatchedFrameStreamer(
             n_frames_per_stream=1,
             frame_size_in_secs=self.chunk_size_in_secs,
             sample_rate=self.input_sample_rate,
             batch_size=self.batch_size,
             pad_last_frame=True,
+            pad_to_sec=self.pad_audio_to_sec,
+            pad_by_sec=self.pad_audio_by_sec,
+            pad_ratio=self.pad_silence_ratio,
         )
         streamer.set_audio_filepaths(audio_filepaths, options)
         streamer.set_progress_bar(progress_bar)
 
-        # Ensure output directory exists
         os.makedirs(self.output_dir, exist_ok=True)
-
-        # Track saved paths by stream id to preserve input order
         saved_paths_by_stream: dict[int, str] = {}
-        chunk_samples = int(self.chunk_size_in_secs * self.input_sample_rate)
 
         self.open_session()
         for frames in streamer:
-            frames, pad_targets = self._apply_padding(frames, streamer)
             self.generate_step(frames)
             self._finalize_and_save_finished_streams(frames, audio_filepaths, saved_paths_by_stream)
-            self._generate_silence_padding(pad_targets, chunk_samples, audio_filepaths, saved_paths_by_stream)
 
         output = self._build_pipeline_output(audio_filepaths, saved_paths_by_stream)
         self.close_session()
         return output
-
-    # ------------------------------------------------------------------
-    # run() helpers
-    # ------------------------------------------------------------------
-
-    def _apply_padding(
-        self,
-        frames: list[Frame],
-        streamer: ContinuousBatchedFrameStreamer,
-    ) -> tuple[list[Frame], dict[int, float]]:
-        """If padding is configured, intercept last frames so the bufferer and
-        context stay alive for the silence-padding phase.  Returns the
-        (possibly modified) frames and a dict mapping ``stream_id`` to the
-        remaining seconds of silence to append.
-        """
-        pad_targets: dict[int, float] = {}
-        if not (self.pad_audio_to_sec or self.pad_silence_ratio or self.pad_audio_by_sec):
-            return frames, pad_targets
-
-        processed_frames = []
-        for frame in frames:
-            if frame.is_last:
-                elapsed = streamer.elapsed_durations[frame.stream_id]
-                remaining = self._padding_remaining_secs(elapsed)
-                if remaining > 0:
-                    processed_frames.append(Frame(
-                        samples=frame.samples,
-                        stream_id=frame.stream_id,
-                        is_first=frame.is_first,
-                        is_last=False,
-                        length=frame.length,
-                        options=frame.options,
-                    ))
-                    pad_targets[frame.stream_id] = remaining
-                    continue
-            processed_frames.append(frame)
-        return processed_frames, pad_targets
-
-    def _generate_silence_padding(
-        self,
-        pad_targets: dict[int, float],
-        chunk_samples: int,
-        audio_filepaths: list[str],
-        saved_paths_by_stream: dict[int, str],
-    ) -> None:
-        """Generate silence-padding frames for streams that need them.
-
-        Must run in the same iteration as the real last frame to avoid the next
-        stream's setup destroying this stream's context.
-        """
-        for stream_id, remaining_secs in pad_targets.items():
-            num_pad_frames = max(1, round(remaining_secs / self.chunk_size_in_secs))
-            for i in range(num_pad_frames):
-                is_last = (i == num_pad_frames - 1)
-                silence_frame = Frame(
-                    samples=torch.zeros(chunk_samples),
-                    stream_id=stream_id,
-                    is_first=False,
-                    is_last=is_last,
-                    length=chunk_samples,
-                )
-                self.generate_step([silence_frame])
-                if is_last:
-                    self._finalize_and_save_finished_streams(
-                        [silence_frame], audio_filepaths, saved_paths_by_stream
-                    )
 
     def _build_pipeline_output(
         self,
@@ -813,16 +744,6 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                 logging.info(f"Added {prompt_len} prompt embeddings to input_embeds_history")
         
         return tts_output_code
-
-    def _padding_remaining_secs(self, elapsed_secs: float) -> float:
-        """Return how many seconds of silence padding are still needed."""
-        if self.pad_audio_to_sec is not None:
-            return max(0.0, self.pad_audio_to_sec - elapsed_secs)
-        if self.pad_silence_ratio is not None:
-            return elapsed_secs * self.pad_silence_ratio
-        if self.pad_audio_by_sec is not None:
-            return self.pad_audio_by_sec
-        return 0.0
 
     def _request_id_for_stream(self, stream_id: int) -> str:
         return str(stream_id)

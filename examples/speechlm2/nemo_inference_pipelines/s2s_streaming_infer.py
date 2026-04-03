@@ -30,8 +30,7 @@ from omegaconf import DictConfig
 from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.collections.speechlm2.inference.factory.s2s_pipeline_builder import S2SPipelineBuilder
 from nemo.collections.speechlm2.inference.utils.audio_data import (
-    calculate_duration,
-    calculate_padded_duration,
+    calculate_duration_incl_padding,
     dump_output,
     prepare_audio_data,
 )
@@ -57,14 +56,9 @@ def main(cfg: DictConfig):
     exec_dur = timer.total_sec()
     logging.info(f"Generated {len(audio_filepaths)} files in {exec_dur:.2f}s")
 
-    # Log RTFX (accounts for padding when configured)
-    pad_to = cfg.get("pad_audio_to_sec", None)
-    pad_ratio = cfg.get("pad_silence_ratio", None)
-    pad_by = cfg.get("pad_audio_by_sec", None)
-    if pad_to or pad_ratio or pad_by:
-        data_dur = calculate_padded_duration(audio_filepaths, pad_to, pad_ratio, pad_by)
-    else:
-        data_dur = calculate_duration(audio_filepaths)
+    data_dur = calculate_duration_incl_padding(
+        audio_filepaths, cfg.get("pad_audio_to_sec"), cfg.get("pad_silence_ratio"), cfg.get("pad_audio_by_sec"),
+    )
     rtfx = data_dur / exec_dur if exec_dur > 0 else float('inf')
     logging.info(f"RTFX: {rtfx:.2f} ({data_dur:.2f}s / {exec_dur:.2f}s)")
 

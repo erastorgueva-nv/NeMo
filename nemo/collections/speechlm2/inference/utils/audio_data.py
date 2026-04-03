@@ -83,22 +83,20 @@ def prepare_audio_data(
     return filepaths, options, ground_truths
 
 
-def calculate_duration(audio_filepaths: list[str]) -> float:
-    """Calculate total duration of the given audio files in seconds."""
-    total_dur = 0
-    for audio_filepath in audio_filepaths:
-        sound = sf.SoundFile(audio_filepath)
-        total_dur += sound.frames / sound.samplerate
-    return total_dur
-
-
-def calculate_padded_duration(
+def calculate_duration_incl_padding(
     audio_filepaths: list[str],
     pad_audio_to_sec: float | None = None,
     pad_silence_ratio: float | None = None,
     pad_audio_by_sec: float | None = None,
 ) -> float:
-    """Calculate total duration including silence padding for RTFX reporting."""
+    """Calculate total duration of the given audio files in seconds.
+
+    Optionally accounts for silence padding appended after each file.
+    At most one padding argument may be set; when none are set this
+    returns the raw audio duration.
+    """
+    if sum(x is not None for x in [pad_audio_to_sec, pad_silence_ratio, pad_audio_by_sec]) > 1:
+        raise ValueError("Set at most one of: pad_audio_to_sec, pad_silence_ratio, pad_audio_by_sec")
     total = 0.0
     for fp in audio_filepaths:
         sound = sf.SoundFile(fp)
