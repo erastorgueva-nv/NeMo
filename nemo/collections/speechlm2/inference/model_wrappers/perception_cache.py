@@ -43,7 +43,7 @@ class PerceptionCacheState:
 
     def is_initialized(self) -> bool:
         """Check if the cache has been initialized."""
-        return self.cache_last_channel is not None
+        return None not in [self.cache_last_channel, self.cache_last_time, self.cache_last_channel_len]
 
 
 @dataclass
