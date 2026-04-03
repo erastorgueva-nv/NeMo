@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 
 import torch
 from nemo.collections.asr.inference.utils.text_segment import Word
+from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
 
 
 @dataclass
@@ -36,6 +39,9 @@ class S2SStreamingState:
     device: torch.device
     dtype: torch.dtype
     output_sample_rate: int
+
+    # Per-stream request options (system prompt, sampling overrides, etc.)
+    options: S2SRequestOptions = field(default_factory=S2SRequestOptions)
 
     # Growing audio buffer — shape (1, T), appended each step
     audio_buffer: torch.Tensor = field(init=False)

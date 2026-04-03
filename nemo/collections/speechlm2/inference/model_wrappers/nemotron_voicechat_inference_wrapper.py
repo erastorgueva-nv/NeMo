@@ -547,12 +547,25 @@ class NemotronVoicechatInferenceWrapper:
         request_id: str | None = None,
         has_prompt: bool = False,
         return_debug: bool = False,
+        sampling_params: dict[str, float] | None = None,
     ) -> InferenceStepResult:
         """Run one streaming inference step: perception -> LLM -> TTS -> audio decode.
 
         All mutable decode state (caches, gen_text, gen_asr_text, code, etc.) is
         updated **in-place** on *state*.  The returned :class:`InferenceStepResult`
         carries only per-step outputs needed by the pipeline.
+
+        Args:
+            audio_input (torch.Tensor): Raw audio tensor for this chunk, shape ``(1, samples)``.
+            num_frames_per_chunk (int): Number of 80 ms frames in this chunk.
+            state (StreamingDecodeState): Mutable decode state (KV caches, token workspaces, etc.).
+            request_id (str | None): Unique ID for this stream (used by vLLM engines).
+            has_prompt (bool): Whether the LLM KV cache already contains a prefilled
+                system prompt.  Affects the first-frame embedding (PAD vs BOS).
+            return_debug (bool): If True, attach per-step debug info to the result.
+            sampling_params (dict[str, float] | None): Optional per-stream sampling overrides
+                (``top_p``, ``temperature``, ``repetition_penalty``).
+                Keys that are absent fall back to the pipeline-level defaults.
         """
         effective_request_id = request_id or self.request_id
         frame_idx = state.frame_idx
@@ -603,6 +616,7 @@ class NemotronVoicechatInferenceWrapper:
             ans = self._run_llm_step(
                 input_emb, state, frame_offset, effective_request_id,
                 current_frame_idx, use_llm_cache, return_debug, new_input_embeds,
+                sampling_params=sampling_params,
             )
 
             if return_debug and "text_logits" in ans:
@@ -741,6 +755,7 @@ class NemotronVoicechatInferenceWrapper:
         use_llm_cache: bool,
         return_debug: bool,
         new_input_embeds: list,
+        sampling_params: dict[str, float] | None = None,
     ) -> dict:
         """Run one LLM forward pass (native cache, vLLM, or full-history).
 
@@ -756,6 +771,7 @@ class NemotronVoicechatInferenceWrapper:
                     request_id=request_id,
                     generated_tokens=state.gen_text,
                     current_step=current_frame_idx,
+                    sampling_params=sampling_params,
                 )
             else:
                 cache_pos = torch.tensor(
@@ -768,6 +784,7 @@ class NemotronVoicechatInferenceWrapper:
                     generated_tokens=state.gen_text,
                     current_step=current_frame_idx,
                     return_logits=return_debug,
+                    sampling_params=sampling_params,
                 )
             state.llm_cache = ans["cache"]
         else:
@@ -779,6 +796,7 @@ class NemotronVoicechatInferenceWrapper:
                 generated_tokens=state.gen_text,
                 current_step=current_frame_idx,
                 return_logits=return_debug,
+                sampling_params=sampling_params,
             )
 
         if self._profile_timing:

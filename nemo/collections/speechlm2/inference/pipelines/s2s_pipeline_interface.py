@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from typing import Any
+
+from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
 
 
 class S2SPipelineInterface:
@@ -42,17 +46,22 @@ class S2SPipelineInterface:
         if stream_id in self._state_pool:
             del self._state_pool[stream_id]
 
-    def create_state(self):  # noqa: D401 (keep same signature as recognizers)
+    def create_state(self, options: S2SRequestOptions | None = None):
         """Create and return a *new*, *empty* state object.
+
+        Args:
+            options: Per-stream request options (system prompt, sampling
+                overrides, etc.).  Stored on the state so they can be
+                consulted throughout the stream's lifetime.
 
         Must be implemented by concrete pipelines.
         """
         raise NotImplementedError("`create_state()` must be implemented in a subclass.")
 
-    def get_or_create_state(self, stream_id: int):
+    def get_or_create_state(self, stream_id: int, options: S2SRequestOptions | None = None):
         """Return existing state for *stream_id* or create a new one via :py:meth:`create_state`."""
         if stream_id not in self._state_pool:
-            self._state_pool[stream_id] = self.create_state()
+            self._state_pool[stream_id] = self.create_state(options)
         return self._state_pool[stream_id]
 
     # ------------------------------------------------------------------

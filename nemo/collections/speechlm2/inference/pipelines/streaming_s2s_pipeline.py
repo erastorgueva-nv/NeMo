@@ -97,12 +97,16 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         )
 
         # ------------------------------------------------------------------
-        # System prompt configuration
+        # System prompt & sampling defaults (from YAML s2s block)
         # ------------------------------------------------------------------
         s2s_cfg = cfg.get("s2s", {})
         self.system_prompt: str | None = getattr(s2s_cfg, "system_prompt", None)
         if self.system_prompt:
             logging.info(f"System prompt configured: {self.system_prompt[:100]}{'...' if len(self.system_prompt) > 100 else ''}")
+
+        self._default_top_p: float | None = getattr(s2s_cfg, "top_p", None)
+        self._default_temperature: float | None = getattr(s2s_cfg, "temperature", None)
+        self._default_repetition_penalty: float | None = getattr(s2s_cfg, "repetition_penalty", None)
 
         # Context manager
         self.context_manager = S2SContextManager(
@@ -138,25 +142,79 @@ class StreamingS2SPipeline(S2SPipelineInterface):
     # ------------------------------------------------------------------
     # State helpers
     # ------------------------------------------------------------------
-    def create_state(self) -> S2SStreamingState:
-        """Create new empty state."""
+    def create_state(self, options: S2SRequestOptions | None = None) -> S2SStreamingState:
+        """Create new empty state with optional per-stream options."""
         dtype = getattr(self.s2s_model, "dtype", torch.float32)
         return S2SStreamingState(
             device=self.device,
             dtype=dtype,
             output_sample_rate=self.output_sample_rate,
+            options=options or S2SRequestOptions(),
         )
+
+    def _init_state(self, stream_id: int, options: S2SRequestOptions | None = None) -> None:
+        """Initialize a new stream: resolve defaults, create state, create context, prefill.
+
+        This is the S2S equivalent of ASR's ``init_state()`` in ``BasePipeline``.
+        Called automatically by :meth:`generate_step` when a frame has
+        ``is_first=True``.
+
+        The method always runs stream initialization (state creation,
+        context-manager allocation, KV-cache prefill).  If the triggering
+        frame also carries audio, :meth:`generate_step` will process it
+        immediately after this method returns.  For latency-sensitive
+        deployments (real-time voice chat), callers should send the first
+        frame with **empty audio** so that prefill completes before the
+        user starts speaking — this prevents audio from queuing up during
+        the expensive prefill phase.
+        """
+        # Normalize empty-string prompts to None so augment_with_defaults
+        # fills in the YAML default instead of treating "" as "set".
+        raw_opts = options or S2SRequestOptions()
+        if raw_opts.system_prompt is not None and not raw_opts.system_prompt.strip():
+            raw_opts = S2SRequestOptions(
+                system_prompt=None,
+                top_p=raw_opts.top_p,
+                temperature=raw_opts.temperature,
+                repetition_penalty=raw_opts.repetition_penalty,
+            )
+        opts = raw_opts.augment_with_defaults(
+            default_system_prompt=self.system_prompt,
+            default_top_p=self._default_top_p,
+            default_temperature=self._default_temperature,
+            default_repetition_penalty=self._default_repetition_penalty,
+        )
+        self.get_or_create_state(stream_id, options=opts)
+
+        self.context_manager = S2SContextManager(
+            s2s_model=self.s2s_model,
+            num_slots=self.batch_size,
+            max_len=self.max_len,
+        )
+
+        # Prefill can take hundreds of ms, or even tens of seconds if the
+        # prompt is long and the model is not warmed up.
+        prompt = opts.system_prompt
+        start_prefill = time.time()
+        with torch.no_grad(), torch.inference_mode():
+            self._prefill_system_prompt(stream_id, prompt)
+        torch.cuda.synchronize()
+        logging.info(f"_init_state: stream_id={stream_id}, prefill={1000*(time.time()-start_prefill):.1f}ms")
+
+        # Will tell generate_step_for_frames whether the KV cache already contains
+        # a system prompt, so it can choose the right first-frame embedding
+        # (PAD tokens if prefilled, BOS tokens if not).  Consumed and
+        # cleared on the first audio frame.
+        self._stream_has_prompt = bool(prompt)
 
 
     # ------------------------------------------------------------------
     # Output helpers
     # ------------------------------------------------------------------
-    def log_output(self, frames: list[Frame], audio_wave: Tensor, ready_feats: list[bool], text_pieces: list[str], asr_text_pieces: list[str] = None):
+    def log_output(self, frames: list[Frame], audio_wave: Tensor, text_pieces: list[str], asr_text_pieces: list[str] = None):
         """Append generated audio waveform and text to per-stream state."""
         for idx, frame in enumerate(frames):
-            if not ready_feats[idx]:
-                continue
-            state = self.get_or_create_state(frame.stream_id)
+            state = self.get_state(frame.stream_id)
             # audio_wave is [B, S]; take sample idx (None when decode_audio=False)
             sample_audio = audio_wave[idx:idx+1, ...] if audio_wave is not None else None
             # Determine text piece for this index
@@ -176,46 +234,54 @@ class StreamingS2SPipeline(S2SPipelineInterface):
             state.append_step_output(sample_audio, text=piece, asr_text=asr_piece)
 
 
-    def inner_generate_step(self, frames: list[Frame], buffers: list[Tensor], ready_feats: list[bool]):
-        """Generate speech for chunks in *batch* using a shared ContextManager."""
+    def generate_step_for_frames(self, frames: list[Frame], buffers: list[Tensor]):
+        """Generate speech for audio Frames using a shared ContextManager.
+
+        This is the S2S equivalent of ASR's ``transcribe_step_for_frames``
+        in ``BasePipeline``.  Like its ASR counterpart, it is never called
+        directly — :meth:`generate_step` (the public API, analogous to
+        ``transcribe_step``) handles stream init and then delegates here
+        for the actual audio processing.
+
+        Stream initialization (state, context, prefill) is always handled
+        by :meth:`_init_state` *before* this method is called.
+        """
         if len(frames) == 0:
             return
 
         stream_ids = [f.stream_id for f in frames]
         eos_flags = [f.is_last for f in frames]
-        bos_flags = [f.is_first for f in frames]
 
-        logging.debug(f"stream_ids={stream_ids} bos_flags={bos_flags} eos_flags={eos_flags}")
+        logging.debug(f"stream_ids={stream_ids} eos_flags={eos_flags}")
 
         if len(frames) != 1:
             raise NotImplementedError("NemotronVoicechatInferenceWrapper currently supports batch_size == 1")
 
-        # If this is the first audio frame and prefill was already done via a
-        # zero-length prefill frame, skip context init -- it's already set up.
-        # Otherwise (no system prompt), create a fresh context_manager.
-        has_prompt = False
-        if bos_flags[0]:
-            if self._stream_has_prompt:
-                logging.debug(f"Prefill already done for stream {stream_ids[0]}, skipping context init")
-            else:
-                logging.debug(f"No prefill for stream {stream_ids[0]}, creating fresh context_manager")
-                self.context_manager = S2SContextManager(
-                    s2s_model=self.s2s_model,
-                    num_slots=self.batch_size,
-                    max_len=self.max_len,
-                )
-
         has_prompt = self._stream_has_prompt
         self._stream_has_prompt = False
-        
+
         request_id = self._request_id_for_stream(stream_ids[0])
-        
+
         context, _ = self.context_manager.get_context(stream_ids)
 
         audio_buffer = buffers[0]
         if audio_buffer.dim() == 1:
             audio_buffer = audio_buffer.unsqueeze(0)
         audio_buffer = audio_buffer.to(self.s2s_model.device, dtype=self.s2s_model.dtype)
+
+        # Sampling overrides were resolved by _init_state via augment_with_defaults
+        # and stored on state.options.  Build the dict for infer_one_step.
+        pipeline_state = self.get_state(stream_ids[0])
+        if pipeline_state is None:
+            raise RuntimeError(
+                f"No state initialized for stream {stream_ids[0]}. "
+                "Clients must send an is_first=True frame before streaming audio."
+            )
+        sampling_params = {
+            k: getattr(pipeline_state.options, k)
+            for k in ("top_p", "temperature", "repetition_penalty")
+            if getattr(pipeline_state.options, k, None) is not None
+        }
 
         result = self.s2s_model.infer_one_step(
             audio_input=audio_buffer,
@@ -224,6 +290,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
             request_id=request_id,
             has_prompt=has_prompt,
             return_debug=self.collect_debug,
+            sampling_params=sampling_params or None,
         )
 
         if self.collect_debug and result.debug is not None:
@@ -259,57 +326,19 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                 # It will be cleaned up in close_session()
         
         # Log audio and attach text to state
-        self.log_output(frames, result.decoded_audio, ready_feats, result.predicted_text_strs, result.asr_predicted_text_strs)
-
-    def prefill_for_new_stream(self, stream_id: int, system_prompt: str | None = None) -> bool:
-        """Prepare the pipeline for a new stream by resetting context and prefilling the system prompt.
-
-        This is the public API for prefill-only calls (e.g. from a server backend)
-        that need to initialize TTS speaker embeddings and/or inject a system prompt
-        into the LLM KV cache *without* processing any audio.
-
-        Args:
-            stream_id: Unique identifier for the new stream.
-            system_prompt: System prompt text. If *None*, falls back to
-                the YAML-configured ``self.system_prompt``.
-
-        Returns:
-            True if a system prompt was prefilled, False otherwise.
-        """
-        t0 = time.time()
-        if system_prompt is None:
-            system_prompt = self.system_prompt
-
-        self.context_manager = S2SContextManager(
-            s2s_model=self.s2s_model,
-            num_slots=self.batch_size,
-            max_len=self.max_len,
-        )
-        t_ctx = time.time()
-
-        with torch.no_grad(), torch.inference_mode():
-            self._prefill_system_prompt(stream_id, system_prompt)
-        t_prefill = time.time()
-
-        self._stream_has_prompt = bool(system_prompt)
-        logging.debug(f"prefill_for_new_stream: context_manager={1000*(t_ctx-t0):.1f}ms, "
-              f"_prefill_system_prompt={1000*(t_prefill-t_ctx):.1f}ms, "
-              f"total={1000*(t_prefill-t0):.1f}ms, has_prompt={self._stream_has_prompt}")
-        return self._stream_has_prompt
+        self.log_output(frames, result.decoded_audio, result.predicted_text_strs, result.asr_predicted_text_strs)
 
     _WARMUP_FALLBACK_PROMPT = "Mock system prompt for warmup."
 
     def warmup(self, system_prompt: str | None = None) -> None:
-        """Run a throwaway prefill cycle to warm up the inference engine.
+        """Run a throwaway inference cycle to warm up the entire pipeline.
 
-        The very first prefill incurs one-time overhead (e.g. CUDA graph
-        compilation, memory pool allocation, DynamicCache initialization).
-        Calling this once during startup moves that cost out of the
-        critical path so the first real client request is fast.
-
-        The method performs a full prefill (TTS speaker embedding + LLM
-        system prompt), then aborts the request and resets all pipeline
-        state so the next real stream starts cleanly.
+        The very first call through each stage incurs one-time overhead
+        (e.g. CUDA graph compilation, memory pool allocation,
+        DynamicCache initialization, torch.compile).  Sending a silence
+        frame with ``is_first=True`` exercises the full path — prefill,
+        perception, LLM decode, TTS, and codec — so the first real
+        client request is fast.
 
         Args:
             system_prompt: Prompt text to use for warmup.  Falls back to
@@ -323,47 +352,58 @@ class StreamingS2SPipeline(S2SPipelineInterface):
             logging.info(f"No system prompt configured — using fallback prompt for warmup: \"{prompt}\"")
 
         warmup_stream_id = -1
+        chunk_samples = int(self.chunk_size_in_secs * self.input_sample_rate)
 
-        logging.info("Running pipeline warmup prefill...")
+        logging.info("Running pipeline warmup (prefill + one silence chunk)...")
         t0 = time.time()
 
-        self.prefill_for_new_stream(warmup_stream_id, prompt)
+        warmup_frame = Frame(
+            samples=torch.zeros(chunk_samples),
+            stream_id=warmup_stream_id,
+            is_first=True,
+            is_last=True,
+            options=S2SRequestOptions(system_prompt=prompt),
+        )
+        self.generate_step([warmup_frame])
 
-        # Tear down the warmup request so the engine is clean for real traffic
-        self._abort_stream_request(warmup_stream_id)
-        self.context_manager.reset()
+        # Tear down everything so the engine is clean for real traffic
+        self.reset_session()
         self._stream_has_prompt = False
 
         logging.info(f"Pipeline warmup complete in {time.time() - t0:.3f}s")
 
     def generate_step(self, frames: list[Frame]):
-        """Main streaming API similar to *transcribe_step* in recognizers.
+        """Main streaming API — handles both init and audio processing.
 
-        If the batch contains a single zero-length first frame with a system
-        prompt in ``options``, this is treated as a **prefill-only** request:
-        the context manager and system prompt are initialized but no audio
-        inference runs.  This is the unified protocol used by both the CLI
-        (``run()``) and server backends.
+        Mirrors ASR's ``transcribe_step``: on ``is_first`` frames, the
+        stream is initialized via :meth:`_init_state` (state creation,
+        context-manager allocation, KV-cache prefill).  If the frame also
+        carries audio, it is processed in the same call.  If there is no
+        audio (e.g. a server prefill-only request), the method returns
+        after init.
+
+        For latency-sensitive deployments, send the ``is_first`` frame
+        with **empty audio** so that the expensive prefill completes
+        before the user starts speaking.  For batch/offline usage the
+        first frame can carry real audio — init and first-chunk
+        processing simply happen back-to-back in one call.
         """
-        # Detect prefill-only frame: is_first + zero-length audio
-        if (len(frames) == 1
-                and frames[0].is_first
-                and frames[0].samples.numel() == 0):
-            opts = frames[0].options
-            prompt = None
-            if opts is not None and hasattr(opts, "system_prompt"):
-                prompt = opts.system_prompt
-            self.prefill_for_new_stream(frames[0].stream_id, prompt)
+        # Init phase — like ASR's `if request.is_first: self.init_state(...)`
+        for frame in frames:
+            if frame.is_first:
+                self._init_state(frame.stream_id, frame.options)
+
+        # Audio phase — skip if no audio (e.g. server prefill-only request)
+        non_empty_frames = [f for f in frames if f.samples.numel() > 0]
+        if not non_empty_frames:
             return
 
-        buffers, left_paddings = self.bufferer.update(frames)
+        buffers, left_paddings = self.bufferer.update(non_empty_frames)
         # This is a workaround for the fact that the audio buffer does left
         # padding, but the rest of the code requires no padding at all.
         buffers = [b[lp:] for b, lp in zip(buffers, left_paddings)]
-        ready_feats = [True] * len(frames)
-
         with torch.no_grad(), torch.inference_mode():
-            self.inner_generate_step(frames, buffers, ready_feats)
+            self.generate_step_for_frames(non_empty_frames, buffers)
         
     # ------------------------------------------------------------------
     # Finalization helpers
@@ -483,7 +523,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
             raise ValueError("progress_bar must be an instance of ProgressBar.")
 
         if options is None:
-            options = [S2SRequestOptions(system_prompt=self.system_prompt) for _ in audio_filepaths]
+            options = [S2SRequestOptions() for _ in audio_filepaths]
 
         streamer = ContinuousBatchedFrameStreamer(
             n_frames_per_stream=1,
@@ -504,7 +544,6 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
         self.open_session()
         for frames in streamer:
-            self._maybe_prefill(frames)
             frames, pad_targets = self._apply_padding(frames, streamer)
             self.generate_step(frames)
             self._finalize_and_save_finished_streams(frames, audio_filepaths, saved_paths_by_stream)
@@ -517,26 +556,6 @@ class StreamingS2SPipeline(S2SPipelineInterface):
     # ------------------------------------------------------------------
     # run() helpers
     # ------------------------------------------------------------------
-
-    def _maybe_prefill(self, frames: list[Frame]) -> None:
-        """If the first frame of a new stream carries a system prompt, emit a
-        zero-length prefill frame through ``generate_step`` before inference
-        begins.  This is the unified prefill protocol used by both ``run()``
-        and server backends.
-        """
-        if (len(frames) == 1
-                and frames[0].is_first
-                and frames[0].options is not None
-                and hasattr(frames[0].options, "system_prompt")
-                and frames[0].options.system_prompt):
-            prefill_frame = Frame(
-                samples=torch.empty(0),
-                stream_id=frames[0].stream_id,
-                is_first=True,
-                is_last=False,
-                options=frames[0].options,
-            )
-            self.generate_step([prefill_frame])
 
     def _apply_padding(
         self,

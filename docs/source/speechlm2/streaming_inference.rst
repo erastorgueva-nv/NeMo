@@ -97,11 +97,44 @@ over chunks and calls a single step method:
 What Happens Inside One Step
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+.. code-block:: text
+
+    generate_step(frames)
+        │
+        ├─ for each frame where is_first=True:
+        │      │
+        │      └─ _init_state(stream_id, options)
+        │             1. augment_with_defaults()   ← fill None fields from YAML
+        │             2. create_state(options)      ← pipeline-level state
+        │             3. create context_manager     ← KV caches, decode slots
+        │             4. prefill system prompt      ← populate LLM KV cache
+        │
+        ├─ any frames with audio?
+        │      │
+        │     NO → return            (server prefill-only request)
+        │      │
+        │    YES ↓
+        │
+        └─ generate_step_for_frames()
+               1. audio buffering
+               2. perception encoder
+               3. per-frame LLM loop
+               4. per-frame TTS
+               5. codec decode
+               6. state updates + output accumulation
+
 Each call to ``generate_step(frames)`` performs:
 
-1. **Prefill detection** -- A zero-length first frame with a system prompt
-   triggers ``prefill_for_new_stream()``, which initializes the LLM KV cache
-   with the system prompt and the TTS speaker embedding.
+1. **Stream init on** ``is_first`` -- If a frame has ``is_first=True``, the
+   private ``_init_state()`` method runs: per-stream options are merged with
+   pipeline defaults (via ``S2SRequestOptions.augment_with_defaults()``),
+   a fresh ``S2SStreamingState`` is created, the context manager is
+   allocated, and the LLM KV cache is prefilled with the system prompt and
+   TTS speaker embedding.  This mirrors ASR's ``init_state()`` called inside
+   ``transcribe_step()``.  If the frame carries no audio (zero-length
+   samples), the method returns after init — this is the recommended
+   pattern for latency-sensitive server deployments (see
+   :ref:`init-and-latency` below).
 
 2. **Audio buffering** -- ``BatchedAudioBufferer`` (reused from ASR
    infrastructure) maintains a sliding window of ``buffer_size_in_secs``.
@@ -188,6 +221,9 @@ S2S Model Settings (``s2s``)
    * - ``temperature``
      - ``0.3``
      - Sampling temperature.
+   * - ``repetition_penalty``
+     - ``1.1``
+     - Repetition penalty applied to previously generated tokens.
    * - ``deterministic``
      - ``false``
      - Force deterministic mode (native engine only).
@@ -246,27 +282,58 @@ Server Integration
 ------------------
 
 The same ``generate_step()`` method used by ``run()`` can be called directly
-from a custom server.  The zero-length Frame protocol handles prefill:
+from a custom server:
 
 .. code-block:: python
 
-    # 1. Prefill system prompt (zero-length frame)
-    prefill_frame = Frame(
+    # 1. Init stream (empty audio so prefill completes before recording)
+    init_frame = Frame(
         samples=torch.empty(0),
         stream_id=stream_id,
         is_first=True, is_last=False,
-        options=S2SRequestOptions(system_prompt=prompt),
+        options=S2SRequestOptions(system_prompt=prompt, top_p=0.9),
     )
-    pipeline.generate_step([prefill_frame])
+    pipeline.generate_step([init_frame])
+    # -> client can now start recording
 
     # 2. Stream audio chunks
-    for chunk in audio_source:
+    for i, chunk in enumerate(audio_source):
         frame = Frame(
             samples=chunk,
             stream_id=stream_id,
-            is_first=(i == 0), is_last=(i == last),
+            is_first=False, is_last=(i == last),
         )
         pipeline.generate_step([frame])
+
+Per-stream options (``system_prompt``, ``top_p``, ``temperature``,
+``repetition_penalty``) are attached to the ``is_first`` frame via
+``S2SRequestOptions``.  Any field left as ``None`` falls back to the
+pipeline-level YAML default through ``augment_with_defaults()``.
+
+.. _init-and-latency:
+
+Init and Latency
+^^^^^^^^^^^^^^^^
+
+When ``generate_step`` sees ``is_first``, it always runs stream
+initialization (context creation, KV-cache prefill).  If the frame also
+carries audio, inference runs immediately after init in the same call.
+
+For **latency-sensitive** server deployments (real-time voice chat),
+prefill can take hundreds of milliseconds or even multiple seconds.  
+Clients should send ``is_first`` with **empty audio**, wait for the 
+response confirming init is done, and only then start recording the 
+user's microphone.  This prevents audio from queuing up during the 
+expensive prefill phase.
+
+For **batch/offline** usage (CLI ``run()``), there is no real-time
+constraint.  The first frame carries both ``is_first`` and real audio,
+so init and first-chunk processing happen in one call with no extra
+round-trip.
+
+The pipeline makes no distinction between these cases — it initializes
+on ``is_first`` and processes whatever audio is present.  The latency
+trade-off is entirely the caller's choice.
 
 
 Batch Size

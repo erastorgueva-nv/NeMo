@@ -91,6 +91,7 @@ class ModelInterface(ABC):
         logits: torch.Tensor,
         generated_tokens: torch.Tensor,
         current_step: int,
+        sampling_params: dict[str, float] | None = None,
     ) -> torch.Tensor:
         """
         Sample text tokens with optional top-p sampling and repetition penalty.
@@ -100,10 +101,17 @@ class ModelInterface(ABC):
             logits: Logits tensor of shape (B, V) for vocabulary V.
             generated_tokens: Previously generated tokens of shape (B, T).
             current_step: Current decoding step (used to slice generated_tokens).
+            sampling_params: Optional per-request overrides for ``top_p``,
+                ``temperature``, and ``repetition_penalty``.  Missing keys
+                fall back to ``self.*`` (the pipeline-level defaults).
 
         Returns:
             Sampled token ids of shape (B,).
         """
+        top_p = sampling_params.get("top_p", self.top_p) if sampling_params else self.top_p
+        temperature = sampling_params.get("temperature", self.temperature) if sampling_params else self.temperature
+        rep_penalty = sampling_params.get("repetition_penalty", self.repetition_penalty) if sampling_params else self.repetition_penalty
+
         B, V = logits.shape
         device = logits.device
 
@@ -111,11 +119,11 @@ class ModelInterface(ABC):
         greedy_tokens = logits.argmax(dim=-1)  # (B,)
 
         # If no sampling needed (all disabled), return greedy
-        if self.top_p >= 1.0 and self.repetition_penalty == 1.0 and (self.temperature == 1.0 or self.temperature == 0.0):
+        if top_p >= 1.0 and rep_penalty == 1.0 and (temperature == 1.0 or temperature == 0.0):
             return greedy_tokens
 
         # temperature=0 means greedy
-        if self.temperature == 0.0:
+        if temperature == 0.0:
             return greedy_tokens
 
         # For each batch, if greedy is special token, use greedy; otherwise sample
@@ -134,7 +142,7 @@ class ModelInterface(ABC):
             batch_logits = logits[b].clone()  # (V,)
 
             # Apply repetition penalty (vectorized, no Python loop)
-            if self.repetition_penalty != 1.0 and current_step > 0:
+            if rep_penalty != 1.0 and current_step > 0:
                 unique_prev = generated_tokens[b, :current_step].unique()
                 # Exclude special tokens from penalty
                 if self._special_ids_tensor is not None:
@@ -151,13 +159,13 @@ class ModelInterface(ABC):
                     # (same as the standard repetition_penalty convention)
                     batch_logits[unique_prev] = torch.where(
                         prev_logits > 0,
-                        prev_logits / self.repetition_penalty,
-                        prev_logits * self.repetition_penalty,
+                        prev_logits / rep_penalty,
+                        prev_logits * rep_penalty,
                     )
 
             # Apply temperature scaling
-            if self.temperature != 1.0:
-                batch_logits = batch_logits / self.temperature
+            if temperature != 1.0:
+                batch_logits = batch_logits / temperature
 
             # Fall back to greedy if logits are non-finite before top-p
             # (top-p intentionally introduces -inf, so check must happen first)
@@ -173,13 +181,13 @@ class ModelInterface(ABC):
                 continue
 
             # Apply top-p (nucleus) sampling
-            if self.top_p < 1.0:
+            if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(batch_logits, descending=True)
                 sorted_probs = torch.softmax(sorted_logits, dim=-1)
                 cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
                 # Remove tokens with cumulative prob > top_p, keeping at least one
-                sorted_indices_to_remove = cumulative_probs > self.top_p
+                sorted_indices_to_remove = cumulative_probs > top_p
                 # Shift to keep the first token that exceeds threshold
                 sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
                 sorted_indices_to_remove[0] = False
@@ -476,7 +484,8 @@ class VllmLLMModel(ModelInterface):
         decode_steps: int = 1,
         prompt_token_ids: list | None = None,
         generated_tokens: torch.Tensor | None = None,
-        current_step: int = 0
+        current_step: int = 0,
+        sampling_params: dict[str, float] | None = None,
     ) -> dict[str, Any]:
         """
         Process embeddings sequentially to generate text and ASR tokens.
@@ -489,6 +498,7 @@ class VllmLLMModel(ModelInterface):
             generated_tokens: Previously generated tokens [batch, num_generated].
                              Required for repetition_penalty. If None, creates empty tensor.
             current_step: Current decoding step. Used for repetition penalty.
+            sampling_params: Optional per-request overrides for sampling.
         """
 
         if decode_steps == 0:
@@ -528,7 +538,10 @@ class VllmLLMModel(ModelInterface):
         text_logits = result.custom_outputs["text_logits"] if result else None
 
         predicted_token = text_token_ids[-1]
-        if self.top_p < 1.0 or self.repetition_penalty != 1.0 or (self.temperature != 1.0 and self.temperature != 0.0):
+        eff_top_p = sampling_params.get("top_p", self.top_p) if sampling_params else self.top_p
+        eff_temp = sampling_params.get("temperature", self.temperature) if sampling_params else self.temperature
+        eff_rep = sampling_params.get("repetition_penalty", self.repetition_penalty) if sampling_params else self.repetition_penalty
+        if eff_top_p < 1.0 or eff_rep != 1.0 or (eff_temp != 1.0 and eff_temp != 0.0):
             # Use provided generated_tokens or create empty tensor
             batch_size = text_logits.shape[0]
             if generated_tokens is None:
@@ -541,6 +554,7 @@ class VllmLLMModel(ModelInterface):
                 logits=text_logits,
                 generated_tokens=gen_tokens,
                 current_step=current_step,
+                sampling_params=sampling_params,
             )
 
         ans = {
@@ -892,6 +906,7 @@ class NativeModel(ModelInterface):
         generated_tokens: torch.Tensor | None = None,
         current_step: int = 0,
         return_logits: bool = False,
+        sampling_params: dict[str, float] | None = None,
         **kwargs
     ) -> dict[str, Any]:
         """
@@ -904,6 +919,8 @@ class NativeModel(ModelInterface):
             generated_tokens: Previously generated tokens [batch, num_generated].
                              Required for repetition_penalty. If None, creates empty tensor.
             current_step: Current decoding step. Used for repetition penalty.
+            sampling_params: Optional per-request overrides for sampling
+                (top_p, temperature, repetition_penalty).
             **kwargs: Additional arguments passed to the model
 
         Returns:
@@ -932,6 +949,7 @@ class NativeModel(ModelInterface):
             logits=text_logits,
             generated_tokens=gen_tokens,
             current_step=current_step,
+            sampling_params=sampling_params,
         )
 
         # ASR tokens use greedy decoding (no sampling)
