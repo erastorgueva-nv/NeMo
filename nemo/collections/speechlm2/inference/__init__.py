@@ -17,6 +17,6 @@ from nemo.collections.speechlm2.inference.model_wrappers.decode_state import (
     InferenceStepResult,
     StreamingDecodeState,
 )
-from nemo.collections.speechlm2.inference.pipelines.streaming_s2s_pipeline import StreamingS2SPipeline
+from nemo.collections.speechlm2.inference.pipelines.streaming_s2s_pipeline import GenerateStepOutput, StreamingS2SPipeline
 from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
 from nemo.collections.speechlm2.inference.utils.pipeline_utils import PipelineOutput

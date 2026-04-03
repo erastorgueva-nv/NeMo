@@ -15,6 +15,7 @@
 import copy
 import os
 import time
+from dataclasses import dataclass
 
 import torch
 import librosa
@@ -36,6 +37,25 @@ from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options 
 from nemo.collections.speechlm2.inference.streaming.framing.silence_padded_frame_streamer import SilencePaddedContinuousBatchedFrameStreamer
 from nemo.collections.speechlm2.inference.utils.pipeline_utils import PipelineOutput
 from nemo.utils import logging
+
+
+@dataclass
+class GenerateStepOutput:
+    """Output of a single :meth:`StreamingS2SPipeline.generate_step` call
+    for one stream.
+
+    Analogous to :class:`TranscribeStepOutput` in the ASR pipelines,
+    this carries the **incremental** (new-this-step) audio and text so
+    that callers don't have to diff against accumulated state.
+
+    The underlying :class:`S2SStreamingState` still accumulates
+    everything for batch/offline use.
+    """
+
+    stream_id: int
+    audio: torch.Tensor
+    text: str = ""
+    asr_text: str = ""
 
 
 class StreamingS2SPipeline(S2SPipelineInterface):
@@ -208,33 +228,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         self._stream_has_prompt = bool(prompt)
 
 
-    # ------------------------------------------------------------------
-    # Output helpers
-    # ------------------------------------------------------------------
-    def log_output(self, frames: list[Frame], audio_wave: Tensor, text_pieces: list[str], asr_text_pieces: list[str] = None):
-        """Append generated audio waveform and text to per-stream state."""
-        for idx, frame in enumerate(frames):
-            state = self.get_state(frame.stream_id)
-            # audio_wave is [B, S]; take sample idx (None when decode_audio=False)
-            sample_audio = audio_wave[idx:idx+1, ...] if audio_wave is not None else None
-            # Determine text piece for this index
-            piece = None
-            if text_pieces and idx < len(text_pieces):
-                candidate = text_pieces[idx]
-                if isinstance(candidate, str) and candidate:
-                    piece = candidate
-            
-            # Determine ASR text piece
-            asr_piece = None
-            if asr_text_pieces and idx < len(asr_text_pieces):
-                candidate = asr_text_pieces[idx]
-                if isinstance(candidate, str) and candidate:
-                    asr_piece = candidate
-
-            state.append_step_output(sample_audio, text=piece, asr_text=asr_piece)
-
-
-    def generate_step_for_frames(self, frames: list[Frame], buffers: list[Tensor]):
+    def generate_step_for_frames(self, frames: list[Frame], buffers: list[Tensor]) -> list[GenerateStepOutput]:
         """Generate speech for audio Frames using a shared ContextManager.
 
         This is the S2S equivalent of ASR's ``transcribe_step_for_frames``
@@ -247,7 +241,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         by :meth:`_init_state` *before* this method is called.
         """
         if len(frames) == 0:
-            return
+            return []
 
         stream_ids = [f.stream_id for f in frames]
         eos_flags = [f.is_last for f in frames]
@@ -325,8 +319,30 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                 # Note: We keep the state in _state_pool until finalization to save audio
                 # It will be cleaned up in close_session()
         
-        # Log audio and attach text to state
-        self.log_output(frames, result.decoded_audio, result.predicted_text_strs, result.asr_predicted_text_strs)
+        # Split the batch-level InferenceStepResult into per-frame outputs.
+        # Two things happen for each frame:
+        #  1. The incremental audio/text is appended to S2SStreamingState
+        #     (the pipeline-level accumulator that persists across steps —
+        #     used by run() to build the final PipelineOutput).
+        #  2. A GenerateStepOutput is built with the same incremental data
+        #     and returned to the caller (used by server integrations to
+        #     stream partial results to clients without diffing state).
+        outputs: list[GenerateStepOutput] = []
+        for idx, frame in enumerate(frames):
+            state = self.get_state(frame.stream_id)
+            audio = result.decoded_audio[idx:idx+1] if result.decoded_audio is not None else None
+            text = result.predicted_text_strs[idx] if result.predicted_text_strs else ""
+            asr_text = result.asr_predicted_text_strs[idx] if result.asr_predicted_text_strs else ""
+
+            state.append_step_output(audio, text=text, asr_text=asr_text)
+
+            outputs.append(GenerateStepOutput(
+                stream_id=frame.stream_id,
+                audio=audio if audio is not None else torch.empty(1, 0),
+                text=text,
+                asr_text=asr_text,
+            ))
+        return outputs
 
     _WARMUP_FALLBACK_PROMPT = "Mock system prompt for warmup."
 
@@ -372,15 +388,21 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
         logging.info(f"Pipeline warmup complete in {time.time() - t0:.3f}s")
 
-    def generate_step(self, frames: list[Frame]):
+    def generate_step(self, frames: list[Frame]) -> list[GenerateStepOutput]:
         """Main streaming API — handles both init and audio processing.
 
         Mirrors ASR's ``transcribe_step``: on ``is_first`` frames, the
         stream is initialized via :meth:`_init_state` (state creation,
         context-manager allocation, KV-cache prefill).  If the frame also
-        carries audio, it is processed in the same call.  If there is no
-        audio (e.g. a server prefill-only request), the method returns
-        after init.
+        carries input audio, it is processed in the same call.  If there
+        is no input audio (e.g. a server prefill-only request), the
+        method returns after init without running inference.
+
+        Returns one :class:`GenerateStepOutput` per input frame carrying
+        the **incremental** output audio and text produced by this step.
+        The output audio tensor may be empty when no waveform is produced
+        (prefill-only frames with no input audio, or when
+        ``decode_audio=False``).
 
         For latency-sensitive deployments, send the ``is_first`` frame
         with **empty audio** so that the expensive prefill completes
@@ -389,21 +411,48 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         processing simply happen back-to-back in one call.
         """
         # Init phase — like ASR's `if request.is_first: self.init_state(...)`
+        # Known limitation: _init_state runs prefill synchronously, so with
+        # batch_size > 1 a long system prompt on one stream will block
+        # decoding on all other streams in the same batch.
         for frame in frames:
             if frame.is_first:
                 self._init_state(frame.stream_id, frame.options)
 
-        # Audio phase — skip if no audio (e.g. server prefill-only request)
+        # Decode phase.
+        # Although generate_step_for_frames currently enforces batch_size==1,
+        # this method already handles mixed batches (a mix of prefill-only
+        # and audio-carrying frames) so it is ready for batch_size > 1.
+        # We run inference only on the non-empty subset, then stitch the
+        # outputs back into a list aligned 1:1 with the original *frames*.
         non_empty_frames = [f for f in frames if f.samples.numel() > 0]
         if not non_empty_frames:
-            return
+            # All frames are prefill-only — nothing to decode.
+            return [
+                GenerateStepOutput(stream_id=f.stream_id, audio=torch.empty(1, 0))
+                for f in frames
+            ]
 
         buffers, left_paddings = self.bufferer.update(non_empty_frames)
         # This is a workaround for the fact that the audio buffer does left
         # padding, but the rest of the code requires no padding at all.
         buffers = [b[lp:] for b, lp in zip(buffers, left_paddings)]
         with torch.no_grad(), torch.inference_mode():
-            self.generate_step_for_frames(non_empty_frames, buffers)
+            step_outputs = self.generate_step_for_frames(non_empty_frames, buffers)
+
+        # Fast path: every frame had audio, so step_outputs is already 1:1.
+        if len(non_empty_frames) == len(frames):
+            return step_outputs
+
+        # Slow path (batch_size > 1 with a mix of prefill and audio frames):
+        # fill in empty outputs for the prefill-only streams.
+        output_by_stream: dict[int, GenerateStepOutput] = {o.stream_id: o for o in step_outputs}
+        return [
+            output_by_stream.get(
+                f.stream_id,
+                GenerateStepOutput(stream_id=f.stream_id, audio=torch.empty(1, 0)),
+            )
+            for f in frames
+        ]
         
     # ------------------------------------------------------------------
     # Finalization helpers
@@ -543,6 +592,10 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
         self.open_session()
         for frames in streamer:
+            # generate_step returns per-step GenerateStepOutput objects
+            # (useful for server integrations that stream partial results
+            # to clients).  Here we rely on the accumulated state instead,
+            # which _finalize_and_save_finished_streams reads on is_last.
             self.generate_step(frames)
             self._finalize_and_save_finished_streams(frames, audio_filepaths, saved_paths_by_stream)
 

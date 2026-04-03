@@ -111,7 +111,7 @@ What Happens Inside One Step
         │
         ├─ any frames with audio?
         │      │
-        │     NO → return            (server prefill-only request)
+        │     NO → return empty outputs  (server prefill-only request)
         │      │
         │    YES ↓
         │
@@ -122,6 +122,7 @@ What Happens Inside One Step
                4. per-frame TTS
                5. codec decode
                6. state updates + output accumulation
+               7. return list[GenerateStepOutput]
 
 Each call to ``generate_step(frames)`` performs:
 
@@ -282,9 +283,13 @@ Server Integration
 ------------------
 
 The same ``generate_step()`` method used by ``run()`` can be called directly
-from a custom server:
+from a custom server.  It returns a list of ``GenerateStepOutput`` objects
+(one per input frame) carrying the **incremental** audio and text produced
+by this step — no need to diff against accumulated state:
 
 .. code-block:: python
+
+    from nemo.collections.speechlm2.inference import GenerateStepOutput
 
     # 1. Init stream (empty audio so prefill completes before recording)
     init_frame = Frame(
@@ -296,14 +301,16 @@ from a custom server:
     pipeline.generate_step([init_frame])
     # -> client can now start recording
 
-    # 2. Stream audio chunks
+    # 2. Stream audio chunks and consume incremental outputs
     for i, chunk in enumerate(audio_source):
         frame = Frame(
             samples=chunk,
             stream_id=stream_id,
             is_first=False, is_last=(i == last),
         )
-        pipeline.generate_step([frame])
+        outputs = pipeline.generate_step([frame])
+        for out in outputs:
+            send_to_client(out.audio, out.text, out.asr_text)
 
 Per-stream options (``system_prompt``, ``top_p``, ``temperature``,
 ``repetition_penalty``) are attached to the ``is_first`` frame via
