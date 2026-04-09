@@ -16,7 +16,6 @@ import copy
 import gc
 import os
 import time
-import types
 import torch
 import torchaudio
 from omegaconf import OmegaConf, DictConfig
@@ -28,7 +27,7 @@ from nemo.collections.speechlm2.models.nemotron_voicechat import NemotronVoiceCh
 from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.audio.parts.utils.transforms import resample
 from nemo.collections.speechlm2.modules.ear_tts_vae_codec import CausalConv1dCache
-from nemo.collections.speechlm2.inference.model_wrappers.model_factory import create_model
+from nemo.collections.speechlm2.inference.model_wrappers.factory import create_model
 from nemo.collections.speechlm2.inference.model_wrappers.perception_cache import (
     PerceptionCacheState,
     PerceptionCacheManager,
@@ -158,7 +157,15 @@ class NemotronVoicechatInferenceWrapper:
         self.model_llm_interface = None
         self.tokenizer = None
 
-        # vLLM configuration
+        # Engine configuration.
+        # engine_type is a user-facing config value that selects which combination
+        # of backends to use for the LLM and TTS components:
+        #   "native"                 -> native_llm  + native_eartts
+        #   "vllm_llm"              -> vllm_llm    + native_eartts
+        #   "vllm_eartts"           -> native_llm  + vllm_eartts
+        #   "vllm_llm_vllm_eartts"  -> vllm_llm    + vllm_eartts
+        # The factory (create_model) uses the specific {backend}_{component}
+        # names: native_llm, native_eartts, vllm_llm, vllm_eartts.
         self.engine_type = model_cfg.get("engine_type", "native")
         self.use_vllm_llm = "vllm_llm" in self.engine_type.lower()
         self.use_vllm_eartts = "vllm_eartts" in self.engine_type.lower()
@@ -202,38 +209,25 @@ class NemotronVoicechatInferenceWrapper:
         )
         logging.info(f"NemotronVoiceChat initialized in {time.time() - start_model_init:.1f}s")
 
-        if self.use_vllm_eartts:
-            # Use object.__setattr__ to bypass PyTorch's module registration
-            # since VllmEARTTSModel is not a torch.nn.Module
-            del self.model.tts_model.tts_model
-            gc.collect()
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            object.__setattr__(
-                self.model.tts_model,
-                'tts_model',
-                create_model(
-                    model=self.model_path,
-                    engine_type="vllm_eartts",
-                    vllm_config=self.vllm_tts_config)
-            )
-            from nemo.collections.speechlm2.inference.vllm.vllm_patch import patched_infer_codes_one_step
-            self.model.tts_model.infer_codes_one_step = types.MethodType(patched_infer_codes_one_step, self.model.tts_model)
-
-        # If using vLLM for LLM, delete native LLM BEFORE moving to device to save memory
+        # Delete unused native components BEFORE moving to GPU to save memory
         if self.use_vllm_llm:
-            logging.info("Deleting native LLM before GPU transfer (will use vLLM instead)...")
+            logging.info("Deleting native LLM (will use vLLM instead)...")
             if hasattr(self.model.stt_model, 'llm') and self.model.stt_model.llm is not None:
-                # Delete all submodules of LLM to free memory
                 for name, child in list(self.model.stt_model.llm.named_children()):
                     delattr(self.model.stt_model.llm, name)
                 del self.model.stt_model.llm
                 self.model.stt_model.llm = None
+
+        if self.use_vllm_eartts:
+            logging.info("Deleting native TTS (will use vLLM instead)...")
+            del self.model.tts_model.tts_model
+
+        if self.use_vllm_llm or self.use_vllm_eartts:
+            # Free memory from deleted components before GPU transfer and vLLM engine creation
             gc.collect()
             torch.cuda.empty_cache()
-            logging.info("  Native LLM deleted")
 
-        # Setup model
+        # Setup model on device
         self.model.to(self.device)
         self.model.eval()
 
@@ -248,24 +242,6 @@ class NemotronVoicechatInferenceWrapper:
         if self.model.stt_model.function_head is not None:
             self.model.stt_model.function_head = self.model.stt_model.function_head.to(self.dtype)
             logging.info("function_head converted to %s", self.dtype)
-
-        # torch.compile for native TTS backbone
-        use_tts_torch_compile = bool(self.model_cfg.get("use_tts_torch_compile", False))
-        if use_tts_torch_compile and not self.use_vllm_eartts and hasattr(self.model, 'tts_model'):
-            tts_backbone = getattr(self.model.tts_model, 'tts_model', None)
-            if tts_backbone is not None and hasattr(tts_backbone, 'backbone'):
-                logging.info("Compiling TTS backbone with torch.compile(mode='default')...")
-                tts_backbone.backbone = torch.compile(tts_backbone.backbone, mode="default")
-                logging.info("  TTS backbone compiled")
-
-        # Inject TTS speedup flags into the TTS model config so ear_tts_model.py can read them
-        tts_inner = getattr(self.model.tts_model, 'tts_model', None) if hasattr(self.model, 'tts_model') else None
-        if tts_inner is not None and hasattr(tts_inner, 'config'):
-            if bool(self.model_cfg.get("use_tts_subword_cache", False)):
-                OmegaConf.update(tts_inner.config, "use_tts_subword_cache", True)
-                logging.info("TTS speedup enabled: use_tts_subword_cache")
-                if hasattr(tts_inner, 'embed_subword') and tts_inner.embed_subword is not None and hasattr(tts_inner.embed_subword, 'use_tts_subword_cache'):
-                    tts_inner.embed_subword.use_tts_subword_cache = True
 
         self.tokenizer = self.model.stt_model.tokenizer
 
@@ -285,16 +261,11 @@ class NemotronVoicechatInferenceWrapper:
         boost_values = {k: self.model.stt_model.cfg.get(k, None) for k in _BOOST_KEYS}
         logging.info(f"Inference logit boosts: {boost_values}")
 
-        # Wrap model with appropriate interface (Native or vLLM)
+        # Create LLM backend
         if self.use_vllm_llm:
-            logging.info("Wrapping model with VllmLLMModel interface...")
+            logging.info("Creating VLLMLLM backend...")
             if self.vllm_llm_config is None:
                 raise ValueError("vllm_llm_config must be provided when engine_type contains 'vllm_llm'")
-
-            # LLM already deleted above, just ensure cleanup
-            gc.collect()
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
 
             # Set logit boosts as env vars BEFORE creating the vLLM engine,
             # so they are inherited by the forked worker process.  The modified
@@ -325,26 +296,28 @@ class NemotronVoicechatInferenceWrapper:
                     os.environ[env_key] = str(float(val))
                     logging.info(f"Set env {env_key}={val} (from {cfg_key})")
 
-            self.model_llm_interface = create_model(
-                model=self.model_path,
-                engine_type="vllm_llm",
-                vllm_config=self.vllm_llm_config,
-                top_p=self.top_p,
-                repetition_penalty=self.repetition_penalty,
-                temperature=self.temperature,
-            )
+        self.model_llm_interface = create_model(
+            model=self.model_path if self.use_vllm_llm else self.model,
+            engine_type="vllm_llm" if self.use_vllm_llm else "native_llm",
+            vllm_config=self.vllm_llm_config if self.use_vllm_llm else None,
+            top_p=self.top_p,
+            repetition_penalty=self.repetition_penalty,
+            temperature=self.temperature,
+        )
+        logging.info(f"LLM backend: {type(self.model_llm_interface).__name__}")
 
-            logging.info("VllmLLMModel interface created")
-        else:
-            logging.info("Wrapping model with NativeModel interface...")
-            self.model_llm_interface = create_model(
-                model=self.model,
-                engine_type="native",
-                top_p=self.top_p,
-                repetition_penalty=self.repetition_penalty,
-                temperature=self.temperature,
-            )
-            logging.info("NativeModel interface created")
+        # Create TTS backend
+        self.model_eartts_interface = create_model(
+            model=self.model_path if self.use_vllm_eartts else self.model.tts_model,
+            engine_type="vllm_eartts" if self.use_vllm_eartts else "native_eartts",
+            vllm_config=self.vllm_tts_config if self.use_vllm_eartts else None,
+        )
+        logging.info(f"TTS backend: {type(self.model_eartts_interface).__name__}")
+
+        # torch.compile and subword cache (no-ops for vLLM, delegated to TTS backend)
+        if bool(self.model_cfg.get("use_tts_torch_compile", False)):
+            self.model_eartts_interface.compile()
+        self.model_eartts_interface.setup_subword_cache(self.model_cfg)
 
         # Get TTS info
         if hasattr(self.model, 'tts_model'):
@@ -491,15 +464,14 @@ class NemotronVoicechatInferenceWrapper:
             if self.use_vllm_eartts:
                 self.tts_prompt_token_ids = init_inputs["subword_ids"].squeeze().cpu().numpy().tolist()
                 self.tts_init_inputs = init_inputs
-                outputs = self.model.tts_model.tts_model(
-                    self.tts_init_inputs,
-                    request_id="tts_system_prompt_prefill_request",
-                    prompt_token_ids=self.tts_prompt_token_ids
-                )
-                # abort this request
-                self.model.tts_model.tts_model.abort_request("tts_system_prompt_prefill_request")
-            else:
-                outputs = self.model.tts_model.tts_model(**init_inputs)
+            outputs = self.model_eartts_interface.prefill_prompt(
+                init_inputs,
+                prompt_token_ids=getattr(self, 'tts_prompt_token_ids', None),
+                request_id="tts_warmup",
+            )
+            if self.use_vllm_eartts:
+                # Abort warmup request so the engine is clean for actual streaming
+                self.model_eartts_interface.abort_request("tts_warmup")
 
             code = init_inputs["code"][:, -1:]
 
@@ -832,20 +804,32 @@ class NemotronVoicechatInferenceWrapper:
             raise RuntimeError("generation_config is not initialized. Ensure TTS warmup ran successfully.")
 
         start_tts_model = time.time()
-        inputs = {
-            "current_subword_id": current_subword_id,
-            "prev_subword_id": prev_subword_id,
-            "current_subword_mask": current_subword_mask,
-            "prev_audio_tokens": state.tts_code,
-            "past_key_values": state.tts_past_key_values,
-            "guidance_enabled": True,
-            "generation_config": self.generation_config,
-            "ignore_eos_flag_stop": True,
-        }
         if self.use_vllm_eartts:
-            inputs["request_id"] = request_id
-
-        state.tts_code, state.tts_past_key_values = self.model.tts_model.infer_codes_one_step(**inputs)
+            tts_inputs = {
+                "code": state.tts_code,
+                "context_hidden_state": None,
+                "subword_ids": current_subword_id,
+                "subword_mask": current_subword_mask,
+                "past_key_values": state.tts_past_key_values,
+                "use_cache": True,
+                "guidance_enabled": True,
+                "generation_config": self.generation_config,
+                "ignore_eos_flag_stop": True,
+            }
+        else:
+            tts_inputs = {
+                "current_subword_id": current_subword_id,
+                "prev_subword_id": prev_subword_id,
+                "current_subword_mask": current_subword_mask,
+                "prev_audio_tokens": state.tts_code,
+                "past_key_values": state.tts_past_key_values,
+                "guidance_enabled": True,
+                "generation_config": self.generation_config,
+                "ignore_eos_flag_stop": True,
+            }
+        result = self.model_eartts_interface(tts_inputs, request_id=request_id)
+        state.tts_code = result.codes
+        state.tts_past_key_values = result.past_key_values
 
         if self._profile_timing:
             torch.cuda.synchronize()
@@ -984,8 +968,8 @@ class NemotronVoicechatInferenceWrapper:
                     logging.warning(f"Failed to abort LLM request {request_id}: {exc}")
 
         # Abort EarTTS if applicable
-        if self.use_vllm_eartts:
-            abort_fn = getattr(self.model.tts_model.tts_model, "abort_request", None)
+        if self.use_vllm_eartts and self.model_eartts_interface is not None:
+            abort_fn = getattr(self.model_eartts_interface, "abort_request", None)
             if callable(abort_fn):
                 try:
                     if abort_fn(request_id):

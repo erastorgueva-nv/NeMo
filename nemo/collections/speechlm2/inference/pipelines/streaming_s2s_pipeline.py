@@ -721,21 +721,18 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         engine_type = getattr(self.s2s_model, "engine_type", "native")
         tts_output_code = None
         
-        # Prefill TTS with speaker embedding when using vLLM EarTTS
-        # This initializes the vLLM TTS engine with the speaker context via prompt_token_ids
+        # Prefill TTS with speaker embedding via model_eartts_interface
         use_vllm_eartts = "vllm_eartts" in engine_type.lower()
         if use_vllm_eartts:
+            eartts = self.s2s_model.model_eartts_interface
             tts_init_inputs = getattr(self.s2s_model, "tts_init_inputs", None)
             tts_prompt_token_ids = getattr(self.s2s_model, "tts_prompt_token_ids", None)
             if tts_init_inputs is not None and tts_prompt_token_ids is not None:
                 logging.info(f"Prefilling TTS speaker embedding for stream {stream_id}...")
                 start_tts_prefill = time.time()
                 with torch.no_grad():
-                    tts_inputs_copy = copy.deepcopy(tts_init_inputs)
-                    tts_result = self.s2s_model.model.tts_model.tts_model(
-                        tts_inputs_copy,
-                        request_id=request_id,
-                        prompt_token_ids=tts_prompt_token_ids
+                    tts_result = eartts.prefill_prompt(
+                        tts_init_inputs, tts_prompt_token_ids, request_id,
                     )
                     # Capture the generated codes to sync context with vLLM state
                     if hasattr(tts_result, 'codes') and tts_result.codes is not None:
@@ -744,58 +741,48 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                 logging.info(f"TTS speaker embedding prefilled in {time.time() - start_tts_prefill:.3f}s")
             else:
                 logging.warning("TTS init inputs not available, skipping TTS prefill")
-        
+
         if not system_prompt:
             return tts_output_code
-        
+
+        # Prefill LLM with system prompt via model_llm_interface
         logging.info(f"Prefilling system prompt for stream {stream_id}...")
         start_get_prompt_embeddings = time.time()
         prompt_embedded, prompt_len = self.s2s_model._prepare_system_prompt_embeddings(system_prompt)
         logging.debug(f"Time taken to get prompt embeddings: {time.time() - start_get_prompt_embeddings:.3f}s")
-        
+
         if prompt_embedded is None:
             logging.warning("System prompt embedding returned None, skipping prefill")
             return tts_output_code
-        
-        # Check if using vLLM for LLM (matches vllm_llm, vllm_llm_vllm_eartts, etc.)
+
         use_vllm_llm = "vllm_llm" in engine_type.lower()
-        
+        llm = self.s2s_model.model_llm_interface
+
         if use_vllm_llm:
-            # For vLLM LLM: prefill all prompt embeddings in one shot
-            # (decode_steps=0 triggers a single bulk prefill in the vLLM engine)
             logging.info(f"Prefilling {prompt_len} prompt embeddings for vLLM LLM...")
             start_prefill = time.time()
             with torch.no_grad():
-                _ = self.s2s_model.model_llm_interface(
-                    prompt_embedded,
-                    request_id=request_id,
-                    decode_steps=0,
-                    prompt_token_ids=None,
-                )
+                llm.prefill_prompt(prompt_embedded, request_id=request_id)
             logging.info(f"System prompt prefilled ({prompt_len} tokens) in {time.time() - start_prefill:.3f}s")
-        
         else:
             context, _ = self.context_manager.get_context([stream_id])
             if context.llm_cache is not None:
-                # Native cache mode: process prompt through LLM to update KV cache
+                # Native cache mode: process prompt through LLM to warm up KV cache
                 with torch.no_grad():
                     cache_pos = torch.arange(prompt_len, device=self.s2s_model.device)
-                    llm_cache = context.llm_cache
-                    ans = self.s2s_model.model_llm_interface(
+                    ans = llm.prefill_prompt(
                         prompt_embedded,
-                        cache=llm_cache,
+                        cache=context.llm_cache,
                         cache_position=cache_pos,
-                        generated_tokens=None,
-                        current_step=0
                     )
-                    context.llm_cache = ans.get("cache", llm_cache)
+                    context.llm_cache = ans.get("cache", context.llm_cache)
                 context.llm_cache_position_offset = prompt_len
                 logging.info(f"System prompt processed, cache updated ({prompt_len} tokens, offset={prompt_len})")
             else:
                 for t in range(prompt_len):
                     context.input_embeds_history.append(prompt_embedded[:, t:t+1, :])
                 logging.info(f"Added {prompt_len} prompt embeddings to input_embeds_history")
-        
+
         return tts_output_code
 
     def _request_id_for_stream(self, stream_id: int) -> str:

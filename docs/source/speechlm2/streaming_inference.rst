@@ -24,7 +24,10 @@ The streaming inference stack has four layers:
          ▼
     Model Wrapper         NemotronVoicechatInferenceWrapper
          │                  - infer_one_step()
-         │                  - perception / LLM / TTS / codec
+         │                  - perception
+         │                  - model_llm_interface    (PyTorchLLM  or VLLMLLM)
+         │                  - model_eartts_interface (PyTorchEarTTS or VLLMEarTTS)
+         │                  - codec decode
          ▼
     Model                 NemotronVoiceChat
                             - DuplexSTTModel + DuplexEARTTS
@@ -174,6 +177,113 @@ The pipeline maintains two separate state objects per stream:
     Lives in the pipeline's ``_state_pool``.  Accumulates generated audio
     chunks, text strings, and word timings across steps.  Kept alive until
     ``close_session()`` so the final ``PipelineOutput`` can be assembled.
+
+
+Inference Backends
+^^^^^^^^^^^^^^^^^^
+
+NemotronVoiceChat has two inference components that each need a backend:
+
+- **LLM** (DuplexSTT backbone) -- takes audio embeddings from the perception
+  encoder and predicts text tokens, ASR tokens, and optional function-call
+  tokens at each frame.
+- **TTS** (EarTTS) -- takes the predicted text token and produces audio codec
+  codes (RVQ acoustic tokens).
+
+Each component can run on **native PyTorch** or **vLLM**, selected by the
+``engine_type`` config value:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 30 30
+
+   * - ``engine_type``
+     - LLM backend
+     - TTS backend
+   * - ``native``
+     - ``PyTorchLLM``
+     - ``PyTorchEarTTS``
+   * - ``vllm_llm``
+     - ``VLLMLLM``
+     - ``PyTorchEarTTS``
+   * - ``vllm_eartts``
+     - ``PyTorchLLM``
+     - ``VLLMEarTTS``
+   * - ``vllm_llm_vllm_eartts``
+     - ``VLLMLLM``
+     - ``VLLMEarTTS``
+
+All four backend classes implement the same ``ModelInterface`` ABC (defined in
+``inference.model_wrappers.backend.interface``), so the inference wrapper
+(``NemotronVoicechatInferenceWrapper``) can treat them uniformly via two
+attributes:
+
+- ``model_llm_interface`` -- the LLM backend
+- ``model_eartts_interface`` -- the TTS backend
+
+The backend classes live under ``inference.model_wrappers.backend/``:
+
+.. code-block:: text
+
+    backend/
+        interface.py            # ModelInterface ABC + shared sampling
+        pytorch/
+            model.py            # PyTorchLLM  (wraps DuplexSTT forward pass)
+            eartts.py           # PyTorchEarTTS  (wraps DuplexEARTTS.infer_codes_one_step)
+        vllm/
+            base.py             # VLLMModelBase  (engine lifecycle, async loop)
+            llm.py              # VLLMLLM  (DuplexSTT via vLLM)
+            eartts.py           # VLLMEarTTS  (EarTTS via vLLM)
+    factory.py                  # create_model()  dispatches to the right class
+
+``ModelInterface`` provides shared utilities used by the LLM backends:
+top-p (nucleus) sampling, repetition penalty, and temperature scaling.
+These are applied **post-hoc** on the returned logits -- vLLM internally
+runs with ``skip_sampling=True`` and greedy decoding.
+
+Each backend also exposes lifecycle methods that the wrapper calls uniformly:
+
+- ``prefill_prompt(embeddings, ...)`` -- Warm up KV cache (native) or
+  prefill the vLLM engine with system-prompt embeddings before streaming.
+- ``compile()`` -- Apply ``torch.compile`` to the TTS backbone (native
+  only; no-op for vLLM).
+- ``setup_subword_cache(cfg)`` -- Enable the TTS subword embedding cache
+  (native only; no-op for vLLM).
+
+The ``factory.create_model()`` function is the single entry point that
+dispatches to the correct class based on a per-component ``engine_type``
+string (``native_llm``, ``native_eartts``, ``vllm_llm``, ``vllm_eartts``).
+
+vLLM Integration Details
+""""""""""""""""""""""""
+
+When ``engine_type`` includes ``vllm``, the pipeline loads vLLM engines
+**in-process** alongside the native PyTorch components -- there is no
+disaggregated multi-server setup.  Each vLLM component runs as an
+``AsyncLLM`` engine in the same Python process, sharing GPU memory with the
+native perception encoder and codec decoder.
+
+The vLLM engines manage their own KV caches via PagedAttention.  Both
+``VLLMLLM`` and ``VLLMEarTTS`` inherit from ``VLLMModelBase``, which wraps a
+``CustomInputAsyncVLLMEngine`` (defined in ``inference.vllm.streaming_llm_engine``)
+and provides:
+
+- An internal ``asyncio`` event loop for blocking synchronous calls
+- Request lifecycle management (start, abort, restart)
+- Automatic checkpoint conversion to vLLM format on first use
+
+``CustomInputAsyncVLLMEngine`` is a thin wrapper around vLLM's ``AsyncLLM``
+that adds support for custom input tensor specifications (multi-tensor
+inputs like audio embeddings, subword IDs, speaker latents).  The
+``engine_kind`` parameter (``"llm"`` or ``"eartts"``) selects EarTTS-specific
+runtime settings (TRITON attention backend, TF32 precision, guidance scale)
+without introducing inheritance between TTS and LLM engine classes.
+
+This requires a custom vLLM fork with NemotronVoiceChat model support:
+
+.. code-block:: bash
+
+    pip install git+https://github.com/vklimkov-nvidia/vllm@vklimkov/voicechat
 
 
 Configuration

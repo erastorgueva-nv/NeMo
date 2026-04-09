@@ -13,15 +13,18 @@
 # limitations under the License.
 
 """
-Speech Streaming Engine Wrapper
-A clean wrapper for streaming speech-to-speech generation with custom embeddings.
+Async vLLM engine wrapper for models that use custom input tensors.
+
+Wraps vLLM's ``AsyncLLM`` for streaming step-by-step inference with
+``custom_inputs`` (used by both DuplexSTT/LLM and EarTTS backends).
+``engine_kind`` selects EarTTS-only runtime settings (guidance scale, attention
+backend env); it does not imply an inheritance relationship between TTS and LLM.
 """
 
 import os
 import json
 import torch
-import asyncio
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Literal
 from dataclasses import dataclass
 from enum import Enum
 
@@ -57,42 +60,61 @@ class RequestState:
     generation_iterator: AsyncGenerator | None = None
 
 
-class LLMStreamingEngine:
+class CustomInputAsyncVLLMEngine:
     """
-    A wrapper for vLLM AsyncLLM engine that enables:
-    - Easy initialization with speech model configuration
-    - Start/stop streaming with custom embeddings
-    - Generate one token at a time
-    - Abort ongoing generation
+    Wrapper for vLLM ``AsyncLLM`` with custom input tensor specifications.
+
+    KV cache is managed entirely inside the AsyncLLM engine -- callers do not
+    allocate, pass, or update cache objects.  The engine uses PagedAttention to
+    manage GPU memory automatically.  Per-request state (generated tokens,
+    generation iterator, status) is tracked in ``self.requests`` dicts.
+
+    Provides:
+    - Start/stop streaming with custom embedding inputs
+    - Generate one token at a time via ``generate_next_token``
+    - Abort / restart individual requests by ``request_id``
     """
 
     def __init__(
         self,
-        model_path: str = "/ws/ckpt/converted",
+        model_path: str,
         max_model_len: int = 10240,
+        max_num_batched_tokens: int = 768,
         gpu_memory_utilization: float = 0.8,
         trust_remote_code: bool = True,
         dtype: str = "bfloat16",
         skip_tokenizer_init: bool = False,
+        engine_kind: Literal["llm", "eartts"] = "llm",
         **sampling_kwargs
     ):
         """
-        Initialize the Speech Streaming Engine.
+        Initialize the async vLLM engine wrapper.
 
         Args:
-            model_path: Path to the speech model (default: "/ws/ckpt/converted")
+            model_path: Path to the vLLM-compatible model checkpoint (required)
             max_model_len: Maximum sequence length (default: 10240)
+            max_num_batched_tokens: Maximum tokens processed per forward pass.
+                Controls prefill chunk size and max concurrent decode streams.
+                Default: 768.
             gpu_memory_utilization: GPU memory utilization ratio (default: 0.8)
             trust_remote_code: Whether to trust remote code (default: True)
             dtype: Data type for embeddings (default: "bfloat16")
-            **sampling_kwargs: Additional sampling parameters (max_tokens, temperature, top_p, top_k, seed, stop, stop_token_ids, ignore_eos)
+            engine_kind: ``"llm"`` for DuplexSTT-style models; ``"eartts"`` applies
+                EarTTS-specific ``guidance_scale`` and attention/runtime env during init.
+            **sampling_kwargs: Additional vLLM sampling parameters.
+                Note: vLLM is configured for greedy decoding internally
+                (temperature=0, ignore_eos=True). Actual text sampling
+                (top-p, repetition penalty) is applied post-hoc by
+                ModelInterface._sample_text_token, not by vLLM.
         """
         self.model_path = model_path
         self.max_model_len = max_model_len
+        self.max_num_batched_tokens = max_num_batched_tokens
         self.gpu_memory_utilization = gpu_memory_utilization
         self.trust_remote_code = trust_remote_code
         self.dtype = dtype
         self.skip_tokenizer_init = skip_tokenizer_init
+        self.engine_kind = engine_kind
 
         # Engine state
         self.engine: AsyncLLM | None = None
@@ -100,21 +122,46 @@ class LLMStreamingEngine:
         # Request state tracking - supports multiple concurrent requests
         self.requests: dict[str, RequestState] = {}
 
-        # Default sampling parameters
+        # vLLM sampling is disabled (skip_sampling=True) because we handle
+        # token selection ourselves for both the LLM and EarTTS paths.
+        # For LLM: text sampling (top-p, repetition penalty) is applied
+        # post-hoc by ModelInterface._sample_text_token on the returned logits.
+        # For EarTTS: acoustic tokens are produced by the model's own forward
+        # pass (RVQ codebook prediction), not by vLLM's sampler.
         default_sampling = {
             "max_tokens": 100000, # Set very high to prevent stopping - use abort to stop explicitly
-            "temperature": 0.0,
-            "top_p": 0.9,
-            "top_k": 50,
-            "seed": None,
-            "stop": [],
-            "stop_token_ids": [],
+            "skip_sampling": True,
             "ignore_eos": True,
         }
         default_sampling.update(sampling_kwargs)
         self.sampling_params = SamplingParams(**default_sampling)
 
-        logging.info(f"LLMStreamingEngine initialized for model: {model_path}")
+        if self.engine_kind == "eartts":
+            guidance_scale = self._read_guidance_scale_from_config()
+            self.sampling_params.guidance_scale = guidance_scale
+            logging.info(
+                f"CustomInputAsyncVLLMEngine initialized (engine_kind=eartts, "
+                f"guidance_scale={guidance_scale}, model={model_path})"
+            )
+        else:
+            logging.info(
+                f"CustomInputAsyncVLLMEngine initialized (engine_kind=llm, model={model_path})"
+            )
+
+    def _read_guidance_scale_from_config(self) -> float:
+        """Read guidance_scale from the converted vLLM model's config.json."""
+        config_path = os.path.join(self.model_path, "config.json")
+        if os.path.isfile(config_path):
+            with open(config_path, "r") as f:
+                cfg = json.load(f)
+            value = cfg.get("guidance_scale", None)
+            if value is not None:
+                logging.info(f"Read guidance_scale={value} from {config_path}")
+                return float(value)
+        logging.warning(
+            f"guidance_scale not found in {config_path}, using default 0.5."
+        )
+        return 0.5
 
     async def initialize(self):
         """Initialize the vLLM engine with custom input specifications."""
@@ -124,31 +171,45 @@ class LLMStreamingEngine:
 
         logging.info("Initializing vLLM engine...")
 
-        # Create engine arguments
+        eartts_env = self.engine_kind == "eartts"
+        if eartts_env:
+            # Force TRITON_ATTN backend for EarTTS
+            os.environ["VLLM_ATTENTION_BACKEND"] = "TRITON_ATTN"
+            # TF32 matmul precision to match TTS training ("medium").
+            # torch.set_float32_matmul_precision is process-local and does NOT
+            # propagate to vLLM's spawned worker processes; this CUDA-level env
+            # var is inherited by child processes.
+            os.environ["NVIDIA_TF32_OVERRIDE"] = "1"
+            _cached_get_attn_backend.cache_clear()
 
-        engine_args = AsyncEngineArgs(
-            model=self.model_path,
-            max_model_len=self.max_model_len,
-            max_num_batched_tokens=768,
-            gpu_memory_utilization=self.gpu_memory_utilization,
-            trust_remote_code=self.trust_remote_code,
-            mamba_ssm_cache_dtype="float32",
-            dtype=self.dtype,
-            skip_tokenizer_init=self.skip_tokenizer_init,
-            enable_prefix_caching=False
-        )
+        try:
+            engine_args = AsyncEngineArgs(
+                model=self.model_path,
+                max_model_len=self.max_model_len,
+                max_num_batched_tokens=self.max_num_batched_tokens,
+                gpu_memory_utilization=self.gpu_memory_utilization,
+                trust_remote_code=self.trust_remote_code,
+                mamba_ssm_cache_dtype="float32",
+                dtype=self.dtype,
+                skip_tokenizer_init=self.skip_tokenizer_init,
+                enable_prefix_caching=False
+            )
 
-        # please custom input/output specs in model config file
-        # Create engine config and add custom input specs
-        vllm_config = engine_args.create_engine_config()
-        self.custom_input_specs = vllm_config.model_config.custom_input_specs
+            # Custom input/output specs are defined in the model's config file
+            vllm_config = engine_args.create_engine_config()
+            self.custom_input_specs = vllm_config.model_config.custom_input_specs
 
-        # Initialize the engine
-        self.engine = AsyncLLM.from_vllm_config(vllm_config)
+            # Initialize the engine
+            self.engine = AsyncLLM.from_vllm_config(vllm_config)
 
-        logging.info("Engine initialized with custom input specs:")
-        for spec in self.custom_input_specs:
-            logging.info(f"  - {spec}")
+            logging.info("Engine initialized with custom input specs:")
+            for spec in self.custom_input_specs:
+                logging.info(f"  - {spec}")
+        finally:
+            if eartts_env:
+                os.environ.pop("VLLM_ATTENTION_BACKEND", None)
+                os.environ.pop("NVIDIA_TF32_OVERRIDE", None)
+                _cached_get_attn_backend.cache_clear()
 
     def _get_safe_prompt_tokens(self, length: int = 10) -> list[int]:
         """Generate safe prompt tokens that won't cause immediate EOS."""
@@ -229,7 +290,7 @@ class LLMStreamingEngine:
             input_dtype = spec.dtype
             if input_dtype is None:
                 input_dtype = "float32"  # Default dtype
-            if spec.dim !=None and spec.dim != input_tensors[i].shape[-1]:
+            if spec.dim is not None and spec.dim != input_tensors[i].shape[-1]:
                 raise ValueError(f"Input tensor dimension mismatch for {spec.name}: expected {spec.dim}, got {input_tensors[i].shape[-1]}")
             custom_inputs[spec.name] = input_tensors[i].to(dtype=getattr(torch, input_dtype)).cpu()
             max_length = max(max_length, input_tensors[i].shape[0])
@@ -412,68 +473,21 @@ class LLMStreamingEngine:
         await self.shutdown()
 
 
-class EARTTSStreamingEngine(LLMStreamingEngine):
+def create_engine(engine_type: str = "llm", **kwargs) -> CustomInputAsyncVLLMEngine:
     """
-    A specialized streaming engine for EARTTS models.
-    Inherits from LLMStreamingEngine and sets EARTTS-specific configurations.
-    """
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        guidance_scale = self._read_guidance_scale_from_config()
-        default_sampling = {
-            "max_tokens": 100000, # Set very high to prevent stopping - use abort to stop explicitly
-            "temperature": 0.0,
-            "skip_sampling": True,
-            "ignore_eos": True,
-            "guidance_scale": guidance_scale,
-        }
-        self.sampling_params = SamplingParams(**default_sampling)
-        logging.info(f"EARTTSStreamingEngine initialized (guidance_scale={guidance_scale}).")
-
-    def _read_guidance_scale_from_config(self) -> float:
-        """Read guidance_scale from the converted vLLM model's config.json."""
-        config_path = os.path.join(self.model_path, "config.json")
-        if os.path.isfile(config_path):
-            with open(config_path, "r") as f:
-                cfg = json.load(f)
-            value = cfg.get("guidance_scale", None)
-            if value is not None:
-                logging.info(f"Read guidance_scale={value} from {config_path}")
-                return float(value)
-        logging.warning(
-            f"guidance_scale not found in {config_path}, using default 0.5. "
-        )
-        return 0.5
-
-    async def initialize(self):
-        # Force TRITON_ATTN backend for EarTTS
-        os.environ["VLLM_ATTENTION_BACKEND"] = "TRITON_ATTN"
-        # TF32 matmul precision to match TTS training ("medium").
-        # torch.set_float32_matmul_precision is process-local and does NOT
-        # propagate to vLLM's spawned worker processes; this CUDA-level env
-        # var is inherited by child processes.
-        os.environ["NVIDIA_TF32_OVERRIDE"] = "1"
-        _cached_get_attn_backend.cache_clear()
-        await super().initialize()
-        os.environ.pop("VLLM_ATTENTION_BACKEND", None)
-        os.environ.pop("NVIDIA_TF32_OVERRIDE", None)
-        _cached_get_attn_backend.cache_clear()
-
-
-def create_engine(engine_type: str = "llm", **kwargs) -> LLMStreamingEngine:
-    """
-    Factory function to create a streaming engine instance.
+    Factory function to create a CustomInputAsyncVLLMEngine instance.
 
     Args:
-        engine_type: Type of the engine ("eartts" or "llm", default: "llm")
-        **kwargs: Additional arguments for engine initialization (model_path, max_model_len, gpu_memory_utilization, trust_remote_code, dtype, and sampling parameters)
+        engine_type: ``"llm"`` or ``"eartts"`` (maps to ``engine_kind``).
+        **kwargs: Passed to the engine (model_path, max_model_len, etc.).
     Returns:
-        An instance of LLMStreamingEngine or its subclass
+        A configured ``CustomInputAsyncVLLMEngine``.
     """
 
     if engine_type == "eartts":
-        return EARTTSStreamingEngine(**kwargs)
+        return CustomInputAsyncVLLMEngine(engine_kind="eartts", **kwargs)
     elif engine_type == "llm":
-        return LLMStreamingEngine(**kwargs)
+        return CustomInputAsyncVLLMEngine(engine_kind="llm", **kwargs)
     else:
         raise ValueError(f"Unsupported engine_type: {engine_type}")
+

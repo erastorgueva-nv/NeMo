@@ -33,6 +33,7 @@ s2s:
   vllm_llm_config:
     model_path: ${s2s.model_path}             # Inherits from s2s.model_path
     max_model_len: 8192                       # Maximum sequence length for vLLM
+    max_num_batched_tokens: 768               # Max tokens per forward pass (prefill chunk size)
     gpu_memory_utilization: 0.35               # GPU memory utilization (0.0-1.0)
     dtype: bfloat16                           # Data type for vLLM inference
     engine_path: null                         # Path to vLLM engine (null = auto-convert if needed)
@@ -41,6 +42,7 @@ s2s:
   vllm_tts_config:
     model_path: ${s2s.vllm_llm_config.model_path}             # Inherits from s2s.model_path
     max_model_len: ${s2s.vllm_llm_config.max_model_len}
+    max_num_batched_tokens: ${s2s.vllm_llm_config.max_num_batched_tokens}
     gpu_memory_utilization: ${s2s.vllm_llm_config.gpu_memory_utilization}
     dtype: float32                              # EarTTS requires float32 for proper audio quality (bfloat16 causes hallucinations)
     engine_path: null
