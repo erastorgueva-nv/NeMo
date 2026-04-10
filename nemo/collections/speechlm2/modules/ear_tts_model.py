@@ -999,6 +999,7 @@ class CharAwareSubwordEncoder(nn.Module):
 
         # Cache results for future lookups
         if not self.training and self.use_tts_subword_cache:
+            valid_ids = torch.masked_select(subword_ids, subword_mask).tolist()
             valid_embeds = subword_embeds[subword_mask].detach()
             for idx, sid in enumerate(valid_ids):
                 self._inference_cache[sid] = valid_embeds[idx]

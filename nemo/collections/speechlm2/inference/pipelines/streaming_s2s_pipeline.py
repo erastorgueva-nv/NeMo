@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 import os
 import time
 from dataclasses import dataclass
@@ -525,16 +524,16 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                     try:
                         with open(os.path.join(txt_dir, f"{base}.txt"), "w", encoding="utf-8") as f:
                             f.write(text_out)
-                    except Exception:
-                        pass
+                    except OSError:
+                        logging.warning(f"Failed to write text output for {base}")
 
                 asr_text_out = state.output_asr_text_str
                 if isinstance(asr_text_out, str) and asr_text_out:
                     try:
                         with open(os.path.join(txt_dir, f"{base}_asr.txt"), "w", encoding="utf-8") as f:
                             f.write(asr_text_out)
-                    except Exception:
-                        pass
+                    except OSError:
+                        logging.warning(f"Failed to write ASR text output for {base}")
 
                 saved_paths_by_stream[stream_id] = out_path
                 # Keep state in _state_pool until _build_pipeline_output;
@@ -660,7 +659,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                 if gen_function_text is not None:
                     fc_text = tokens_to_str(gen_function_text, lengths, tokenizer=tokenizer, pad_id=pad_id, eval_text_turn_taking=False)[0]
                     fc_text_raw = tokens_to_str(gen_function_text, lengths, tokenizer=tokenizer, pad_id=pad_id, keep_pad=True)[0]
-                    logging.info(f"Function calling channel: {fc_text}")
+                    logging.info(f"Function calling channel: {fc_text}, fc_text_raw: {fc_text_raw}")
             else:
                 token_texts.append(None)
                 token_asr_texts.append(None)
@@ -732,7 +731,9 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                 start_tts_prefill = time.time()
                 with torch.no_grad():
                     tts_result = eartts.prefill_prompt(
-                        tts_init_inputs, tts_prompt_token_ids, request_id,
+                        tts_init_inputs,
+                        prompt_token_ids=tts_prompt_token_ids,
+                        request_id=request_id,
                     )
                     # Capture the generated codes to sync context with vLLM state
                     if hasattr(tts_result, 'codes') and tts_result.codes is not None:

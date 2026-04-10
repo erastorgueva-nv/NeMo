@@ -175,7 +175,7 @@ class VLLMEarTTS(VLLMModelBase):
             past_key_values=None  # vLLM manages cache internally
         )
 
-    def prefill_prompt(self, init_inputs, prompt_token_ids, request_id: str, **kwargs):
+    def prefill_prompt(self, init_inputs, prompt_token_ids=None, request_id=None, **kwargs):
         """Prefill vLLM EarTTS engine with speaker embedding context.
 
         Args:

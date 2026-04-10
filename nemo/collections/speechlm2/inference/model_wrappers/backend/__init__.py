@@ -20,4 +20,4 @@ try:
     from nemo.collections.speechlm2.inference.model_wrappers.backend.vllm.llm import VLLMLLM
     from nemo.collections.speechlm2.inference.model_wrappers.backend.vllm.eartts import VLLMEarTTS
 except ImportError:
-    pass
+    pass  # vLLM is an optional dependency

@@ -235,7 +235,7 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
             tts_model_cfg['pretrained_model'] = None
             tts_model_cfg['pretrained_codec_model'] = None
         except (KeyError, TypeError):
-            pass
+            logging.warning("Could not nullify pretrained TTS/codec paths in nested TTS config")
 
         # Instantiate the empty model skeleton
         model = cls(model_kwargs['cfg'])

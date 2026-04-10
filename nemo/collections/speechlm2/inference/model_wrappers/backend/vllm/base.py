@@ -219,6 +219,10 @@ class VLLMModelBase(ModelInterface):
                 try:
                     await self.engine.abort_generation(request_id)
                 except Exception:
+                    # The request already finished/aborted; abort_generation
+                    # is just releasing engine-side resources.  If the engine
+                    # already purged it, the call may raise -- harmless since
+                    # we start a fresh generation immediately after.
                     pass
                 await self.engine.start_generation(request_id=request_id)
 
@@ -300,4 +304,8 @@ class VLLMModelBase(ModelInterface):
         try:
             self.shutdown()
         except Exception:
+            # __del__ may run during interpreter shutdown when globals
+            # (self._loop, self.engine, asyncio) are already torn down.
+            # Nothing useful to do with the error; suppress to avoid
+            # noisy tracebacks on exit.
             pass

@@ -21,7 +21,6 @@ instead of re-encoding the entire buffer.
 """
 
 import copy
-import time
 from dataclasses import dataclass
 
 import torch
