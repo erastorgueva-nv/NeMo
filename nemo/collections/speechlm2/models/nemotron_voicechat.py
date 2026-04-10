@@ -646,8 +646,8 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
         T = inference_state["T"]
 
         if return_logits:
-            _text_logits = [ans["text_logits"][:, -1].detach().cpu()]
-            _asr_logits = [ans["asr_logits"][:, -1].detach().cpu()] if "asr_logits" in ans else []
+            _text_logits = [ans["text_logits"][:, -1].detach()]
+            _asr_logits = [ans["asr_logits"][:, -1].detach()] if "asr_logits" in ans else []
 
         # if speaker_name is provided uses it, if not uses the speaker_audio provided, if speaker_audio is None load it from inference_speaker_reference
         if speaker_audio is None:
@@ -699,9 +699,9 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
             ans = self.stt_model.streaming_inference._step_inference(t, inference_state, ans)
 
             if return_logits:
-                _text_logits.append(ans["text_logits"][:, -1].detach().cpu())
+                _text_logits.append(ans["text_logits"][:, -1].detach())
                 if "asr_logits" in ans:
-                    _asr_logits.append(ans["asr_logits"][:, -1].detach().cpu())
+                    _asr_logits.append(ans["asr_logits"][:, -1].detach())
 
             # do one step inference on Duplex TTS model
             # current subword id is always seem
@@ -738,7 +738,7 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
                     audio_pred = torch.cat([audio_pred, audio_pred_i], dim=1)
                 audio_pred_len += audio_pred_i_len
 
-            logging.info(f"Autoregressive inference step: {t} of {T} !")
+            logging.debug(f"Autoregressive inference step: {t} of {T} !")
 
         # Trim back to local length if padded
         if self._use_fsdp and T > inference_state["T_local"]:

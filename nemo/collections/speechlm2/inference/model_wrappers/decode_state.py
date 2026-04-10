@@ -78,3 +78,60 @@ class InferenceStepResult:
     decoded_audio: torch.Tensor | None = None
     function_predicted_text_tokens: torch.Tensor | None = None
     debug: dict | None = None
+
+
+class IntermediateResultLogger:
+    """Records per-frame debug data (logits, embeddings, indices) during inference.
+
+    Tensors are kept on their original device until :meth:`build_debug_dict`
+    is called, which performs a single bulk copy to CPU.
+    """
+
+    def __init__(self):
+        self.text_logits: list[torch.Tensor] = []
+        self.asr_logits: list[torch.Tensor] = []
+        self.input_embeds: list[torch.Tensor] = []
+        self.selected_frame_indices: list[int] = []
+
+    def log_input_embeds(self, emb: torch.Tensor):
+        self.input_embeds.append(emb.detach())
+
+    def log_text_logits(self, logits: torch.Tensor):
+        self.text_logits.append(logits.detach())
+
+    def log_asr_logits(self, logits: torch.Tensor | None):
+        if logits is not None:
+            self.asr_logits.append(logits.detach())
+
+    def log_selected_frame_index(self, idx: int):
+        self.selected_frame_indices.append(idx)
+
+    def build_debug_dict(self, source_encoded: torch.Tensor, gen_text: torch.Tensor, gen_asr_text: torch.Tensor | None) -> dict:
+        return {
+            "source_encoded": source_encoded.detach().cpu(),
+            "selected_frame_indices": self.selected_frame_indices,
+            "input_embeds": torch.cat(self.input_embeds, dim=1).cpu() if self.input_embeds else None,
+            "gen_text": gen_text.detach().cpu(),
+            "gen_asr": gen_asr_text.detach().cpu() if gen_asr_text is not None else None,
+            "text_logits": torch.stack(self.text_logits, dim=1).cpu() if self.text_logits else None,
+            "asr_logits": torch.stack(self.asr_logits, dim=1).cpu() if self.asr_logits else None,
+        }
+
+
+class NullIntermediateResultLogger:
+    """No-op stand-in for :class:`IntermediateResultLogger`."""
+
+    def log_input_embeds(self, emb):
+        pass
+
+    def log_text_logits(self, logits):
+        pass
+
+    def log_asr_logits(self, logits):
+        pass
+
+    def log_selected_frame_index(self, idx):
+        pass
+
+    def build_debug_dict(self, *args, **kwargs):
+        return None

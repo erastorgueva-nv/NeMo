@@ -309,10 +309,16 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
         self.context_manager.reset_slots(stream_ids, eos_flags)
         
-        # Explicitly clean up bufferer and state for finished streams
+        # Log summary and clean up finished streams
         for stream_id, eos_flag in zip(stream_ids, eos_flags):
             if eos_flag:
-                logging.debug(f"Ending stream {stream_id} - cleaning up bufferer and context")
+                state = self.get_state(stream_id)
+                audio_sec = state.audio_buffer.shape[-1] / self.output_sample_rate if self.output_sample_rate > 0 else 0
+                logging.info(
+                    f"Stream {stream_id} finished: {state.final_total_frames} frames, "
+                    f"{audio_sec:.1f}s audio, "
+                    f"agent: {state.output_text_str!r}, user: {state.output_asr_text_str!r}"
+                )
                 self.bufferer.rm_bufferer(stream_id)
                 self._abort_stream_request(stream_id)
                 # Note: We keep the state in _state_pool until finalization to save audio

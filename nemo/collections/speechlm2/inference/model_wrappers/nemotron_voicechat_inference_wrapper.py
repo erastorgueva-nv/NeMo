@@ -34,6 +34,8 @@ from nemo.collections.speechlm2.inference.model_wrappers.perception_cache import
 )
 from nemo.collections.speechlm2.inference.model_wrappers.decode_state import (
     InferenceStepResult,
+    IntermediateResultLogger,
+    NullIntermediateResultLogger,
     StreamingDecodeState,
 )
 from nemo.collections.speechlm2.parts.text_utils import _decode_tokens_with_specials
@@ -552,7 +554,7 @@ class NemotronVoicechatInferenceWrapper:
         if self.model.stt_model.function_head is not None:
             function_predicted_tokens = torch.empty((B, num_frames_per_chunk), dtype=state.gen_text.dtype, device=state.gen_text.device)
 
-        debug_text_logits, debug_asr_logits, debug_input_embeds, selected_frame_indices = [], [], [], []
+        debug_logger = IntermediateResultLogger() if return_debug else NullIntermediateResultLogger()
 
         # --- Stage 1: Perception ---
         source_encoded, state.perception_cache = self._run_perception(
@@ -576,14 +578,13 @@ class NemotronVoicechatInferenceWrapper:
         for frame_offset in range(num_frames_per_chunk):
             current_frame_idx = frame_idx + frame_offset
             current_frame_index = min(base_frame_index + frame_offset, source_encoded.shape[1] - 1)
-            selected_frame_indices.append(current_frame_index)
+            debug_logger.log_selected_frame_index(current_frame_index)
             frame_embedding = source_encoded[:, current_frame_index:current_frame_index + 1, :]
 
             input_emb = self._build_input_embedding(
                 frame_embedding, current_frame_idx, state, has_prompt,
             )
-            if return_debug:
-                debug_input_embeds.append(input_emb.detach().cpu())
+            debug_logger.log_input_embeds(input_emb)
 
             ans = self._run_llm_step(
                 input_emb, state, frame_offset, effective_request_id,
@@ -591,10 +592,11 @@ class NemotronVoicechatInferenceWrapper:
                 sampling_params=sampling_params,
             )
 
-            if return_debug and "text_logits" in ans:
-                debug_text_logits.append(ans["text_logits"][:, -1].detach().cpu())
-            if return_debug and "asr_logits" in ans and ans["asr_logits"] is not None:
-                debug_asr_logits.append(ans["asr_logits"][:, -1].detach().cpu())
+            if "text_logits" in ans:
+                debug_logger.log_text_logits(ans["text_logits"][:, -1])
+            asr_logits = ans.get("asr_logits")
+            if asr_logits is not None:
+                debug_logger.log_asr_logits(asr_logits[:, -1])
 
             state.gen_text[:, current_frame_idx] = ans["predicted_token"]
             predicted_tokens[:, frame_offset] = ans["predicted_token"]
@@ -623,8 +625,8 @@ class NemotronVoicechatInferenceWrapper:
         predicted_text_strs = self._tokens_to_strings(predicted_tokens)
         asr_predicted_text_strs = self._tokens_to_strings(asr_predicted_tokens)
 
-        logging.info(f'frame {frame_idx}: USER asr: {asr_predicted_text_strs}')
-        logging.info(f'frame {frame_idx}: AGENT txt: {predicted_text_strs}')
+        logging.debug(f'frame {frame_idx}: USER asr: {asr_predicted_text_strs}')
+        logging.debug(f'frame {frame_idx}: AGENT txt: {predicted_text_strs}')
 
         # --- Update remaining state fields ---
         if not use_llm_cache:
@@ -637,17 +639,7 @@ class NemotronVoicechatInferenceWrapper:
             time_for_one_step = time.time() - start_time_one_step
             logging.info(f'frame {frame_idx}: Time taken for one step: {time_for_one_step:.3f}s')
 
-        debug = None
-        if return_debug:
-            debug = {
-                "source_encoded": source_encoded.detach().cpu(),
-                "selected_frame_indices": selected_frame_indices,
-                "input_embeds": torch.cat(debug_input_embeds, dim=1) if debug_input_embeds else None,
-                "gen_text": state.gen_text.detach().cpu(),
-                "gen_asr": state.gen_asr_text.detach().cpu() if state.gen_asr_text is not None else None,
-                "text_logits": torch.stack(debug_text_logits, dim=1) if debug_text_logits else None,
-                "asr_logits": torch.stack(debug_asr_logits, dim=1) if debug_asr_logits else None,
-            }
+        debug = debug_logger.build_debug_dict(source_encoded, state.gen_text, state.gen_asr_text)
 
         return InferenceStepResult(
             predicted_text_tokens=predicted_tokens,
@@ -863,7 +855,7 @@ class NemotronVoicechatInferenceWrapper:
         if not self.decode_audio or not new_codes_for_decode:
             return None
 
-        logging.info(f"Decoding audio for {frame_idx}-th frame  ({num_frames_per_chunk=})")
+        logging.debug(f"Decoding audio for {frame_idx}-th frame  ({num_frames_per_chunk=})")
 
         start_time_decode = time.time()
         with fp32_precision(), torch.no_grad():

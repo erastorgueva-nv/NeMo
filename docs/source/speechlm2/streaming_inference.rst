@@ -89,9 +89,19 @@ over chunks and calls a single step method:
 
     pipeline.open_session()
     for frames in streamer:
-        pipeline.generate_step(frames)
+        # Each call returns partial results for this chunk only
+        step_outputs = pipeline.generate_step(frames)
+        for out in step_outputs:
+            # out.text / out.asr_text: new tokens from this step
+            # out.audio: newly decoded audio for this step
+            print(f"[stream {out.stream_id}] agent: {out.text}  user: {out.asr_text}")
     pipeline.close_session()
-    return PipelineOutput(...)
+    return PipelineOutput(...)  # aggregated final results
+
+Each ``generate_step()`` call returns a list of ``GenerateStepOutput`` carrying
+the partial text, ASR text, and audio produced by that single chunk.  The
+``PipelineOutput`` returned after ``close_session()`` carries the aggregated
+results for the entire session.
 
 ``generate_step()`` is the unified entry point used by **both** the batch
 ``run()`` method and server deployments.
