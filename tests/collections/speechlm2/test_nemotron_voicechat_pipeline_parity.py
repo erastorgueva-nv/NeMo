@@ -226,18 +226,37 @@ def assert_parity(
     assert not failures, "Parity failed:\n  " + "\n  ".join(failures)
 
 
+# Parity requires deterministic, float32, no caches, greedy decoding.
+_PARITY_DEFAULTS = {
+    "s2s": {
+        "engine_type": "native",
+        "compute_dtype": "float32",
+        "deterministic": True,
+        "decode_audio": False,
+        "use_perception_cache": False,
+        "use_perception_cudagraph": False,
+        "use_llm_cache": False,
+        "top_p": 1.0,
+        "repetition_penalty": 1.0,
+        "temperature": 1.0,
+    },
+}
+
+
 def _build_parity_pipeline(
     model_path: str,
     audio_path: str,
     output_dir: str,
-    *,
-    speaker_name: str | None = None,
-    system_prompt: str | None = None,
+    *overrides: dict[str, Any],
 ) -> StreamingS2SPipeline:
     """Build a :class:`StreamingS2SPipeline` configured for strict parity testing.
 
-    Loads ``s2s_streaming.yaml`` as the base config and applies
-    parity-specific overrides (deterministic, float32, no caches, greedy).
+    Loads ``s2s_streaming.yaml`` as the base config, applies
+    ``_PARITY_DEFAULTS``, then merges each dict in *overrides*
+    on top (in order).
+
+    The chunk size is set to cover the full audio in one step so that
+    offline and incremental paths see identical input.
     """
     import librosa
 
@@ -246,31 +265,22 @@ def _build_parity_pipeline(
     chunk_secs = total_frames * FRAME_SIZE_SAMPLES / SAMPLE_RATE
 
     cfg = OmegaConf.load(_CONF_YAML)
-    overrides = {
-        "audio_file": audio_path,
-        "output_dir": output_dir,
-        "s2s": {
-            "model_path": model_path,
-            "engine_type": "native",
-            "compute_dtype": "float32",
-            "deterministic": True,
-            "decode_audio": False,
-            "use_perception_cache": False,
-            "use_perception_cudagraph": False,
-            "use_llm_cache": False,
-            "system_prompt": system_prompt,
-            "top_p": 1.0,
-            "repetition_penalty": 1.0,
-            "temperature": 1.0,
+    cfg = OmegaConf.merge(
+        cfg,
+        _PARITY_DEFAULTS,
+        {
+            "audio_file": audio_path,
+            "output_dir": output_dir,
+            "s2s": {"model_path": model_path},
+            "streaming": {
+                "chunk_size_in_secs": chunk_secs,
+                "buffer_size_in_secs": max(71 * 0.08, chunk_secs),
+            },
         },
-        "streaming": {
-            "chunk_size_in_secs": chunk_secs,
-            "buffer_size_in_secs": max(71 * 0.08, chunk_secs),
-        },
-    }
-    if speaker_name:
-        overrides["s2s"]["speaker_name"] = speaker_name
-    cfg = OmegaConf.merge(cfg, OmegaConf.create(overrides))
+    )
+    for overrides in overrides:
+        if overrides:
+            cfg = OmegaConf.merge(cfg, overrides)
     return S2SPipelineBuilder.build_pipeline(cfg)
 
 
@@ -289,7 +299,10 @@ def test_parity_tiny_model(tiny_model_artifacts):
     model_dir, audio_path, _ = tiny_model_artifacts
     output_dir = tempfile.mkdtemp(prefix="parity-tiny-")
 
-    pipeline = _build_parity_pipeline(model_dir, audio_path, output_dir, system_prompt=_MOCK_SYSTEM_PROMPT)
+    pipeline = _build_parity_pipeline(
+        model_dir, audio_path, output_dir,
+        {"s2s": {"system_prompt": _MOCK_SYSTEM_PROMPT}},
+    )
     report = run_parity_check(pipeline, audio_path, system_prompt=_MOCK_SYSTEM_PROMPT)
     assert_parity(report, strict=True, atol=0.0)
 
@@ -319,9 +332,12 @@ def test_parity_real_checkpoint():
     audio = os.environ.get("PARITY_AUDIO_PATH") or _FORCE_ALIGN_AUDIO
     speaker = os.environ.get("PARITY_SPEAKER_NAME")
 
+    parity_overrides: dict[str, Any] = {"s2s": {"system_prompt": _MOCK_SYSTEM_PROMPT}}
+    if speaker:
+        parity_overrides["s2s"]["speaker_name"] = speaker
     pipeline = _build_parity_pipeline(
         ckpt, audio, tempfile.mkdtemp(prefix="parity-"),
-        speaker_name=speaker, system_prompt=_MOCK_SYSTEM_PROMPT,
+        parity_overrides,
     )
     report = run_parity_check(pipeline, audio, system_prompt=_MOCK_SYSTEM_PROMPT)
     assert_parity(report, strict=True, atol=0.0)

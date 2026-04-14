@@ -35,6 +35,7 @@ from omegaconf import OmegaConf
 
 from nemo.collections.speechlm2.inference.factory.s2s_pipeline_builder import S2SPipelineBuilder
 from nemo.collections.speechlm2.inference.pipelines.streaming_s2s_pipeline import StreamingS2SPipeline
+from nemo.collections.speechlm2.inference.utils.stepprogressbar import StepProgressBar
 
 _CONF_YAML = os.path.join(
     os.path.dirname(__file__),
@@ -42,24 +43,10 @@ _CONF_YAML = os.path.join(
 )
 _MOCK_SYSTEM_PROMPT = "This is a mock prompt for the test"
 
-# ---------------------------------------------------------------------------
-# Helper
-# ---------------------------------------------------------------------------
-
-
-def _build_no_crash_pipeline(
-    model_path: str,
-    audio_path: str,
-    output_dir: str,
-    *,
-    s2s_overrides: dict[str, Any] | None = None,
-    streaming_overrides: dict[str, Any] | None = None,
-) -> StreamingS2SPipeline:
-    """Build a :class:`StreamingS2SPipeline` with custom overrides for no-crash testing."""
-    cfg = OmegaConf.load(_CONF_YAML)
-
-    s2s_cfg: dict[str, Any] = {
-        "model_path": model_path,
+# Safe defaults so tests run quickly with the tiny model.
+# Individual tests override specific keys via OmegaConf.merge.
+_TEST_DEFAULTS = {
+    "s2s": {
         "engine_type": "native",
         "compute_dtype": "float32",
         "deterministic": False,
@@ -71,68 +58,82 @@ def _build_no_crash_pipeline(
         "top_p": 1.0,
         "repetition_penalty": 1.0,
         "temperature": 1.0,
-    }
-    streaming_cfg: dict[str, Any] = {
+    },
+    "streaming": {
         "chunk_size_in_secs": 0.08,
         "buffer_size_in_secs": 71 * 0.08,
-    }
+    },
+}
 
-    if s2s_overrides:
-        s2s_cfg.update(s2s_overrides)
-    if streaming_overrides:
-        streaming_cfg.update(streaming_overrides)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    overrides = {
-        "audio_file": audio_path,
-        "output_dir": output_dir,
-        "s2s": s2s_cfg,
-        "streaming": streaming_cfg,
-    }
-    cfg = OmegaConf.merge(cfg, OmegaConf.create(overrides))
+
+def _build_no_crash_pipeline(
+    model_path: str,
+    audio_path: str,
+    output_dir: str,
+    *overrides: dict[str, Any],
+) -> StreamingS2SPipeline:
+    """Build a :class:`StreamingS2SPipeline` for no-crash testing.
+
+    Loads the YAML base config, applies ``_TEST_DEFAULTS``, then merges
+    each dict in *overrides* on top (in order).  Nested dicts are
+    recursively merged by OmegaConf, so ``{"s2s": {"top_p": 0.9}}``
+    overrides only that key while keeping all other s2s defaults.
+    """
+    cfg = OmegaConf.load(_CONF_YAML)
+    cfg = OmegaConf.merge(
+        cfg,
+        _TEST_DEFAULTS,
+        {"audio_file": audio_path, "output_dir": output_dir, "s2s": {"model_path": model_path}},
+    )
+    for overrides in overrides:
+        if overrides:
+            cfg = OmegaConf.merge(cfg, overrides)
     return S2SPipelineBuilder.build_pipeline(cfg)
 
 
 # ---------------------------------------------------------------------------
-# Parametrized configs
+# Parametrized configs — each entry is a single overrides dict
 # ---------------------------------------------------------------------------
 
 # Text-only configs (decode_audio=False): minimal STT-path smoke checks.
-# Most config variations are folded into the audio tests below.
 _TEXT_CONFIGS = [
-    pytest.param({}, {}, id="baseline"),
+    pytest.param({}, id="baseline"),
     pytest.param(
-        {"use_llm_cache": True, "use_perception_cache": True},
-        {},
+        {"s2s": {"use_llm_cache": True, "use_perception_cache": True}},
         id="both_caches",
     ),
+    pytest.param({"pad_audio_by_sec": 2}, id="pad_by_sec"),
 ]
 
 # Audio configs (decode_audio=True): exercises the full STT + TTS pipeline.
 _AUDIO_CONFIGS = [
-    pytest.param({}, {}, id="baseline"),
+    pytest.param({}, id="baseline"),
     pytest.param(
-        {"use_llm_cache": True, "use_perception_cache": True, "system_prompt": _MOCK_SYSTEM_PROMPT},
-        {"chunk_size_in_secs": 0.24},
-        id="both_caches_prompt_multiframe",
+        {"s2s": {"use_llm_cache": True, "use_perception_cache": True, "system_prompt": _MOCK_SYSTEM_PROMPT},
+         "streaming": {"chunk_size_in_secs": 0.24},
+         "pad_audio_to_sec": 5},
+        id="both_caches_prompt_multiframe_pad_to_sec",
     ),
     pytest.param(
-        {"use_llm_cache": True, "top_p": 0.9, "temperature": 0.7, "repetition_penalty": 1.1},
-        {},
-        id="sampling",
+        {"s2s": {"use_llm_cache": True, "top_p": 0.9, "temperature": 0.7, "repetition_penalty": 1.1},
+         "pad_silence_ratio": 0.5},
+        id="sampling_pad_silence_ratio",
     ),
     pytest.param(
-        {"use_tts_subword_cache": True, "use_tts_torch_compile": True},
-        {},
-        id="tts_optimizations",
+        {"s2s": {"use_tts_subword_cache": True, "use_tts_torch_compile": True},
+         "pad_audio_by_sec": 2},
+        id="tts_optimizations_pad_by_sec",
     ),
     pytest.param(
-        {"deterministic": True, "temperature": 0.0},
-        {},
+        {"s2s": {"deterministic": True, "temperature": 0.0}},
         id="deterministic",
     ),
     pytest.param(
-        {"profile_timing": True},
-        {},
+        {"s2s": {"profile_timing": True}},
         id="profile_timing",
     ),
 ]
@@ -143,33 +144,42 @@ _AUDIO_CONFIGS = [
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-@pytest.mark.parametrize("s2s_overrides,streaming_overrides", _TEXT_CONFIGS)
-def test_pipeline_no_crash_tiny_model(tiny_model_artifacts, s2s_overrides, streaming_overrides):
+@pytest.mark.parametrize("overrides", _TEXT_CONFIGS)
+def test_pipeline_no_crash_tiny_model(tiny_model_artifacts, overrides):
     """Run the streaming pipeline with various configs and verify it doesn't crash."""
     model_dir, audio_path, _ = tiny_model_artifacts
     output_dir = tempfile.mkdtemp(prefix="no-crash-text-")
 
-    pipeline = _build_no_crash_pipeline(
-        model_dir, audio_path, output_dir,
-        s2s_overrides=s2s_overrides, streaming_overrides=streaming_overrides,
+    pipeline = _build_no_crash_pipeline(model_dir, audio_path, output_dir, overrides)
+    progress_bar = StepProgressBar.from_audio_filepaths(
+        [audio_path],
+        chunk_size_in_secs=pipeline.chunk_size_in_secs,
+        pad_audio_to_sec=pipeline.pad_audio_to_sec,
+        pad_silence_ratio=pipeline.pad_silence_ratio,
+        pad_audio_by_sec=pipeline.pad_audio_by_sec,
     )
-    result = pipeline.run([audio_path])
+    result = pipeline.run([audio_path], progress_bar=progress_bar)
     assert result is not None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-@pytest.mark.parametrize("s2s_overrides,streaming_overrides", _AUDIO_CONFIGS)
-def test_pipeline_no_crash_tiny_model_decode_audio(tiny_model_artifacts, s2s_overrides, streaming_overrides):
+@pytest.mark.parametrize("overrides", _AUDIO_CONFIGS)
+def test_pipeline_no_crash_tiny_model_decode_audio(tiny_model_artifacts, overrides):
     """Run the streaming pipeline with decode_audio=True and verify it doesn't crash."""
     model_dir, audio_path, speaker_ref_path = tiny_model_artifacts
     output_dir = tempfile.mkdtemp(prefix="no-crash-audio-")
 
-    audio_overrides = {"decode_audio": True, "speaker_reference": speaker_ref_path}
-    audio_overrides.update(s2s_overrides)
-
     pipeline = _build_no_crash_pipeline(
         model_dir, audio_path, output_dir,
-        s2s_overrides=audio_overrides, streaming_overrides=streaming_overrides,
+        {"s2s": {"decode_audio": True, "speaker_reference": speaker_ref_path}},
+        overrides,
     )
-    result = pipeline.run([audio_path])
+    progress_bar = StepProgressBar.from_audio_filepaths(
+        [audio_path],
+        chunk_size_in_secs=pipeline.chunk_size_in_secs,
+        pad_audio_to_sec=pipeline.pad_audio_to_sec,
+        pad_silence_ratio=pipeline.pad_silence_ratio,
+        pad_audio_by_sec=pipeline.pad_audio_by_sec,
+    )
+    result = pipeline.run([audio_path], progress_bar=progress_bar)
     assert result is not None
