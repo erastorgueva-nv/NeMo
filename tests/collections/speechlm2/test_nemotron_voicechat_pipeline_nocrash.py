@@ -130,6 +130,11 @@ _AUDIO_CONFIGS = [
         {},
         id="deterministic",
     ),
+    pytest.param(
+        {"profile_timing": True},
+        {},
+        id="profile_timing",
+    ),
 ]
 
 # ---------------------------------------------------------------------------

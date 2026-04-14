@@ -12,23 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 import time
 from dataclasses import dataclass
 
+import soundfile as sf
 import torch
 import librosa
 from torch import Tensor
-import soundfile as sf
 from omegaconf import DictConfig
-import math
 
 from nemo.collections.asr.inference.streaming.framing.request import Frame
 from nemo.collections.asr.inference.utils.enums import RequestType
 from nemo.collections.asr.inference.streaming.buffering.audio_bufferer import BatchedAudioBufferer
-from nemo.collections.asr.inference.utils.progressbar import ProgressBar
+from nemo.collections.speechlm2.inference.utils.stepprogressbar import StepProgressBar
 from nemo.collections.speechlm2.inference.pipelines.s2s_pipeline_interface import S2SPipelineInterface
 from nemo.collections.speechlm2.inference.streaming.state.s2s_state import S2SStreamingState
+from nemo.collections.speechlm2.inference.model_wrappers.decode_state import NullTimingSummary
 from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_inference_wrapper import NemotronVoicechatInferenceWrapper
 from nemo.collections.speechlm2.parts.text_utils import tokens_to_str
 from nemo.collections.speechlm2.inference.streaming.state.s2s_context_manager import S2SContextManager
@@ -295,8 +296,9 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         # Persist updated cache & clean finished streams
         self.context_manager.update_context(stream_ids, result, self.num_frames_per_chunk)
 
-        # Save full token tensors to state before the context is destroyed,
-        # so we can run tokens_to_str post-hoc.
+        # Save token tensors and timing from the decode context before it is
+        # destroyed by reset_slots.
+        timing_by_stream: dict[int, object] = {}
         for stream_id, eos_flag in zip(stream_ids, eos_flags):
             if eos_flag:
                 ctx = self.context_manager.slot_contexts[
@@ -306,6 +308,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                     state = self.get_or_create_state(stream_id)
                     state.save_token_tensors(ctx.gen_text, ctx.gen_asr_text, ctx.frame_idx,
                                              gen_function_text=ctx.gen_function_text)
+                    timing_by_stream[stream_id] = ctx.timing
 
         self.context_manager.reset_slots(stream_ids, eos_flags)
         
@@ -319,6 +322,27 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                     f"{audio_sec:.1f}s audio, "
                     f"agent: {state.output_text_str!r}, user: {state.output_asr_text_str!r}"
                 )
+
+                # Compact pad-visible summary (· replaces <SPECIAL_12>)
+                token_data = state.get_token_tensors()
+                if token_data is not None:
+                    gen_text, gen_asr_text, total_frames, _ = token_data
+                    tokenizer = self.s2s_model.tokenizer
+                    pad_id = self.s2s_model.model.stt_model.text_pad_id
+                    lengths = torch.tensor([total_frames], dtype=torch.long)
+                    raw_agent = tokens_to_str(gen_text, lengths, tokenizer=tokenizer, pad_id=pad_id, keep_pad=True)[0]
+                    raw_user = tokens_to_str(gen_asr_text, lengths, tokenizer=tokenizer, pad_id=pad_id, keep_pad=True)[0]
+                    compact_agent = raw_agent.replace('<SPECIAL_12>', '·')
+                    compact_user = raw_user.replace('<SPECIAL_12>', '·')
+                    logging.info(f"Stream {stream_id} agent (with padding): {compact_agent}")
+                    logging.info(f"Stream {stream_id} user  (with padding): {compact_user}")
+
+                # Timing summary (no-op when profile_timing is off)
+                timing_by_stream.get(stream_id, NullTimingSummary()).log_summary(
+                    label=f"Stream {stream_id}",
+                    chunk_ms=self.chunk_size_in_secs * 1000,
+                )
+
                 self.bufferer.rm_bufferer(stream_id)
                 self._abort_stream_request(stream_id)
                 # Note: We keep the state in _state_pool until finalization to save audio
@@ -566,15 +590,19 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         self,
         audio_filepaths: list[str],
         options: list[S2SRequestOptions] | None = None,
-        progress_bar: ProgressBar | None = None,
+        progress_bar: StepProgressBar | None = None,
     ) -> PipelineOutput:
         """Stream all *audio_filepaths* through the pipeline and save outputs.
 
         Saves one generated ``.wav`` per input under ``self.output_dir`` and
         returns their paths in ``PipelineOutput.texts``.
+
+        Args:
+            audio_filepaths: Paths to input audio files.
+            options: Per-stream request options (system prompt, sampling, etc.).
+            progress_bar: Optional :class:`StepProgressBar` for per-step
+                progress with per-stream postfix.
         """
-        if progress_bar and not isinstance(progress_bar, ProgressBar):
-            raise ValueError("progress_bar must be an instance of ProgressBar.")
 
         if options is None:
             options = [S2SRequestOptions() for _ in audio_filepaths]
@@ -590,7 +618,6 @@ class StreamingS2SPipeline(S2SPipelineInterface):
             pad_ratio=self.pad_silence_ratio,
         )
         streamer.set_audio_filepaths(audio_filepaths, options)
-        streamer.set_progress_bar(progress_bar)
 
         os.makedirs(self.output_dir, exist_ok=True)
         saved_paths_by_stream: dict[int, str] = {}
@@ -603,6 +630,13 @@ class StreamingS2SPipeline(S2SPipelineInterface):
             # which _finalize_and_save_finished_streams reads on is_last.
             self.generate_step(frames)
             self._finalize_and_save_finished_streams(frames, audio_filepaths, saved_paths_by_stream)
+
+            if progress_bar is not None:
+                for f in frames:
+                    progress_bar.step(f.stream_id)
+
+        if progress_bar is not None:
+            progress_bar.finish()
 
         output = self._build_pipeline_output(audio_filepaths, saved_paths_by_stream)
         self.close_session()

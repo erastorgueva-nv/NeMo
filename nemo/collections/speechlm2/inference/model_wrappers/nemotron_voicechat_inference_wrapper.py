@@ -36,7 +36,9 @@ from nemo.collections.speechlm2.inference.model_wrappers.decode_state import (
     InferenceStepResult,
     IntermediateResultLogger,
     NullIntermediateResultLogger,
+    NullTimingSummary,
     StreamingDecodeState,
+    TimingSummary,
 )
 from nemo.collections.speechlm2.parts.text_utils import _decode_tokens_with_specials
 
@@ -144,9 +146,10 @@ class NemotronVoicechatInferenceWrapper:
         logging.info(f"Precision (effective): float32_matmul_precision={torch.get_float32_matmul_precision()}, cudnn.allow_tf32={torch.backends.cudnn.allow_tf32}, cuda.matmul.allow_tf32={torch.backends.cuda.matmul.allow_tf32}")
         logging.info("=" * 70)
 
-        # Profiling: when True, insert torch.cuda.synchronize() around each
-        # stage for accurate per-stage wall-clock timing.  Disabled by default
-        # to avoid unnecessary GPU stalls in production.
+        # Profiling: when True, a TimingSummary (extending NamedTimer with
+        # sync_cuda=True) is attached to each decode state, recording
+        # per-stage wall-clock times.  Disabled by default to avoid
+        # unnecessary GPU stalls in production.
         self._profile_timing = bool(model_cfg.get("profile_timing", False))
 
         # Cached TTS helpers populated during initialization/warmup
@@ -510,6 +513,7 @@ class NemotronVoicechatInferenceWrapper:
             perception_cache=perception_cache,
             tts_codec_cache=tts_codec_cache,
             llm_cache_position_offset=0,
+            timing=TimingSummary() if self._profile_timing else NullTimingSummary(),
         )
 
     def infer_one_step(
@@ -544,7 +548,7 @@ class NemotronVoicechatInferenceWrapper:
         effective_request_id = request_id or self.request_id
         frame_idx = state.frame_idx
 
-        start_time_one_step = time.time()
+        state.timing.start("total_step")
         use_llm_cache = state.llm_cache is not None
         B = state.gen_text.shape[0]
 
@@ -557,9 +561,11 @@ class NemotronVoicechatInferenceWrapper:
         debug_logger = IntermediateResultLogger() if return_debug else NullIntermediateResultLogger()
 
         # --- Stage 1: Perception ---
+        state.timing.start("perception")
         source_encoded, state.perception_cache = self._run_perception(
             audio_input, frame_idx, num_frames_per_chunk, state.perception_cache,
         )
+        state.timing.stop("perception")
         total_encoded_frames = source_encoded.shape[1]
         if self.use_perception_cache and state.perception_cache is not None and state.perception_cache.is_initialized():
             # With cache: we get exactly num_frames_per_chunk output frames
@@ -634,10 +640,7 @@ class NemotronVoicechatInferenceWrapper:
         if use_llm_cache:
             state.llm_cache_position_offset += num_frames_per_chunk
 
-        if self._profile_timing:
-            torch.cuda.synchronize()
-            time_for_one_step = time.time() - start_time_one_step
-            logging.info(f'frame {frame_idx}: Time taken for one step: {time_for_one_step:.3f}s')
+        state.timing.stop("total_step")
 
         debug = debug_logger.build_debug_dict(source_encoded, state.gen_text, state.gen_asr_text)
 
@@ -726,7 +729,7 @@ class NemotronVoicechatInferenceWrapper:
         Updates ``state.llm_cache`` in-place for cached paths.  For the
         no-cache fallback, appends to *new_input_embeds* (list, mutated).
         """
-        start_stt_model = time.time()
+        state.timing.start("stt_model")
 
         if use_llm_cache or self.use_vllm_llm:
             if self.use_vllm_llm:
@@ -763,10 +766,7 @@ class NemotronVoicechatInferenceWrapper:
                 sampling_params=sampling_params,
             )
 
-        if self._profile_timing:
-            torch.cuda.synchronize()
-            time_stt_model = time.time() - start_stt_model
-            logging.info(f"Time taken for stt_model: {time_stt_model:.3f}s")
+        state.timing.stop("stt_model")
 
         return ans
 
@@ -795,7 +795,7 @@ class NemotronVoicechatInferenceWrapper:
         if self.generation_config is None:
             raise RuntimeError("generation_config is not initialized. Ensure TTS warmup ran successfully.")
 
-        start_tts_model = time.time()
+        state.timing.start("tts_model")
         if self.use_vllm_eartts:
             tts_inputs = {
                 "code": state.tts_code,
@@ -823,10 +823,7 @@ class NemotronVoicechatInferenceWrapper:
         state.tts_code = result.codes
         state.tts_past_key_values = result.past_key_values
 
-        if self._profile_timing:
-            torch.cuda.synchronize()
-            time_tts_model = time.time() - start_tts_model
-            logging.info(f"Time taken for tts_model: {time_tts_model:.3f}s")
+        state.timing.stop("tts_model")
 
         new_code = state.tts_code.clone()
 
@@ -857,7 +854,7 @@ class NemotronVoicechatInferenceWrapper:
 
         logging.debug(f"Decoding audio for {frame_idx}-th frame  ({num_frames_per_chunk=})")
 
-        start_time_decode = time.time()
+        state.timing.start("audio_codec")
         with fp32_precision(), torch.no_grad():
             new_codes_tensor = torch.cat(new_codes_for_decode, dim=1)
             if hasattr(self.model.tts_model, '_control_codes'):
@@ -874,10 +871,7 @@ class NemotronVoicechatInferenceWrapper:
                 new_codes_tensor, new_code_len, cache=state.tts_codec_cache,
             )
 
-        if self._profile_timing:
-            torch.cuda.synchronize()
-            time_audio_codec = time.time() - start_time_decode
-            logging.info(f"Time taken for audio_codec: {time_audio_codec:.3f}s")
+        state.timing.stop("audio_codec")
 
         return decoded_audio
 
@@ -889,8 +883,6 @@ class NemotronVoicechatInferenceWrapper:
         perception_cache: PerceptionCacheState | None,
     ) -> tuple[torch.Tensor, PerceptionCacheState | None]:
         """Run the perception encoder and return (source_encoded, updated_cache)."""
-        start_perception = time.time()
-
         if self.use_perception_cache and perception_cache is not None and perception_cache.is_initialized():
             source_encoded, perception_cache = self.perception_cache_mgr.step(
                 audio_input=audio_input,
@@ -905,11 +897,6 @@ class NemotronVoicechatInferenceWrapper:
                 input_signal_length=buffer_len,
                 return_encoder_emb=True,
             )
-
-        if self._profile_timing:
-            torch.cuda.synchronize()
-            time_perception = time.time() - start_perception
-            logging.info(f"Time taken for perception: {time_perception:.3f}s")
 
         source_encoded = source_encoded.to(self.dtype)
         return source_encoded, perception_cache

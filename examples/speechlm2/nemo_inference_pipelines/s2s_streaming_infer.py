@@ -29,8 +29,9 @@ from omegaconf import DictConfig
 
 from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.collections.speechlm2.inference.factory.s2s_pipeline_builder import S2SPipelineBuilder
+from nemo.collections.speechlm2.inference.utils.stepprogressbar import StepProgressBar
 from nemo.collections.speechlm2.inference.utils.audio_data import (
-    calculate_duration_incl_padding,
+    calculate_durations_incl_padding,
     dump_output,
     prepare_audio_data,
 )
@@ -49,16 +50,24 @@ def main(cfg: DictConfig):
 
     pipeline = S2SPipelineBuilder.build_pipeline(cfg)
 
+    progress_bar = StepProgressBar.from_audio_filepaths(
+        audio_filepaths,
+        chunk_size_in_secs=pipeline.chunk_size_in_secs,
+        pad_audio_to_sec=cfg.get("pad_audio_to_sec"),
+        pad_silence_ratio=cfg.get("pad_silence_ratio"),
+        pad_audio_by_sec=cfg.get("pad_audio_by_sec"),
+    )
+
     timer = SimpleTimer()
     timer.start()
-    output = pipeline.run(audio_filepaths, options=options)
+    output = pipeline.run(audio_filepaths, options=options, progress_bar=progress_bar)
     timer.stop()
     exec_dur = timer.total_sec()
     logging.info(f"Generated {len(audio_filepaths)} files in {exec_dur:.2f}s")
 
-    data_dur = calculate_duration_incl_padding(
+    data_dur = sum(calculate_durations_incl_padding(
         audio_filepaths, cfg.get("pad_audio_to_sec"), cfg.get("pad_silence_ratio"), cfg.get("pad_audio_by_sec"),
-    )
+    ))
     rtfx = data_dur / exec_dur if exec_dur > 0 else float('inf')
     logging.info(f"RTFX: {rtfx:.2f} ({data_dur:.2f}s / {exec_dur:.2f}s)")
 

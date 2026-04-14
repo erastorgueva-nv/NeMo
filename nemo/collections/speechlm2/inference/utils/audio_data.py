@@ -83,33 +83,31 @@ def prepare_audio_data(
     return filepaths, options, ground_truths
 
 
-def calculate_duration_incl_padding(
+def calculate_durations_incl_padding(
     audio_filepaths: list[str],
     pad_audio_to_sec: float | None = None,
     pad_silence_ratio: float | None = None,
     pad_audio_by_sec: float | None = None,
-) -> float:
-    """Calculate total duration of the given audio files in seconds.
+) -> list[float]:
+    """Return per-file durations in seconds, accounting for silence padding.
 
-    Optionally accounts for silence padding appended after each file.
     At most one padding argument may be set; when none are set this
-    returns the raw audio duration.
+    returns the raw audio durations.
     """
     if sum(x is not None for x in [pad_audio_to_sec, pad_silence_ratio, pad_audio_by_sec]) > 1:
         raise ValueError("Set at most one of: pad_audio_to_sec, pad_silence_ratio, pad_audio_by_sec")
-    total = 0.0
+    durations = []
     for fp in audio_filepaths:
         sound = sf.SoundFile(fp)
-        orig = sound.frames / sound.samplerate
+        dur = sound.frames / sound.samplerate
         if pad_audio_to_sec is not None:
-            total += max(orig, pad_audio_to_sec)
+            dur = max(dur, pad_audio_to_sec)
         elif pad_silence_ratio is not None:
-            total += orig * (1 + pad_silence_ratio)
+            dur *= (1 + pad_silence_ratio)
         elif pad_audio_by_sec is not None:
-            total += orig + pad_audio_by_sec
-        else:
-            total += orig
-    return total
+            dur += pad_audio_by_sec
+        durations.append(dur)
+    return durations
 
 
 def dump_output(

@@ -31,13 +31,65 @@ pipeline import from here.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
 import torch
 
+from nemo.utils import logging
+from nemo.utils.timers import NamedTimer
+
 if TYPE_CHECKING:
     from nemo.collections.speechlm2.inference.model_wrappers.perception_cache import PerceptionCacheState
+
+
+class TimingSummary(NamedTimer):
+    """Accumulates per-stage wall-clock times across inference steps.
+
+    Extends :class:`~nemo.utils.timers.NamedTimer` (``sync_cuda=True``)
+    with a :meth:`log_summary` that prints a compact min/mean/max table
+    at ``logging.info`` level once a stream finishes.
+
+    Usage::
+
+        timing.start("perception")
+        # ... run perception ...
+        timing.stop("perception")
+
+        timing.log_summary(label="Stream 0", chunk_ms=240)
+    """
+
+    def __init__(self):
+        super().__init__(reduction="none", sync_cuda=True)
+
+    def log_summary(self, label: str = "Timing", chunk_ms: float | None = None) -> None:
+        header = f"{label} timing"
+        if chunk_ms is not None:
+            header += f" (chunk={chunk_ms:.0f}ms)"
+        parts = []
+        for name, data in self.timers.items():
+            times = data.get("dt", [])
+            if not times:
+                continue
+            mean_ms = sum(times) / len(times) * 1000
+            min_ms = min(times) * 1000
+            max_ms = max(times) * 1000
+            parts.append(f"{name}: mean={mean_ms:.1f}ms min={min_ms:.1f}ms max={max_ms:.1f}ms")
+        if parts:
+            logging.info(f"{header}:\n  " + "\n  ".join(parts))
+
+
+class NullTimingSummary:
+    """No-op stand-in for :class:`TimingSummary`."""
+
+    def start(self, name: str = "") -> None:
+        pass
+
+    def stop(self, name: str = "") -> None:
+        pass
+
+    def log_summary(self, label: str = "Timing", chunk_ms: float | None = None) -> None:
+        pass
 
 
 @dataclass
@@ -60,6 +112,7 @@ class StreamingDecodeState:
     perception_cache: "PerceptionCacheState" | None = None
     tts_codec_cache: Any = None
     llm_cache_position_offset: int = 0
+    timing: TimingSummary | NullTimingSummary = field(default_factory=NullTimingSummary)
 
 
 @dataclass
