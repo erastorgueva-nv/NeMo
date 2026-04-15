@@ -13,10 +13,10 @@
 # limitations under the License.
 
 import re
+from dataclasses import dataclass
+
 import torch
 from whisper_normalizer.english import EnglishTextNormalizer
-
-from nemo.collections.asr.inference.utils.text_segment import Word
 
 _whisper_normalizer = EnglishTextNormalizer()
 
@@ -41,39 +41,23 @@ def clean_pred_text(text: str) -> str:
     return _whisper_normalizer(text)
 
 
+@dataclass
 class PipelineOutput:
-    """
-    Class to store the output of the S2S pipeline.
+    """Output of the S2S pipeline's :meth:`run` method.
+
+    Every list field is indexed by stream id — entry *i* holds the result
+    for the *i*-th input audio file.
     """
 
-    def __init__(
-        self,
-        texts: list[str] | None = None,
-        words: list[list[Word]] | None = None,
-        asr_texts: list[str] | None = None,
-        texts_with_timestamps: list[str] | None = None,
-        asr_texts_with_timestamps: list[str] | None = None,
-        raw_texts: list[str] | None = None,
-        raw_asr_texts: list[str] | None = None,
-        token_texts: list[torch.Tensor | None] | None = None,
-        token_asr_texts: list[torch.Tensor | None] | None = None,
-        token_function_texts: list[torch.Tensor | None] | None = None,
-        token_lengths: list[int | None] | None = None,
-        audio_filepaths: list[str | None] | None = None,
-        debug_data: list[list] | None = None,
-    ):
-        if texts is None and words is None:
-            raise ValueError("At least one of the 'texts' or 'words' should be provided.")
-        self.texts = texts
-        self.words = words
-        self.asr_texts = asr_texts
-        self.texts_with_timestamps = texts_with_timestamps
-        self.asr_texts_with_timestamps = asr_texts_with_timestamps
-        self.raw_texts = raw_texts
-        self.raw_asr_texts = raw_asr_texts
-        self.token_texts = token_texts
-        self.token_asr_texts = token_asr_texts
-        self.token_function_texts = token_function_texts
-        self.token_lengths = token_lengths
-        self.audio_filepaths = audio_filepaths
-        self.debug_data = debug_data
+    texts: list[str] | None = None
+    asr_texts: list[str] | None = None
+    texts_with_timestamps: list[str] | None = None
+    asr_texts_with_timestamps: list[str] | None = None
+    raw_texts: list[str] | None = None
+    raw_asr_texts: list[str] | None = None
+    token_texts: list[torch.Tensor | None] | None = None
+    token_asr_texts: list[torch.Tensor | None] | None = None
+    token_function_texts: list[torch.Tensor | None] | None = None
+    token_lengths: list[int | None] | None = None
+    audio_filepaths: list[str | None] | None = None
+    debug_data: list[list] | None = None

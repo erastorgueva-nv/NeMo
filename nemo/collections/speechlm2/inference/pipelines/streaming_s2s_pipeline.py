@@ -31,7 +31,7 @@ from nemo.collections.speechlm2.inference.pipelines.s2s_pipeline_interface impor
 from nemo.collections.speechlm2.inference.streaming.state.s2s_state import S2SStreamingState
 from nemo.collections.speechlm2.inference.model_wrappers.decode_state import NullTimingSummary
 from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_inference_wrapper import NemotronVoicechatInferenceWrapper
-from nemo.collections.speechlm2.parts.text_utils import tokens_to_str
+from nemo.collections.speechlm2.parts.text_utils import _decode_tokens_with_specials, tokens_to_str
 from nemo.collections.speechlm2.inference.streaming.state.s2s_context_manager import S2SContextManager
 from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
 from nemo.collections.speechlm2.inference.streaming.framing.silence_padded_frame_streamer import SilencePaddedContinuousBatchedFrameStreamer
@@ -316,7 +316,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         for stream_id, eos_flag in zip(stream_ids, eos_flags):
             if eos_flag:
                 state = self.get_state(stream_id)
-                audio_sec = state.audio_buffer.shape[-1] / self.output_sample_rate if self.output_sample_rate > 0 else 0
+                audio_sec = state._total_audio_samples / self.output_sample_rate if self.output_sample_rate > 0 else 0
                 logging.info(
                     f"Stream {stream_id} finished: {state.final_total_frames} frames, "
                     f"{audio_sec:.1f}s audio, "
@@ -345,8 +345,6 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
                 self.bufferer.rm_bufferer(stream_id)
                 self._abort_stream_request(stream_id)
-                # Note: We keep the state in _state_pool until finalization to save audio
-                # It will be cleaned up in close_session()
         
         # Split the batch-level InferenceStepResult into per-frame outputs.
         # Two things happen for each frame:
@@ -490,9 +488,12 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         self,
         frames: list[Frame],
         audio_filepaths: list[str],
-        saved_paths_by_stream: dict[int, str],
+        per_stream_results: dict[int, dict],
     ) -> None:
-        """Finalize any streams that ended in this batch and save their outputs."""
+        """Finalize streams that ended in this batch: save files, build per-stream result, free state."""
+        tokenizer = self.s2s_model.tokenizer
+        pad_id = self.s2s_model.model.stt_model.text_pad_id
+
         for frame in frames:
             if frame.is_last:
                 stream_id = frame.stream_id
@@ -565,9 +566,103 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                     except OSError:
                         logging.warning(f"Failed to write ASR text output for {base}")
 
-                saved_paths_by_stream[stream_id] = out_path
-                # Keep state in _state_pool until _build_pipeline_output;
-                # it will be cleared on close_session().
+                # Build lightweight per-stream result (all CPU / small data)
+                # so the heavy S2SStreamingState can be freed immediately.
+                result: dict = {
+                    "text": text_out or out_path or "",
+                    "asr_text": asr_text_out,
+                    "audio_filepath": out_path,
+                }
+
+                token_data = state.get_token_tensors()
+                if token_data is not None:
+                    gen_text, gen_asr_text, total_frames, gen_function_text = token_data
+                    lengths = torch.tensor([total_frames], dtype=torch.long)
+                    result["token_text"] = gen_text
+                    result["token_asr_text"] = gen_asr_text
+                    result["token_function_text"] = gen_function_text
+                    result["token_length"] = total_frames
+                    result["text_with_timestamps"] = tokens_to_str(
+                        gen_text, lengths, tokenizer=tokenizer, pad_id=pad_id, eval_text_turn_taking=True,
+                    )[0]
+                    result["asr_text_with_timestamps"] = tokens_to_str(
+                        gen_asr_text, lengths, tokenizer=tokenizer, pad_id=pad_id, eval_text_turn_taking=True,
+                    )[0]
+                    result["raw_text"] = tokens_to_str(
+                        gen_text, lengths, tokenizer=tokenizer, pad_id=pad_id, keep_pad=True,
+                    )[0]
+                    result["raw_asr_text"] = tokens_to_str(
+                        gen_asr_text, lengths, tokenizer=tokenizer, pad_id=pad_id, keep_pad=True,
+                    )[0]
+                    if gen_function_text is not None:
+                        fc_text = tokens_to_str(
+                            gen_function_text, lengths, tokenizer=tokenizer, pad_id=pad_id, eval_text_turn_taking=False,
+                        )[0]
+                        fc_text_raw = tokens_to_str(
+                            gen_function_text, lengths, tokenizer=tokenizer, pad_id=pad_id, keep_pad=True,
+                        )[0]
+                        logging.info(f"Function calling channel: {fc_text}, fc_text_raw: {fc_text_raw}")
+
+                if self.collect_debug:
+                    result["debug_steps"] = getattr(state, "debug_steps", [])
+
+                if token_data is not None:
+                    self._write_ctm(
+                        base, gen_text[0, :total_frames], total_frames,
+                        state._total_audio_samples, tokenizer, pad_id,
+                    )
+                    self._write_ctm(
+                        base, gen_asr_text[0, :total_frames], total_frames,
+                        state._total_audio_samples, tokenizer, pad_id,
+                        suffix="_asr",
+                    )
+
+                per_stream_results[stream_id] = result
+
+                # Free the heavy state (GPU audio chunks etc.) now that
+                # files are saved and the lightweight result is captured.
+                self.delete_state(stream_id)
+
+    def _write_ctm(
+        self,
+        base: str,
+        token_ids: torch.Tensor,
+        total_frames: int,
+        total_audio_samples: int,
+        tokenizer,
+        pad_id: int,
+        suffix: str = "",
+    ) -> None:
+        """Write a token-level CTM file derived from a token-ID tensor.
+
+        Each non-pad frame gets one line with evenly-spaced timing based on
+        the total audio duration divided by the number of frames.
+
+        Args:
+            suffix: Appended to the filename stem, e.g. ``"_asr"`` produces
+                ``<base>_asr.ctm``.
+        """
+        if total_frames == 0 or total_audio_samples == 0 or self.output_sample_rate == 0:
+            return
+        frame_duration = total_audio_samples / total_frames / self.output_sample_rate
+
+        ctm_dir = os.path.join(self.output_dir, "ctm")
+        os.makedirs(ctm_dir, exist_ok=True)
+        try:
+            with open(os.path.join(ctm_dir, f"{base}{suffix}.ctm"), "w", encoding="utf-8") as f:
+                for i in range(total_frames):
+                    tid = int(token_ids[i].item())
+                    if tid == pad_id:
+                        continue
+                    tok_str = _decode_tokens_with_specials(
+                        tokenizer.ids_to_tokens([tid]), tokenizer, keep_pad=False,
+                    )
+                    if not tok_str:
+                        continue
+                    start = i * frame_duration
+                    f.write(f"{base} A {start:.3f} {frame_duration:.3f} {tok_str}\n")
+        except OSError:
+            logging.warning(f"Failed to write CTM for {base}")
 
 
     # ------------------------------------------------------------------
@@ -592,10 +687,13 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         options: list[S2SRequestOptions] | None = None,
         progress_bar: StepProgressBar | None = None,
     ) -> PipelineOutput:
-        """Stream all *audio_filepaths* through the pipeline and save outputs.
+        """Process audio files through the streaming pipeline, saving outputs to disk.
 
-        Saves one generated ``.wav`` per input under ``self.output_dir`` and
-        returns their paths in ``PipelineOutput.texts``.
+        Each file is streamed chunk-by-chunk through :meth:`generate_step`.
+        When a stream finishes, its wav, txt, and CTM files are written
+        immediately and the per-stream state is freed.  Returns a
+        :class:`PipelineOutput` with texts, word timings, token tensors,
+        and generated audio filepaths for all input files.
 
         Args:
             audio_filepaths: Paths to input audio files.
@@ -620,16 +718,21 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         streamer.set_audio_filepaths(audio_filepaths, options)
 
         os.makedirs(self.output_dir, exist_ok=True)
-        saved_paths_by_stream: dict[int, str] = {}
+
+        # Collects each stream's final results (texts, token tensors, word
+        # timings, audio filepaths) as it finishes.  Assembled into the
+        # returned PipelineOutput after the loop.
+        per_stream_results: dict[int, dict] = {}
 
         self.open_session()
         for frames in streamer:
             # generate_step returns per-step GenerateStepOutput objects
             # (useful for server integrations that stream partial results
             # to clients).  Here we rely on the accumulated state instead,
-            # which _finalize_and_save_finished_streams reads on is_last.
+            # which _finalize_and_save_finished_streams reads on is_last
+            # to save files and capture the per-stream result.
             self.generate_step(frames)
-            self._finalize_and_save_finished_streams(frames, audio_filepaths, saved_paths_by_stream)
+            self._finalize_and_save_finished_streams(frames, audio_filepaths, per_stream_results)
 
             if progress_bar is not None:
                 for f in frames:
@@ -638,99 +741,46 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         if progress_bar is not None:
             progress_bar.finish()
 
-        output = self._build_pipeline_output(audio_filepaths, saved_paths_by_stream)
+        output = self._build_pipeline_output(audio_filepaths, per_stream_results)
         self.close_session()
         return output
+
+    # Maps per-stream result dict keys -> PipelineOutput field names.
+    _RESULT_KEY_TO_OUTPUT_FIELD = {
+        "text": "texts",
+        "asr_text": "asr_texts",
+        "text_with_timestamps": "texts_with_timestamps",
+        "asr_text_with_timestamps": "asr_texts_with_timestamps",
+        "raw_text": "raw_texts",
+        "raw_asr_text": "raw_asr_texts",
+        "token_text": "token_texts",
+        "token_asr_text": "token_asr_texts",
+        "token_function_text": "token_function_texts",
+        "token_length": "token_lengths",
+        "audio_filepath": "audio_filepaths",
+        "debug_steps": "debug_data",
+    }
 
     def _build_pipeline_output(
         self,
         audio_filepaths: list[str],
-        saved_paths_by_stream: dict[int, str],
+        per_stream_results: dict[int, dict],
     ) -> PipelineOutput:
-        """Assemble final ``PipelineOutput`` from accumulated per-stream state.
+        """Build :class:`PipelineOutput` from pre-built per-stream dicts."""
+        n = len(audio_filepaths)
+        fields: dict[str, list] = {field: [] for field in self._RESULT_KEY_TO_OUTPUT_FIELD.values()}
 
-        Must be called *before* ``close_session()`` since it reads from the
-        state pool.
-        """
-        texts = []
-        words = []
-        asr_texts = []
-        texts_with_timestamps = []
-        asr_texts_with_timestamps = []
-        raw_texts = []
-        raw_asr_texts = []
-        token_texts = []
-        token_asr_texts = []
-        token_function_texts = []
-        token_lengths = []
-        audio_paths = []
+        for idx in range(n):
+            r = per_stream_results.get(idx, {})
+            for key, field in self._RESULT_KEY_TO_OUTPUT_FIELD.items():
+                if field == "debug_data" and not self.collect_debug:
+                    continue
+                fields[field].append(r.get(key))
 
-        tokenizer = self.s2s_model.tokenizer
-        pad_id = self.s2s_model.model.stt_model.text_pad_id
+        if not self.collect_debug:
+            fields["debug_data"] = None
 
-        for idx in range(len(audio_filepaths)):
-            state = self.get_or_create_state(idx)
-            text_value = state.output_text_str or saved_paths_by_stream.get(idx, "")
-            texts.append(text_value)
-            audio_paths.append(saved_paths_by_stream.get(idx))
-            words.append(list(state.output_words))
-            asr_texts.append(state.output_asr_text_str)
-
-            token_data = state.get_token_tensors()
-            if token_data is not None:
-                gen_text, gen_asr_text, total_frames, gen_function_text = token_data
-                token_texts.append(gen_text)
-                token_asr_texts.append(gen_asr_text)
-                token_function_texts.append(gen_function_text)
-                token_lengths.append(total_frames)
-                lengths = torch.tensor([total_frames], dtype=torch.long)
-                texts_with_timestamps.append(
-                    tokens_to_str(gen_text, lengths, tokenizer=tokenizer, pad_id=pad_id, eval_text_turn_taking=True)[0]
-                )
-                asr_texts_with_timestamps.append(
-                    tokens_to_str(gen_asr_text, lengths, tokenizer=tokenizer, pad_id=pad_id, eval_text_turn_taking=True)[0]
-                )
-                raw_texts.append(
-                    tokens_to_str(gen_text, lengths, tokenizer=tokenizer, pad_id=pad_id, keep_pad=True)[0]
-                )
-                raw_asr_texts.append(
-                    tokens_to_str(gen_asr_text, lengths, tokenizer=tokenizer, pad_id=pad_id, keep_pad=True)[0]
-                )
-                if gen_function_text is not None:
-                    fc_text = tokens_to_str(gen_function_text, lengths, tokenizer=tokenizer, pad_id=pad_id, eval_text_turn_taking=False)[0]
-                    fc_text_raw = tokens_to_str(gen_function_text, lengths, tokenizer=tokenizer, pad_id=pad_id, keep_pad=True)[0]
-                    logging.info(f"Function calling channel: {fc_text}, fc_text_raw: {fc_text_raw}")
-            else:
-                token_texts.append(None)
-                token_asr_texts.append(None)
-                token_function_texts.append(None)
-                token_lengths.append(None)
-                texts_with_timestamps.append("")
-                asr_texts_with_timestamps.append("")
-                raw_texts.append("")
-                raw_asr_texts.append("")
-
-        debug_data = []
-        if self.collect_debug:
-            for idx in range(len(audio_filepaths)):
-                state = self.get_or_create_state(idx)
-                debug_data.append(getattr(state, "debug_steps", []))
-
-        return PipelineOutput(
-            texts=texts,
-            words=words,
-            asr_texts=asr_texts,
-            texts_with_timestamps=texts_with_timestamps,
-            asr_texts_with_timestamps=asr_texts_with_timestamps,
-            raw_texts=raw_texts,
-            raw_asr_texts=raw_asr_texts,
-            token_texts=token_texts,
-            token_asr_texts=token_asr_texts,
-            token_function_texts=token_function_texts,
-            token_lengths=token_lengths,
-            audio_filepaths=audio_paths,
-            debug_data=debug_data if debug_data else None,
-        )
+        return PipelineOutput(**fields)
 
     def _prefill_system_prompt(self, stream_id: int, system_prompt: str | None = None) -> torch.Tensor | None:
         """Prefill the system prompt for a new stream.

@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import torch
-from nemo.collections.asr.inference.utils.text_segment import Word
+
 from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
 
 
@@ -25,10 +25,8 @@ from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options 
 class S2SStreamingState:
     """Pipeline-level output accumulator for a single S2S stream.
 
-    Collects generated audio samples, text strings, and word timings
-    produced by each inference step.  Kept alive by the pipeline's
-    ``_state_pool`` until ``close_session()`` so the final
-    :class:`PipelineOutput` can be assembled.
+    Collects generated audio chunks and text parts produced by each
+    inference step, concatenating lazily to avoid O(n^2) copying.
 
     This is *not* the model-level decode state (KV caches, token
     workspaces) -- that is :class:`StreamingDecodeState` in
@@ -43,34 +41,47 @@ class S2SStreamingState:
     # Per-stream request options (system prompt, sampling overrides, etc.)
     options: S2SRequestOptions = field(default_factory=S2SRequestOptions)
 
-    # Growing audio buffer — shape (1, T), appended each step
-    audio_buffer: torch.Tensor = field(init=False)
+    # Audio chunks accumulated each step; use the ``audio_buffer`` property
+    # to get a single concatenated tensor (lazy, O(n) instead of O(n^2)).
+    _audio_chunks: list[torch.Tensor] = field(default_factory=list, repr=False)
+    _total_audio_samples: int = field(default=0, repr=False)
 
-    # Accumulated agent response text (built incrementally per step)
-    output_text_str: str = ""
-    # Accumulated ASR (user) text
-    output_asr_text_str: str = ""
-    # Word-level timings for the agent response
-    output_words: list[Word] = field(default_factory=list)
+    # Text parts accumulated each step; use the ``output_text_str`` /
+    # ``output_asr_text_str`` properties to get joined strings.
+    _text_parts: list[str] = field(default_factory=list, repr=False)
+    _asr_text_parts: list[str] = field(default_factory=list, repr=False)
 
     # Snapshots of full token-ID tensors, saved from StreamingDecodeState
     # before the decode context is destroyed at end-of-stream.
-    # Used for post-hoc tokens_to_str conversion.
+    # Used for post-hoc tokens_to_str conversion and CTM generation.
     final_gen_text: torch.Tensor | None = None
     final_gen_asr_text: torch.Tensor | None = None
     final_gen_function_text: torch.Tensor | None = None
     final_total_frames: int = 0
 
-    def __post_init__(self) -> None:
-        # Depends on self.device and self.dtype, so can't be a field default.
-        self.audio_buffer = torch.empty((1, 0), device=self.device, dtype=self.dtype)
+    @property
+    def audio_buffer(self) -> torch.Tensor:
+        """Concatenated audio from all steps. Built lazily to avoid O(n^2) copies."""
+        if not self._audio_chunks:
+            return torch.empty((1, 0), device=self.device, dtype=self.dtype)
+        return torch.cat(self._audio_chunks, dim=-1)
+
+    @property
+    def output_text_str(self) -> str:
+        """Accumulated agent response text. Joined lazily to avoid O(n^2) copies."""
+        return "".join(self._text_parts)
+
+    @property
+    def output_asr_text_str(self) -> str:
+        """Accumulated ASR (user) text. Joined lazily to avoid O(n^2) copies."""
+        return "".join(self._asr_text_parts)
 
     def reset(self) -> None:
         """Reset all accumulated outputs to initial state."""
-        self.audio_buffer = torch.empty((1, 0), device=self.device, dtype=self.dtype)
-        self.output_text_str = ""
-        self.output_asr_text_str = ""
-        self.output_words.clear()
+        self._audio_chunks.clear()
+        self._total_audio_samples = 0
+        self._text_parts.clear()
+        self._asr_text_parts.clear()
         self.final_gen_text = None
         self.final_gen_asr_text = None
         self.final_gen_function_text = None
@@ -93,21 +104,14 @@ class S2SStreamingState:
             append_tensor = append_tensor.reshape(1, -1)
         elif append_tensor.dim() == 1:
             append_tensor = append_tensor.unsqueeze(0)
-        prior_samples = int(self.audio_buffer.shape[-1])
-        appended_samples = int(append_tensor.shape[-1])
-        self.audio_buffer = torch.cat(
-            [self.audio_buffer, append_tensor.to(self.device, dtype=self.dtype)], dim=-1
-        )
+        self._audio_chunks.append(append_tensor.to(self.device, dtype=self.dtype))
+        self._total_audio_samples += int(append_tensor.shape[-1])
 
         if isinstance(text, str) and text:
-            self.output_text_str += text
-            if appended_samples > 0 and self.output_sample_rate > 0:
-                start_t = float(prior_samples) / float(self.output_sample_rate)
-                end_t = float(prior_samples + appended_samples) / float(self.output_sample_rate)
-                self.output_words.append(Word(text=text, start=start_t, end=end_t, conf=1.0))
+            self._text_parts.append(text)
 
         if isinstance(asr_text, str) and asr_text:
-            self.output_asr_text_str += asr_text
+            self._asr_text_parts.append(asr_text)
 
     def save_token_tensors(
         self,
@@ -133,4 +137,5 @@ class S2SStreamingState:
 
     def clear_audio_buffer(self) -> None:
         """Clear the audio buffer (e.g. after sending audio to a client)."""
-        self.audio_buffer = torch.empty((1, 0), device=self.device, dtype=self.dtype)
+        self._audio_chunks.clear()
+        self._total_audio_samples = 0

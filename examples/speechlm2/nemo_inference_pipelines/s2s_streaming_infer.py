@@ -32,7 +32,7 @@ from nemo.collections.speechlm2.inference.factory.s2s_pipeline_builder import S2
 from nemo.collections.speechlm2.inference.utils.stepprogressbar import StepProgressBar
 from nemo.collections.speechlm2.inference.utils.audio_data import (
     calculate_durations_incl_padding,
-    dump_output,
+    dump_output_json,
     prepare_audio_data,
 )
 from nemo.collections.speechlm2.inference.utils.pipeline_utils import clean_pred_text
@@ -87,7 +87,7 @@ def main(cfg: DictConfig):
         logging.info(f"WER: {wer:.4f} ({wer * 100:.2f}%), n={len(all_refs)}")
 
     output_dir = cfg.get("output_dir", "./generated")
-    dump_output(audio_filepaths, output, output_dir, options, ground_truths)
+    dump_output_json(audio_filepaths, output, output_dir, options, ground_truths)
     logging.info(f"Transcriptions written to {output_dir}/output_processed.json and {output_dir}/output_raw.json")
 
 

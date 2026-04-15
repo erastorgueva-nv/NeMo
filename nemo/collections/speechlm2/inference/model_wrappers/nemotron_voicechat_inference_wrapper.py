@@ -636,6 +636,10 @@ class NemotronVoicechatInferenceWrapper:
 
         # --- Update remaining state fields ---
         if not use_llm_cache:
+            # WARNING: Without the KV cache, input_embeds_history grows
+            # linearly with session length and the full-sequence LLM forward
+            # pass is O(n^2).  This path is intended for debugging / parity
+            # testing only and is not suitable for long sessions or deployment.
             state.input_embeds_history = state.input_embeds_history + new_input_embeds
         if use_llm_cache:
             state.llm_cache_position_offset += num_frames_per_chunk

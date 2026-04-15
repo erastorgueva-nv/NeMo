@@ -96,12 +96,20 @@ over chunks and calls a single step method:
             # out.audio: newly decoded audio for this step
             print(f"[stream {out.stream_id}] agent: {out.text}  user: {out.asr_text}")
     pipeline.close_session()
-    return PipelineOutput(...)  # aggregated final results
+    return PipelineOutput(...)  # texts, token tensors, audio filepaths
 
 Each ``generate_step()`` call returns a list of ``GenerateStepOutput`` carrying
 the partial text, ASR text, and audio produced by that single chunk.  The
-``PipelineOutput`` returned after ``close_session()`` carries the aggregated
-results for the entire session.
+``run()`` method uses these to build a ``PipelineOutput`` with the aggregated
+results for all streams.
+
+Output files (wav, txt, CTM) are written as each stream finishes, so
+results are available on disk before the full run completes.
+Two token-level CTM files are produced per stream:
+``<stem>.ctm`` for agent output tokens and ``<stem>_asr.ctm`` for user
+(ASR) tokens.  Timestamps in both files reflect when the text token was
+*generated* by the model, which is not necessarily when the corresponding
+speech was spoken.
 
 ``generate_step()`` is the unified entry point used by **both** the batch
 ``run()`` method and server deployments.
@@ -185,8 +193,10 @@ The pipeline maintains two separate state objects per stream:
 
 **S2SStreamingState** (pipeline level)
     Lives in the pipeline's ``_state_pool``.  Accumulates generated audio
-    chunks, text strings, and word timings across steps.  Kept alive until
-    ``close_session()`` so the final ``PipelineOutput`` can be assembled.
+    chunks and text strings across steps.  In the ``run()``
+    batch path, the state is freed as soon as the stream's output files are
+    saved.  In the server path, the caller controls lifetime via
+    ``close_session()`` or ``delete_state()``.
 
 
 Inference Backends

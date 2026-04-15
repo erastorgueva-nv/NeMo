@@ -110,14 +110,14 @@ def calculate_durations_incl_padding(
     return durations
 
 
-def dump_output(
+def dump_output_json(
     audio_filepaths: list[str],
     output: PipelineOutput,
     output_dir: str,
     options: list[S2SRequestOptions],
     ground_truths: list[str | None],
 ) -> None:
-    """Dump inference results to output_processed.json, output_raw.json, and per-file CTM.
+    """Dump inference results to output_processed.json and output_raw.json.
 
     ``output_processed.json`` uses the canonical S2S processed-output schema
     (timestamps in pred_text via ``<|t|>`` / ``<$t$>``).
@@ -126,9 +126,6 @@ def dump_output(
     """
     output_processed_path = os.path.join(output_dir, "output_processed.json")
     output_raw_path = os.path.join(output_dir, "output_raw.json")
-    output_ctm_dir = os.path.join(output_dir, "ctm")
-
-    os.makedirs(output_ctm_dir, exist_ok=True)
 
     asr_texts_ts = output.asr_texts_with_timestamps or [None] * len(audio_filepaths)
     texts_ts = output.texts_with_timestamps or [""] * len(audio_filepaths)
@@ -136,17 +133,11 @@ def dump_output(
     raw_asr_texts = output.raw_asr_texts or [""] * len(audio_filepaths)
 
     with open(output_processed_path, 'w') as f_proc, open(output_raw_path, 'w') as f_raw:
-        for audio_filepath, words, opts, gt, pred_text_ts, pred_src_text_ts, pred_text_raw, pred_src_text_raw in zip(
-            audio_filepaths, output.words, options, ground_truths,
+        for audio_filepath, opts, gt, pred_text_ts, pred_src_text_ts, pred_text_raw, pred_src_text_raw in zip(
+            audio_filepaths, options, ground_truths,
             texts_ts, asr_texts_ts, raw_texts, raw_asr_texts,
         ):
             stem = os.path.splitext(os.path.basename(audio_filepath))[0]
-            ctm_filepath = os.path.abspath(os.path.join(output_ctm_dir, f"{stem}.ctm"))
-            with open(ctm_filepath, 'w') as ctm_fout:
-                for word in words:
-                    ctm_line = f"A {round(word.start, 2)} {round(word.duration, 2)} {word.text} {word.conf}"
-                    ctm_fout.write(f"{stem} {ctm_line}\n")
-
             pred_audio_path = os.path.join(output_dir, "wav", f"{stem}.wav")
 
             record_processed = {
