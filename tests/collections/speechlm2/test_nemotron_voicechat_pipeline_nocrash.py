@@ -89,9 +89,9 @@ def _build_no_crash_pipeline(
         _TEST_DEFAULTS,
         {"audio_file": audio_path, "output_dir": output_dir, "s2s": {"model_path": model_path}},
     )
-    for overrides in overrides:
-        if overrides:
-            cfg = OmegaConf.merge(cfg, overrides)
+    for ov in overrides:
+        if ov:
+            cfg = OmegaConf.merge(cfg, ov)
     return S2SPipelineBuilder.build_pipeline(cfg)
 
 

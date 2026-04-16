@@ -12,9 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from queue import Queue
 import torch
-from nemo.utils import logging
 
 from nemo.collections.speechlm2.inference.model_wrappers.decode_state import (
     InferenceStepResult,
@@ -23,30 +21,46 @@ from nemo.collections.speechlm2.inference.model_wrappers.decode_state import (
 
 
 class S2SContextManager:
+    """Manages the lifecycle of model-level decode state for S2S streaming inference.
+
+    Each active stream gets a :class:`StreamingDecodeState` that holds LLM KV
+    caches, TTS KV caches, perception cache, codec cache, token workspaces
+    (``gen_text``, ``gen_asr_text``), and ``frame_idx``.  These are created by
+    the model wrapper's ``create_decode_state()`` and mutated in-place by
+    ``infer_one_step()``.
+
+    This class is kept separate from the pipeline-level output accumulator
+    (:class:`S2SStreamingOutput`) so that the heavy GPU tensors inside
+    ``StreamingDecodeState`` can be released as soon as a stream finishes,
+    independently of how long the caller holds on to the accumulated text
+    and audio results.
+
+    :meth:`get_context` lazily creates a context on first access,
+    :meth:`reset_streams` destroys contexts at end-of-stream, and
+    :meth:`reset` destroys all contexts.  A stream ID may be reused
+    after its context has been destroyed.
+    """
 
     def __init__(
         self,
         s2s_model,
-        num_slots: int,
         max_len: int,
     ):
         self.s2s_model = s2s_model
-        self.num_slots = num_slots
-        
         self.max_len = max_len
         self.device = getattr(self.s2s_model, "device", torch.device("cpu"))
         self.dtype = getattr(self.s2s_model, "dtype", torch.float32)
 
-        self.reset()
+        self._contexts: dict[int, StreamingDecodeState] = {}
 
     def reset(self) -> None:
-        """Reset all bookkeeping for a new streaming session."""
-        self.streamidx2slotidx: dict[int, int] = {}
-        self.slotidx2streamidx: dict[int, int] = {}
-        self.free_slots = Queue(self.num_slots)
-        for i in range(self.num_slots):
-            self.free_slots.put(i)
-        self.slot_contexts: list[StreamingDecodeState | None] = [None] * self.num_slots
+        """Release all contexts and start fresh."""
+        self._contexts.clear()
+
+    @property
+    def active_stream_ids(self) -> set[int]:
+        """Stream IDs that currently have an active decode context."""
+        return set(self._contexts.keys())
 
     def _create_context(self) -> StreamingDecodeState:
         """Allocate a fresh context backed by the realtime inference model."""
@@ -54,38 +68,22 @@ class S2SContextManager:
             raise RuntimeError("s2s_model must provide create_decode_state(max_len)")
         return self.s2s_model.create_decode_state(self.max_len)
 
-    def _ensure_slot(self, stream_id: int) -> int:
-        if stream_id not in self.streamidx2slotidx:
-            if self.free_slots.empty():
-                # Emergency cleanup: force-release all slots for a fresh start
-                # This handles cases where previous streams didn't end properly
-                # (e.g., exceptions, client disconnects, missing is_last=True)
-                logging.warning(f"No free slots available - forcing cleanup of all {self.num_slots} slots")
-                orphaned_streams = list(self.slotidx2streamidx.values())
-                if orphaned_streams:
-                    logging.warning(f"Orphaned streams being cleaned up: {orphaned_streams}")
-                for slot_idx in range(self.num_slots):
-                    self.reset_slot(slot_idx)
-            slot_idx = self.free_slots.get()
-            # Ensure the slot is completely clean before assigning to new stream
-            if self.slot_contexts[slot_idx] is not None:
-                logging.warning(f"Slot {slot_idx} was not properly cleaned. Forcing cleanup.")
-                self.slot_contexts[slot_idx] = None
-            self.streamidx2slotidx[stream_id] = slot_idx
-            self.slotidx2streamidx[slot_idx] = stream_id
-        return self.streamidx2slotidx[stream_id]
+    def get_context(self, stream_ids: list[int]) -> StreamingDecodeState:
+        """Return the decode context for the given stream IDs, creating if needed."""
+        if len(stream_ids) == 0:
+            return self._create_context()
+        if len(stream_ids) != 1:
+            raise NotImplementedError("get_context currently supports batch_size == 1")
 
-    def reset_slot(self, slot_idx: int) -> None:
-        """Release a slot back to the pool."""
-        if slot_idx < 0 or slot_idx >= self.num_slots:
-            return
-        # Set to None to break reference and allow garbage collection
-        self.slot_contexts[slot_idx] = None
-        stream_id = self.slotidx2streamidx.get(slot_idx)
-        if stream_id is not None:
-            del self.slotidx2streamidx[slot_idx]
-            del self.streamidx2slotidx[stream_id]
-        self.free_slots.put(slot_idx)
+        stream_id = stream_ids[0]
+        if stream_id not in self._contexts:
+            self._contexts[stream_id] = self._create_context()
+
+        return self._contexts[stream_id]
+
+    def get_context_for_stream(self, stream_id: int) -> StreamingDecodeState | None:
+        """Return the decode context for a single stream, or *None* if absent."""
+        return self._contexts.get(stream_id)
 
     def update_context(
         self,
@@ -107,14 +105,9 @@ class S2SContextManager:
             raise NotImplementedError("update_context currently supports batch_size == 1")
 
         stream_id = stream_ids[0]
-        slot_idx = self.streamidx2slotidx.get(stream_id)
-        if slot_idx is None:
-            raise RuntimeError(f"Stream {stream_id} is not registered in the context manager")
-
-        context = self.slot_contexts[slot_idx]
+        context = self._contexts.get(stream_id)
         if context is None:
-            context = self._create_context()
-            self.slot_contexts[slot_idx] = context
+            raise RuntimeError(f"Stream {stream_id} is not registered in the context manager")
 
         start_idx = context.frame_idx
         end_idx = start_idx + num_frames
@@ -128,25 +121,10 @@ class S2SContextManager:
         if context.subword_mask is not None:
             context.subword_mask[:, start_idx:end_idx] = True
 
-    def reset_slots(self, stream_ids: list[int], eos_flags: list[bool]) -> None:
+    def reset_streams(self, stream_ids: list[int], eos_flags: list[bool]) -> None:
         """Release contexts for streams that signalled end-of-stream."""
         if len(stream_ids) != len(eos_flags):
             raise ValueError("stream_ids and eos_flags must have the same length")
         for stream_id, eos_flag in zip(stream_ids, eos_flags):
-            if eos_flag and stream_id in self.streamidx2slotidx:
-                self.reset_slot(self.streamidx2slotidx[stream_id])
-
-    def get_context(self, stream_ids: list[int]) -> tuple[StreamingDecodeState, dict[int, int]]:
-        """Return the cached context associated with the provided stream ids."""
-        if len(stream_ids) == 0:
-            return self._create_context(), {}
-        if len(stream_ids) != 1:
-            raise NotImplementedError("get_context currently supports batch_size == 1")
-
-        stream_id = stream_ids[0]
-        slot_idx = self._ensure_slot(stream_id)
-
-        if self.slot_contexts[slot_idx] is None:
-            self.slot_contexts[slot_idx] = self._create_context()
-
-        return self.slot_contexts[slot_idx], {slot_idx: 0}
+            if eos_flag and stream_id in self._contexts:
+                del self._contexts[stream_id]

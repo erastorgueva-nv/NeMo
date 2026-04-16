@@ -14,9 +14,8 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
+from nemo.collections.speechlm2.inference.streaming.state.s2s_streaming_output import S2SStreamingOutput
 
 
 class S2SPipelineInterface:
@@ -24,20 +23,20 @@ class S2SPipelineInterface:
 
     This class is intentionally kept minimal and mirrors the behaviour of
     ``BasePipeline`` that is used for streaming ASR pipelines.  It
-    provides a small in-memory *state pool* that stores per-stream objects
-    (cache, running buffers, etc.) required by a concrete pipeline
+    provides an in-memory *state pool* that stores per-stream
+    :class:`S2SStreamingOutput` objects (accumulated audio, text, and
+    finalized token fields) required by a concrete pipeline
     implementation.  Sub-classes are expected to implement
-    :py:meth:`create_state` to construct a fresh state object.
+    :py:meth:`create_state` to construct a fresh output object.
     """
 
     def __init__(self) -> None:
-        # Pool that holds per-stream state, keyed by ``stream_id``
-        self._state_pool: dict[int, Any] = {}
+        self._state_pool: dict[int, S2SStreamingOutput] = {}
 
     # ------------------------------------------------------------------
     # State helpers
     # ------------------------------------------------------------------
-    def get_state(self, stream_id: int):
+    def get_state(self, stream_id: int) -> S2SStreamingOutput | None:
         """Return the state object for *stream_id* or *None* if it does not exist."""
         return self._state_pool.get(stream_id, None)
 
@@ -46,7 +45,7 @@ class S2SPipelineInterface:
         if stream_id in self._state_pool:
             del self._state_pool[stream_id]
 
-    def create_state(self, options: S2SRequestOptions | None = None):
+    def create_state(self, options: S2SRequestOptions | None = None) -> S2SStreamingOutput:
         """Create and return a *new*, *empty* state object.
 
         Args:
@@ -58,7 +57,7 @@ class S2SPipelineInterface:
         """
         raise NotImplementedError("`create_state()` must be implemented in a subclass.")
 
-    def get_or_create_state(self, stream_id: int, options: S2SRequestOptions | None = None):
+    def get_or_create_state(self, stream_id: int, options: S2SRequestOptions | None = None) -> S2SStreamingOutput:
         """Return existing state for *stream_id* or create a new one via :py:meth:`create_state`."""
         if stream_id not in self._state_pool:
             self._state_pool[stream_id] = self.create_state(options)

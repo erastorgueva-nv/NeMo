@@ -21,7 +21,7 @@ import soundfile as sf
 
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
-from nemo.collections.speechlm2.inference.utils.pipeline_utils import PipelineOutput
+from nemo.collections.speechlm2.inference.streaming.state.s2s_streaming_output import S2SStreamingOutput
 
 
 def prepare_audio_data(
@@ -112,7 +112,7 @@ def calculate_durations_incl_padding(
 
 def dump_output_json(
     audio_filepaths: list[str],
-    output: PipelineOutput,
+    outputs: list[S2SStreamingOutput],
     output_dir: str,
     options: list[S2SRequestOptions],
     ground_truths: list[str | None],
@@ -127,16 +127,8 @@ def dump_output_json(
     output_processed_path = os.path.join(output_dir, "output_processed.json")
     output_raw_path = os.path.join(output_dir, "output_raw.json")
 
-    asr_texts_ts = output.asr_texts_with_timestamps or [None] * len(audio_filepaths)
-    texts_ts = output.texts_with_timestamps or [""] * len(audio_filepaths)
-    raw_texts = output.raw_texts or [""] * len(audio_filepaths)
-    raw_asr_texts = output.raw_asr_texts or [""] * len(audio_filepaths)
-
     with open(output_processed_path, 'w') as f_proc, open(output_raw_path, 'w') as f_raw:
-        for audio_filepath, opts, gt, pred_text_ts, pred_src_text_ts, pred_text_raw, pred_src_text_raw in zip(
-            audio_filepaths, options, ground_truths,
-            texts_ts, asr_texts_ts, raw_texts, raw_asr_texts,
-        ):
+        for audio_filepath, opts, gt, out in zip(audio_filepaths, options, ground_truths, outputs):
             stem = os.path.splitext(os.path.basename(audio_filepath))[0]
             pred_audio_path = os.path.join(output_dir, "wav", f"{stem}.wav")
 
@@ -145,8 +137,8 @@ def dump_output_json(
                 "target_text": "",
                 "pred_audio": pred_audio_path,
                 "src_text": gt or "",
-                "pred_src_text": pred_src_text_ts or "",
-                "pred_text": pred_text_ts or "",
+                "pred_src_text": out.asr_text_with_timestamps or "",
+                "pred_text": out.text_with_timestamps or "",
                 "system_prompt": opts.system_prompt or "",
             }
             json.dump(record_processed, f_proc, ensure_ascii=False)
@@ -158,8 +150,8 @@ def dump_output_json(
                 "target_text": "",
                 "pred_audio": pred_audio_path,
                 "src_text": gt or "",
-                "pred_src_text": pred_src_text_raw or "",
-                "pred_text": pred_text_raw or "",
+                "pred_src_text": out.raw_asr_text or "",
+                "pred_text": out.raw_text or "",
                 "system_prompt": opts.system_prompt or "",
             }
             json.dump(record_raw, f_raw, ensure_ascii=False)

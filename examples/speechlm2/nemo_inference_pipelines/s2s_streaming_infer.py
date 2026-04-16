@@ -60,7 +60,7 @@ def main(cfg: DictConfig):
 
     timer = SimpleTimer()
     timer.start()
-    output = pipeline.run(audio_filepaths, options=options, progress_bar=progress_bar)
+    outputs = pipeline.run(audio_filepaths, options=options, progress_bar=progress_bar)
     timer.stop()
     exec_dur = timer.total_sec()
     logging.info(f"Generated {len(audio_filepaths)} files in {exec_dur:.2f}s")
@@ -73,9 +73,9 @@ def main(cfg: DictConfig):
 
     # Compute WER when ground-truth texts are available (micro-average,
     # matching the offline eval in speechlm2.parts.metrics.asr_cer_wer)
-    asr_texts = output.asr_texts_with_timestamps or [None] * len(audio_filepaths)
     all_refs, all_hyps = [], []
-    for gt, asr_text in zip(ground_truths, asr_texts):
+    for gt, out in zip(ground_truths, outputs):
+        asr_text = out.asr_text_with_timestamps
         if gt and asr_text:
             cleaned_gt = clean_pred_text(gt)
             cleaned_pred = clean_pred_text(asr_text)
@@ -87,7 +87,7 @@ def main(cfg: DictConfig):
         logging.info(f"WER: {wer:.4f} ({wer * 100:.2f}%), n={len(all_refs)}")
 
     output_dir = cfg.get("output_dir", "./generated")
-    dump_output_json(audio_filepaths, output, output_dir, options, ground_truths)
+    dump_output_json(audio_filepaths, outputs, output_dir, options, ground_truths)
     logging.info(f"Transcriptions written to {output_dir}/output_processed.json and {output_dir}/output_raw.json")
 
 

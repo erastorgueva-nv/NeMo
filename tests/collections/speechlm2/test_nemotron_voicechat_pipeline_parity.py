@@ -171,17 +171,17 @@ def run_parity_check(
     logging.info("Running incremental inference (pipeline.run) ...")
     t0 = time.time()
     pipeline.collect_debug = True
-    pipeline_output = pipeline.run(
+    outputs = pipeline.run(
         [audio_path],
         options=[S2SRequestOptions(system_prompt=system_prompt)],
     )
     logging.info(f"  incremental done in {time.time() - t0:.2f}s")
 
-    inc_tokens = pipeline_output.token_texts[0] if pipeline_output.token_texts else None
-    inc_asr_tokens = pipeline_output.token_asr_texts[0] if pipeline_output.token_asr_texts else None
-    inc_debug = _merge_incremental_debug_steps(
-        pipeline_output.debug_data[0] if pipeline_output.debug_data and pipeline_output.debug_data[0] else []
-    )
+    output = outputs[0]
+    inc_tokens = output.token_text
+    inc_asr_tokens = output.token_asr_text
+    assert output.debug_data, "collect_debug=True but no debug data was recorded"
+    inc_debug = _merge_incremental_debug_steps(output.debug_data)
 
     # -- Compare --
     # offline_inference returns logits for ALL positions (including prompt),
@@ -278,9 +278,9 @@ def _build_parity_pipeline(
             },
         },
     )
-    for overrides in overrides:
-        if overrides:
-            cfg = OmegaConf.merge(cfg, overrides)
+    for ov in overrides:
+        if ov:
+            cfg = OmegaConf.merge(cfg, ov)
     return S2SPipelineBuilder.build_pipeline(cfg)
 
 

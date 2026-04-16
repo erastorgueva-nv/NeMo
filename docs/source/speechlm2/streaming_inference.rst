@@ -69,241 +69,10 @@ Programmatic Usage
     from nemo.collections.speechlm2.inference import S2SPipelineBuilder
 
     pipeline = S2SPipelineBuilder.build_pipeline(cfg)
-    output = pipeline.run(audio_filepaths, options=options)
+    outputs = pipeline.run(audio_filepaths, options=options)
 
-    # output.texts            -- generated agent text per file
-    # output.asr_texts        -- recognized user text per file
-    # output.audio_filepaths  -- paths to generated .wav files
-
-
-Architecture
-------------
-
-The Core Loop
-^^^^^^^^^^^^^
-
-Like the ASR pipeline's ``BasePipeline.run()``, the S2S pipeline iterates
-over chunks and calls a single step method:
-
-.. code-block:: python
-
-    pipeline.open_session()
-    for frames in streamer:
-        # Each call returns partial results for this chunk only
-        step_outputs = pipeline.generate_step(frames)
-        for out in step_outputs:
-            # out.text / out.asr_text: new tokens from this step
-            # out.audio: newly decoded audio for this step
-            print(f"[stream {out.stream_id}] agent: {out.text}  user: {out.asr_text}")
-    pipeline.close_session()
-    return PipelineOutput(...)  # texts, token tensors, audio filepaths
-
-Each ``generate_step()`` call returns a list of ``GenerateStepOutput`` carrying
-the partial text, ASR text, and audio produced by that single chunk.  The
-``run()`` method uses these to build a ``PipelineOutput`` with the aggregated
-results for all streams.
-
-Output files (wav, txt, CTM) are written as each stream finishes, so
-results are available on disk before the full run completes.
-Two token-level CTM files are produced per stream:
-``<stem>.ctm`` for agent output tokens and ``<stem>_asr.ctm`` for user
-(ASR) tokens.  Timestamps in both files reflect when the text token was
-*generated* by the model, which is not necessarily when the corresponding
-speech was spoken.
-
-``generate_step()`` is the unified entry point used by **both** the batch
-``run()`` method and server deployments.
-
-
-What Happens Inside One Step
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-.. code-block:: text
-
-    generate_step(frames)
-        │
-        ├─ for each frame where is_first=True:
-        │      │
-        │      └─ _init_state(stream_id, options)
-        │             1. augment_with_defaults()   ← fill None fields from YAML
-        │             2. create_state(options)      ← pipeline-level state
-        │             3. create context_manager     ← KV caches, decode slots
-        │             4. prefill system prompt      ← populate LLM KV cache
-        │
-        ├─ any frames with audio?
-        │      │
-        │     NO → return empty outputs  (server prefill-only request)
-        │      │
-        │    YES ↓
-        │
-        └─ generate_step_for_frames()
-               1. audio buffering
-               2. perception encoder
-               3. per-frame LLM loop
-               4. per-frame TTS
-               5. codec decode
-               6. state updates + output accumulation
-               7. return list[GenerateStepOutput]
-
-Each call to ``generate_step(frames)`` performs:
-
-1. **Stream init on** ``is_first`` -- If a frame has ``is_first=True``, the
-   private ``_init_state()`` method runs: per-stream options are merged with
-   pipeline defaults (via ``S2SRequestOptions.augment_with_defaults()``),
-   a fresh ``S2SStreamingState`` is created, the context manager is
-   allocated, and the LLM KV cache is prefilled with the system prompt and
-   TTS speaker embedding.  This mirrors ASR's ``init_state()`` called inside
-   ``transcribe_step()``.  If the frame carries no audio (zero-length
-   samples), the method returns after init — this is the recommended
-   pattern for latency-sensitive server deployments (see
-   :ref:`init-and-latency` below).
-
-2. **Audio buffering** -- ``BatchedAudioBufferer`` (reused from ASR
-   infrastructure) maintains a sliding window of ``buffer_size_in_secs``.
-
-3. **Model inference** via ``infer_one_step(audio_buffer, state)``:
-
-   a. **Perception** -- The audio buffer is encoded by the streaming
-      FastConformer encoder into frame embeddings.
-   b. **Per-frame LLM loop** -- For each of the ``num_frames_per_chunk``
-      frames, the pipeline builds an input embedding (user audio +
-      previous-step text/ASR tokens), runs it through the LLM, and obtains
-      predicted text and ASR tokens.
-   c. **Per-frame TTS** -- Each predicted text token is fed into the EarTTS
-      model to produce audio codec codes.
-   d. **Codec decode** -- The accumulated codes are decoded into a waveform.
-
-4. **State updates** -- The context manager advances ``frame_idx`` and
-   updates the subword mask.
-
-5. **Output accumulation** -- Decoded audio and text are appended to the
-   per-stream ``S2SStreamingState``.
-
-
-Two Kinds of State
-^^^^^^^^^^^^^^^^^^
-
-The pipeline maintains two separate state objects per stream:
-
-**StreamingDecodeState** (model level)
-    Lives in ``S2SContextManager`` slots.  Contains LLM KV cache, TTS KV
-    cache, perception cache, codec cache, token workspaces (``gen_text``,
-    ``gen_asr_text``), and ``frame_idx``.  Created by the wrapper, mutated
-    in-place by ``infer_one_step()``, destroyed at end-of-stream.
-
-**S2SStreamingState** (pipeline level)
-    Lives in the pipeline's ``_state_pool``.  Accumulates generated audio
-    chunks and text strings across steps.  In the ``run()``
-    batch path, the state is freed as soon as the stream's output files are
-    saved.  In the server path, the caller controls lifetime via
-    ``close_session()`` or ``delete_state()``.
-
-
-Inference Backends
-^^^^^^^^^^^^^^^^^^
-
-NemotronVoiceChat has two inference components that each need a backend:
-
-- **LLM** (DuplexSTT backbone) -- takes audio embeddings from the perception
-  encoder and predicts text tokens, ASR tokens, and optional function-call
-  tokens at each frame.
-- **TTS** (EarTTS) -- takes the predicted text token and produces audio codec
-  codes (RVQ acoustic tokens).
-
-Each component can run on **native PyTorch** or **vLLM**, selected by the
-``engine_type`` config value:
-
-.. list-table::
-   :header-rows: 1
-   :widths: 35 30 30
-
-   * - ``engine_type``
-     - LLM backend
-     - TTS backend
-   * - ``native``
-     - ``PyTorchLLM``
-     - ``PyTorchEarTTS``
-   * - ``vllm_llm``
-     - ``VLLMLLM``
-     - ``PyTorchEarTTS``
-   * - ``vllm_eartts``
-     - ``PyTorchLLM``
-     - ``VLLMEarTTS``
-   * - ``vllm_llm_vllm_eartts``
-     - ``VLLMLLM``
-     - ``VLLMEarTTS``
-
-All four backend classes implement the same ``ModelInterface`` ABC (defined in
-``inference.model_wrappers.backend.interface``), so the inference wrapper
-(``NemotronVoicechatInferenceWrapper``) can treat them uniformly via two
-attributes:
-
-- ``model_llm_interface`` -- the LLM backend
-- ``model_eartts_interface`` -- the TTS backend
-
-The backend classes live under ``inference.model_wrappers.backend/``:
-
-.. code-block:: text
-
-    backend/
-        interface.py            # ModelInterface ABC + shared sampling
-        pytorch/
-            model.py            # PyTorchLLM  (wraps DuplexSTT forward pass)
-            eartts.py           # PyTorchEarTTS  (wraps DuplexEARTTS.infer_codes_one_step)
-        vllm/
-            base.py             # VLLMModelBase  (engine lifecycle, async loop)
-            llm.py              # VLLMLLM  (DuplexSTT via vLLM)
-            eartts.py           # VLLMEarTTS  (EarTTS via vLLM)
-    factory.py                  # create_model()  dispatches to the right class
-
-``ModelInterface`` provides shared utilities used by the LLM backends:
-top-p (nucleus) sampling, repetition penalty, and temperature scaling.
-These are applied **post-hoc** on the returned logits -- vLLM internally
-runs with ``skip_sampling=True`` and greedy decoding.
-
-Each backend also exposes lifecycle methods that the wrapper calls uniformly:
-
-- ``prefill_prompt(embeddings, ...)`` -- Warm up KV cache (native) or
-  prefill the vLLM engine with system-prompt embeddings before streaming.
-- ``compile()`` -- Apply ``torch.compile`` to the TTS backbone (native
-  only; no-op for vLLM).
-- ``setup_subword_cache(cfg)`` -- Enable the TTS subword embedding cache
-  (native only; no-op for vLLM).
-
-The ``factory.create_model()`` function is the single entry point that
-dispatches to the correct class based on a per-component ``engine_type``
-string (``native_llm``, ``native_eartts``, ``vllm_llm``, ``vllm_eartts``).
-
-vLLM Integration Details
-""""""""""""""""""""""""
-
-When ``engine_type`` includes ``vllm``, the pipeline loads vLLM engines
-**in-process** alongside the native PyTorch components -- there is no
-disaggregated multi-server setup.  Each vLLM component runs as an
-``AsyncLLM`` engine in the same Python process, sharing GPU memory with the
-native perception encoder and codec decoder.
-
-The vLLM engines manage their own KV caches via PagedAttention.  Both
-``VLLMLLM`` and ``VLLMEarTTS`` inherit from ``VLLMModelBase``, which wraps a
-``CustomInputAsyncVLLMEngine`` (defined in ``inference.vllm.streaming_llm_engine``)
-and provides:
-
-- An internal ``asyncio`` event loop for blocking synchronous calls
-- Request lifecycle management (start, abort, restart)
-- Automatic checkpoint conversion to vLLM format on first use
-
-``CustomInputAsyncVLLMEngine`` is a thin wrapper around vLLM's ``AsyncLLM``
-that adds support for custom input tensor specifications (multi-tensor
-inputs like audio embeddings, subword IDs, speaker latents).  The
-``engine_kind`` parameter (``"llm"`` or ``"eartts"``) selects EarTTS-specific
-runtime settings (TRITON attention backend, TF32 precision, guidance scale)
-without introducing inheritance between TTS and LLM engine classes.
-
-This requires a custom vLLM fork with NemotronVoiceChat model support:
-
-.. code-block:: bash
-
-    pip install git+https://github.com/vklimkov-nvidia/vllm@vklimkov/voicechat
+    # returns list[S2SStreamingOutput], one per input file
+    # each element has: .output_text_str, .output_asr_text_str, .audio_filepath, ...
 
 
 Configuration
@@ -457,10 +226,10 @@ initialization (context creation, KV-cache prefill).  If the frame also
 carries audio, inference runs immediately after init in the same call.
 
 For **latency-sensitive** server deployments (real-time voice chat),
-prefill can take hundreds of milliseconds or even multiple seconds.  
-Clients should send ``is_first`` with **empty audio**, wait for the 
-response confirming init is done, and only then start recording the 
-user's microphone.  This prevents audio from queuing up during the 
+prefill can take hundreds of milliseconds or even multiple seconds.
+Clients should send ``is_first`` with **empty audio**, wait for the
+response confirming init is done, and only then start recording the
+user's microphone.  This prevents audio from queuing up during the
 expensive prefill phase.
 
 For **batch/offline** usage (CLI ``run()``), there is no real-time
@@ -479,30 +248,260 @@ Batch Size
 The pipeline currently supports ``batch_size=1`` (one stream at a time).
 
 
-File Layout
------------
+Architecture
+------------
+
+The Core Loop
+^^^^^^^^^^^^^
+
+Like the ASR pipeline's ``BasePipeline.run()``, the S2S pipeline iterates
+over chunks and calls a single step method:
+
+.. code-block:: python
+
+    pipeline.open_session()
+    for frames in streamer:
+        # Each call returns partial results for this chunk only
+        step_outputs = pipeline.generate_step(frames)
+        for out in step_outputs:
+            # out.text / out.asr_text: new tokens from this step
+            # out.audio: newly decoded audio for this step
+            print(f"[stream {out.stream_id}] agent: {out.text}  user: {out.asr_text}")
+    pipeline.close_session()
+    # returns list[S2SStreamingOutput], one per input file (finalized)
+
+Each ``generate_step()`` call returns a list of ``GenerateStepOutput`` carrying
+the partial text, ASR text, and audio produced by that single chunk.  The
+``run()`` method returns a list of finalized ``S2SStreamingOutput`` objects (one
+per input audio file) with the accumulated texts, token tensors, and audio
+filepaths.
+
+Output files (wav, txt, CTM) are written as each stream finishes, so
+results are available on disk before the full run completes.  In-memory
+audio chunks are freed after writing.  Accessing ``output.audio_buffer``
+after ``run()`` reloads from the saved ``.wav`` file.
+Two token-level CTM files are produced per stream:
+``<stem>.ctm`` for agent output tokens and ``<stem>_asr.ctm`` for user
+(ASR) tokens.  Timestamps in both files reflect when the text token was
+*generated* by the model, which is not necessarily when the corresponding
+speech was spoken.
+
+``generate_step()`` is the unified entry point used by **both** the batch
+``run()`` method and server deployments.
+
+
+What Happens Inside One Step
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 .. code-block:: text
 
-    nemo/collections/speechlm2/inference/
-    ├── __init__.py                          # Public exports
-    ├── factory/
-    │   └── s2s_pipeline_builder.py          # S2SPipelineBuilder
-    ├── pipelines/
-    │   ├── s2s_pipeline_interface.py        # Base: _state_pool, sessions
-    │   └── streaming_s2s_pipeline.py        # StreamingS2SPipeline
-    ├── model_wrappers/
-    │   ├── decode_state.py                  # StreamingDecodeState, InferenceStepResult
-    │   ├── nemotron_voicechat_inference_wrapper.py
-    │   ├── model_factory.py                 # Native / vLLM model interfaces
-    │   └── perception_cache.py              # Perception cache + CUDA graphs
-    ├── streaming/
-    │   ├── framing/
-    │   │   └── s2s_request_options.py       # S2SRequestOptions
-    │   └── state/
-    │       ├── s2s_state.py                 # S2SStreamingState
-    │       └── s2s_context_manager.py       # Slot-based decode-state lifecycle
-    ├── utils/
-    │   ├── pipeline_utils.py                # PipelineOutput, text helpers
-    │   └── audio_data.py                    # Manifest / folder loading
-    └── vllm/                                # Optional vLLM engine backend
+    generate_step(frames)
+        │
+        ├─ for each frame where is_first=True:
+        │      │
+        │      └─ _init_state(stream_id, options)
+        │             1. augment_with_defaults()   ← fill None fields from YAML
+        │             2. create_state(options)      ← pipeline-level state
+        │             3. reset context_manager       ← fresh decode-state storage
+        │             4. prefill system prompt      ← populate LLM KV cache
+        │
+        └─ any frames with audio?
+               │
+              NO → return empty outputs  (server prefill-only request)
+               │
+             YES → generate_step_for_frames()
+                      1. audio buffering
+                      2. perception encoder
+                      3. per-frame LLM loop
+                      4. per-frame TTS
+                      5. codec decode
+                      6. state updates + output accumulation
+                      7. return list[GenerateStepOutput]
+
+Each call to ``generate_step(frames)`` performs:
+
+1. **Stream init on** ``is_first`` -- If a frame has ``is_first=True``, the
+   private ``_init_state()`` method runs: per-stream options are merged with
+   pipeline defaults (via ``S2SRequestOptions.augment_with_defaults()``),
+   a fresh ``S2SStreamingOutput`` is created, the context manager is
+   allocated, and the LLM KV cache is prefilled with the system prompt and
+   TTS speaker embedding.  This mirrors ASR's ``init_state()`` called inside
+   ``transcribe_step()``.  If the frame carries no audio (zero-length
+   samples), the method returns after init — this is the recommended
+   pattern for latency-sensitive server deployments (see
+   :ref:`init-and-latency` above).
+
+2. **Audio buffering** -- ``BatchedAudioBufferer`` (reused from ASR
+   infrastructure) maintains a sliding window of ``buffer_size_in_secs``.
+
+3. **Model inference** via ``infer_one_step(audio_buffer, state)``:
+
+   a. **Perception** -- The audio buffer is encoded by the streaming
+      FastConformer encoder into frame embeddings.
+   b. **Per-frame LLM loop** -- For each of the ``num_frames_per_chunk``
+      frames, the pipeline builds an input embedding (user audio +
+      previous-step text/ASR tokens), runs it through the LLM, and obtains
+      predicted text and ASR tokens.
+   c. **Per-frame TTS** -- Each predicted text token is fed into the EarTTS
+      model to produce audio codec codes.
+   d. **Codec decode** -- The accumulated codes are decoded into a waveform.
+
+4. **State updates** -- The context manager advances ``frame_idx`` and
+   updates the subword mask.
+
+5. **Output accumulation** -- Decoded audio and text are appended to the
+   per-stream ``S2SStreamingOutput``.
+
+
+Data Objects
+^^^^^^^^^^^^
+
+The streaming pipeline uses four data objects.  Two are **model-level**
+(owned by the model wrapper) and two are **pipeline-level** (owned by
+``StreamingS2SPipeline``):
+
+.. code-block:: text
+
+    Model level (decode_state.py)
+    ─────────────────────────────────────────────────────────────
+    StreamingDecodeState          created per stream
+      GPU KV caches, token          mutated in-place by infer_one_step()
+      workspaces, perception        destroyed at end-of-stream
+      cache, codec cache
+              │
+              │ infer_one_step()
+              ▼
+    InferenceStepResult           created each step
+      predicted tokens, text        returned to the pipeline
+      strings, decoded audio        consumed immediately
+
+    Pipeline level (streaming_s2s_pipeline.py, s2s_streaming_output.py)
+    ─────────────────────────────────────────────────────────────
+    S2SStreamingOutput            created per stream
+      accumulates audio chunks      finalized fields (text_with_timestamps,
+      and text across steps         audio_filepath, etc.) filled at end-of-stream
+                                    returned by run()
+              ▲
+              │ each step appends
+              │
+    GenerateStepOutput            created each step
+      incremental per-stream        returned by generate_step()
+      audio + text                  used by server integrations
+
+**StreamingDecodeState** lives in ``S2SContextManager`` and holds the heavy
+GPU tensors (KV caches, perception cache, token workspaces).  It is created
+by the model wrapper, mutated in-place by ``infer_one_step()``, and
+destroyed at end-of-stream.
+
+**S2SStreamingOutput** lives in the pipeline's ``_state_pool``.  During
+streaming it accumulates audio chunks and text parts.  At end-of-stream the
+pipeline populates its finalized fields (``text_with_timestamps``,
+``raw_text``, ``audio_filepath``, token tensors) and returns the same
+object from ``run()``.
+
+
+Inference Backends
+^^^^^^^^^^^^^^^^^^
+
+NemotronVoiceChat has two inference components that each need a backend:
+
+- **LLM** (DuplexSTT backbone) -- takes audio embeddings from the perception
+  encoder and predicts text tokens, ASR tokens, and optional function-call
+  tokens at each frame.
+- **TTS** (EarTTS) -- takes the predicted text token and produces audio codec
+  codes (RVQ acoustic tokens).
+
+Each component can run on **native PyTorch** or **vLLM**, selected by the
+``engine_type`` config value:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 30 30
+
+   * - ``engine_type``
+     - LLM backend
+     - TTS backend
+   * - ``native``
+     - ``PyTorchLLM``
+     - ``PyTorchEarTTS``
+   * - ``vllm_llm``
+     - ``VLLMLLM``
+     - ``PyTorchEarTTS``
+   * - ``vllm_eartts``
+     - ``PyTorchLLM``
+     - ``VLLMEarTTS``
+   * - ``vllm_llm_vllm_eartts``
+     - ``VLLMLLM``
+     - ``VLLMEarTTS``
+
+All four backend classes implement the same ``ModelInterface`` ABC (defined in
+``inference.model_wrappers.backend.interface``), so the inference wrapper
+(``NemotronVoicechatInferenceWrapper``) can treat them uniformly via two
+attributes:
+
+- ``model_llm_interface`` -- the LLM backend
+- ``model_eartts_interface`` -- the TTS backend
+
+The backend classes live under ``inference.model_wrappers.backend/``:
+
+.. code-block:: text
+
+    backend/
+        interface.py            # ModelInterface ABC + shared sampling
+        pytorch/
+            model.py            # PyTorchLLM  (wraps DuplexSTT forward pass)
+            eartts.py           # PyTorchEarTTS  (wraps DuplexEARTTS.infer_codes_one_step)
+        vllm/
+            base.py             # VLLMModelBase  (engine lifecycle, async loop)
+            llm.py              # VLLMLLM  (DuplexSTT via vLLM)
+            eartts.py           # VLLMEarTTS  (EarTTS via vLLM)
+    factory.py                  # create_model()  dispatches to the right class
+
+``ModelInterface`` provides shared utilities used by the LLM backends:
+top-p (nucleus) sampling, repetition penalty, and temperature scaling.
+These are applied **post-hoc** on the returned logits -- vLLM internally
+runs with ``skip_sampling=True`` and greedy decoding.
+
+Each backend also exposes lifecycle methods that the wrapper calls uniformly:
+
+- ``prefill_prompt(embeddings, ...)`` -- Warm up KV cache (native) or
+  prefill the vLLM engine with system-prompt embeddings before streaming.
+- ``compile()`` -- Apply ``torch.compile`` to the TTS backbone (native
+  only; no-op for vLLM).
+- ``setup_subword_cache(cfg)`` -- Enable the TTS subword embedding cache
+  (native only; no-op for vLLM).
+
+The ``factory.create_model()`` function is the single entry point that
+dispatches to the correct class based on a per-component ``engine_type``
+string (``native_llm``, ``native_eartts``, ``vllm_llm``, ``vllm_eartts``).
+
+vLLM Integration Details
+""""""""""""""""""""""""
+
+When ``engine_type`` includes ``vllm``, the pipeline loads vLLM engines
+**in-process** alongside the native PyTorch components -- there is no
+disaggregated multi-server setup.  Each vLLM component runs as an
+``AsyncLLM`` engine in the same Python process, sharing GPU memory with the
+native perception encoder and codec decoder.
+
+The vLLM engines manage their own KV caches via PagedAttention.  Both
+``VLLMLLM`` and ``VLLMEarTTS`` inherit from ``VLLMModelBase``, which wraps a
+``CustomInputAsyncVLLMEngine`` (defined in ``inference.vllm.streaming_llm_engine``)
+and provides:
+
+- An internal ``asyncio`` event loop for blocking synchronous calls
+- Request lifecycle management (start, abort, restart)
+- Automatic checkpoint conversion to vLLM format on first use
+
+``CustomInputAsyncVLLMEngine`` is a thin wrapper around vLLM's ``AsyncLLM``
+that adds support for custom input tensor specifications (multi-tensor
+inputs like audio embeddings, subword IDs, speaker latents).  The
+``engine_kind`` parameter (``"llm"`` or ``"eartts"``) selects EarTTS-specific
+runtime settings (TRITON attention backend, TF32 precision, guidance scale)
+without introducing inheritance between TTS and LLM engine classes.
+
+This requires a custom vLLM fork with NemotronVoiceChat model support:
+
+.. code-block:: bash
+
+    pip install git+https://github.com/vklimkov-nvidia/vllm@vklimkov/voicechat

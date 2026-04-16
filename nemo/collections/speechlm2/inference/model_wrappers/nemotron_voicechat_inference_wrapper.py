@@ -625,6 +625,7 @@ class NemotronVoicechatInferenceWrapper:
                 new_codes_for_decode.append(new_code)
 
         # --- Stage 3: Audio decode ---
+        # No-op when self.decode_audio is False: _decode_audio returns None immediately.
         decoded_audio_new = self._decode_audio(new_codes_for_decode, state, frame_idx, num_frames_per_chunk)
 
         # --- Stage 4: Token -> string conversion ---

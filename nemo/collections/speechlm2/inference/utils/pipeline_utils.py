@@ -13,9 +13,7 @@
 # limitations under the License.
 
 import re
-from dataclasses import dataclass
 
-import torch
 from whisper_normalizer.english import EnglishTextNormalizer
 
 _whisper_normalizer = EnglishTextNormalizer()
@@ -39,25 +37,3 @@ def clean_pred_text(text: str) -> str:
     text = re.sub(r'<SPECIAL_12>', '', text)
     # Normalize with Whisper's EnglishTextNormalizer (same as offline eval)
     return _whisper_normalizer(text)
-
-
-@dataclass
-class PipelineOutput:
-    """Output of the S2S pipeline's :meth:`run` method.
-
-    Every list field is indexed by stream id — entry *i* holds the result
-    for the *i*-th input audio file.
-    """
-
-    texts: list[str] | None = None
-    asr_texts: list[str] | None = None
-    texts_with_timestamps: list[str] | None = None
-    asr_texts_with_timestamps: list[str] | None = None
-    raw_texts: list[str] | None = None
-    raw_asr_texts: list[str] | None = None
-    token_texts: list[torch.Tensor | None] | None = None
-    token_asr_texts: list[torch.Tensor | None] | None = None
-    token_function_texts: list[torch.Tensor | None] | None = None
-    token_lengths: list[int | None] | None = None
-    audio_filepaths: list[str | None] | None = None
-    debug_data: list[list] | None = None
