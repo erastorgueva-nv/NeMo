@@ -21,6 +21,8 @@ import numpy as np
 import torch
 from lhotse import CutSet
 
+from nemo.collections.speechlm2.parts.text_utils import strip_timestamps
+
 # Use NeMo's force alignment utilities instead of torchaudio
 from nemo.collections.asr.models.asr_model import ASRModel
 from nemo.collections.asr.parts.utils.aligner_utils import (
@@ -150,7 +152,7 @@ class ForceAligner:
 
         for i, (supervision, cut) in enumerate(zip(user_supervisions, user_cuts)):
             try:
-                text = self._strip_timestamps(supervision.text)
+                text = strip_timestamps(supervision.text)
                 normalized_text = self._normalize_transcript(text)
                 if not normalized_text.strip():
                     logging.warning(f"Text became empty after normalization: {supervision.text}")
@@ -327,17 +329,3 @@ class ForceAligner:
 
         return " ".join(timestamped_words)
 
-    def _strip_timestamps(self, text: str) -> str:
-        """
-        Strip timestamp tokens from text.
-
-        Args:
-            text: Text that may contain timestamp tokens
-
-        Returns:
-            Text with timestamp tokens removed
-        """
-        text = re.sub(r'<\|[0-9]+\|>', '', text)
-        text = re.sub(r' +', ' ', text)
-
-        return text.strip()

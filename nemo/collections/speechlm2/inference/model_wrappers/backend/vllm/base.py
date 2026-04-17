@@ -146,8 +146,12 @@ class VLLMModelBase(ModelInterface):
         logging.info("Initializing vLLM engine (this may take a moment)...")
         self._loop.run_until_complete(self.engine.initialize())
 
-        if self.engine.engine.tokenizer is not None and not self.special_token_ids:
-            self.special_token_ids = self._get_special_token_ids_from_vllm_tokenizer(self.engine.engine.tokenizer)
+        if not self.special_token_ids:
+            logging.warning(
+                "special_token_ids is empty for vLLM backend. "
+                "Pass special_token_ids via get_special_token_ids() to ensure "
+                "special tokens use greedy decoding."
+            )
 
         logging.debug(f"Special token IDs: {self.special_token_ids}")
         logging.info("vLLM engine ready!")
@@ -156,28 +160,6 @@ class VLLMModelBase(ModelInterface):
     def _convert_ckpt(self, save_path: str):
         """Convert existing checkpoint to vLLM format and save."""
         pass
-
-    @staticmethod
-    def _get_special_token_ids_from_vllm_tokenizer(tokenizer) -> set[int]:
-        """
-        Extract special token IDs from a vLLM tokenizer.
-        Looks for: '<s>' (bos), '</s>' (eos), '<SPECIAL_12>' (pad).
-
-        Args:
-            tokenizer: A vLLM CachedTokenizer instance.
-
-        Returns:
-            Set of special token IDs.
-        """
-        special_ids = set()
-        for token in ('<s>', '</s>', '<SPECIAL_12>'):
-            try:
-                tid = tokenizer.convert_tokens_to_ids(token)
-                if isinstance(tid, int):
-                    special_ids.add(tid)
-            except (KeyError, AttributeError):
-                logging.debug(f"Token '{token}' not found in vLLM tokenizer, skipping")
-        return special_ids
 
     def _generate_request_id(self) -> str:
         """Generate a unique request ID."""

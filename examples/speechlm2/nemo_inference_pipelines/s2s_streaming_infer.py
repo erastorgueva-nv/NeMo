@@ -35,7 +35,7 @@ from nemo.collections.speechlm2.inference.utils.audio_data import (
     dump_output_json,
     prepare_audio_data,
 )
-from nemo.collections.speechlm2.inference.utils.pipeline_utils import clean_pred_text
+from nemo.collections.speechlm2.parts.text_utils import clean_pred_text
 from nemo.utils import logging
 from nemo.utils.timers import SimpleTimer
 
@@ -73,12 +73,13 @@ def main(cfg: DictConfig):
 
     # Compute WER when ground-truth texts are available (micro-average,
     # matching the offline eval in speechlm2.parts.metrics.asr_cer_wer)
+    special_tokens = pipeline.special_token_strings
     all_refs, all_hyps = [], []
     for gt, out in zip(ground_truths, outputs):
         asr_text = out.asr_text_with_timestamps
         if gt and asr_text:
-            cleaned_gt = clean_pred_text(gt)
-            cleaned_pred = clean_pred_text(asr_text)
+            cleaned_gt = clean_pred_text(gt, special_token_strings=special_tokens)
+            cleaned_pred = clean_pred_text(asr_text, special_token_strings=special_tokens)
             if cleaned_gt.strip() and cleaned_pred.strip():
                 all_refs.append(cleaned_gt)
                 all_hyps.append(cleaned_pred)

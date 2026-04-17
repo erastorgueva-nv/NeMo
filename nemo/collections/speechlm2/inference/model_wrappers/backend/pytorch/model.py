@@ -27,6 +27,7 @@ import torch
 
 from nemo.utils import logging
 from nemo.collections.speechlm2.inference.model_wrappers.backend.interface import ModelInterface
+from nemo.collections.speechlm2.parts.text_utils import get_special_token_ids
 
 
 class PyTorchLLM(ModelInterface):
@@ -53,21 +54,21 @@ class PyTorchLLM(ModelInterface):
             model: The DuplexS2SExternalSpeechDecoderModel instance
             special_token_ids: Set of special token IDs (pad, eos, bos) that should bypass sampling.
                                These tokens will use greedy decoding and won't be penalized.
-                               If None, will try to extract from model.tokenizer for tokens:
-                               '<s>' (bos), '</s>' (eos), '<SPECIAL_12>' (pad).
-                               You can also manually provide: {tokenizer.pad_token_id, tokenizer.eos_token_id, tokenizer.bos_token_id}
+                               If None, auto-extracted from model via
+                               :func:`~nemo.collections.speechlm2.parts.text_utils.get_special_token_ids`.
             top_p: Top-p (nucleus) sampling threshold. 1.0 disables it (greedy). Default: 1.0
             repetition_penalty: Penalty for repeated tokens. 1.0 disables it. Default: 1.0
                                Recommended value when enabling: 1.2
             temperature: Temperature for sampling. 1.0 = no change, <1.0 = sharper, >1.0 = flatter.
                         0.0 = greedy (argmax). Default: 1.0
         """
-        DEFAULT_SPECIAL_TOKEN_IDS = {1, 2, 12}
-
         if special_token_ids is None:
-            special_token_ids = self._extract_special_token_ids_from_nemo(model)
-        if not special_token_ids:
-            special_token_ids = DEFAULT_SPECIAL_TOKEN_IDS
+            try:
+                stt = model.stt_model
+                special_token_ids = get_special_token_ids(stt.tokenizer, stt.text_pad_id, model_cfg=stt.cfg)
+            except AttributeError:
+                logging.debug("Cannot extract special token IDs: model has no stt_model.tokenizer")
+                special_token_ids = set()
 
         super().__init__(
             special_token_ids=special_token_ids,
@@ -157,36 +158,6 @@ class PyTorchLLM(ModelInterface):
         if "function_logits" in result:
             ans["function_predicted_token"] = result["function_logits"][:, -1].argmax(dim=-1)
         return ans
-
-    @staticmethod
-    def _extract_special_token_ids_from_nemo(model) -> set[int]:
-        """
-        Extract special token IDs from NeMo model's tokenizer.
-
-        NeMo tokenizer uses bos_token, eos_token, pad_token (not bos_token_id).
-        Then converts token strings to IDs using token_to_id method.
-
-        Args:
-            model: The DuplexS2SExternalSpeechDecoderModel instance
-
-        Returns:
-            Set of special token IDs, or empty set if extraction fails
-        """
-        special_ids = set()
-        try:
-            tokenizer = model.stt_model.tokenizer
-        except AttributeError:
-            logging.debug("Cannot extract special token IDs: model has no stt_model.tokenizer")
-            return special_ids
-
-        for attr in ('bos_token', 'eos_token', 'pad_token'):
-            token = getattr(tokenizer, attr, None)
-            if token is not None and hasattr(tokenizer, 'token_to_id'):
-                tid = tokenizer.token_to_id(token)
-                if tid is not None and isinstance(tid, int):
-                    special_ids.add(tid)
-
-        return special_ids
 
     def to(self, device_or_dtype: torch.device | torch.dtype) -> 'PyTorchLLM':
         """Move underlying model to device or convert dtype."""

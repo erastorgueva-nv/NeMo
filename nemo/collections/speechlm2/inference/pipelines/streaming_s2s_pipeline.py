@@ -160,6 +160,14 @@ class StreamingS2SPipeline(S2SPipelineInterface):
     # ------------------------------------------------------------------
     # State helpers
     # ------------------------------------------------------------------
+    @property
+    def special_token_strings(self) -> set[str]:
+        """Token strings that should be stripped from decoded text for clean output.
+
+        Pass to :func:`~nemo.collections.speechlm2.parts.text_utils.clean_pred_text`.
+        """
+        return self.s2s_model.special_token_strings
+
     def create_state(self, options: S2SRequestOptions | None = None) -> S2SStreamingOutput:
         """Create new empty state with optional per-stream options."""
         dtype = getattr(self.s2s_model, "dtype", torch.float32)
@@ -310,6 +318,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         self.context_manager.reset_streams(stream_ids, eos_flags)
         
         # Log summary and clean up finished streams
+        pad_str = tokenizer.ids_to_tokens([pad_id])[0]
         for stream_id, eos_flag in zip(stream_ids, eos_flags):
             if eos_flag:
                 state = self.get_state(stream_id)
@@ -320,11 +329,11 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                     f"agent: {state.output_text_str!r}, user: {state.output_asr_text_str!r}"
                 )
 
-                if state.raw_text is not None:
-                    compact_agent = state.raw_text.replace('<SPECIAL_12>', '·')
-                    compact_user = (state.raw_asr_text or '').replace('<SPECIAL_12>', '·')
-                    logging.info(f"Stream {stream_id} agent (with padding): {compact_agent}")
-                    logging.info(f"Stream {stream_id} user  (with padding): {compact_user}")
+                # Replace verbose pad token (e.g. '<SPECIAL_12>') with '·' for compact logging
+                compact_agent = state.raw_text.replace(pad_str, '·')
+                compact_user = (state.raw_asr_text or '').replace(pad_str, '·')
+                logging.info(f"Stream {stream_id} agent (with padding): {compact_agent}")
+                logging.info(f"Stream {stream_id} user  (with padding): {compact_user}")
 
                 # Timing summary (no-op when profile_timing is off)
                 timing_by_stream.get(stream_id, NullTimingSummary()).log_summary(
@@ -611,6 +620,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         if total_frames == 0 or total_audio_samples == 0 or self.output_sample_rate == 0:
             return
         frame_duration = total_audio_samples / total_frames / self.output_sample_rate
+        pad_token_str = tokenizer.ids_to_tokens([pad_id])[0]
 
         ctm_dir = os.path.join(self.output_dir, "ctm")
         os.makedirs(ctm_dir, exist_ok=True)
@@ -621,7 +631,8 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                     if tid == pad_id:
                         continue
                     tok_str = _decode_tokens_with_specials(
-                        tokenizer.ids_to_tokens([tid]), tokenizer, keep_pad=False,
+                        tokenizer.ids_to_tokens([tid]), tokenizer,
+                        pad_token_str=pad_token_str, keep_pad=False,
                     )
                     if not tok_str:
                         continue

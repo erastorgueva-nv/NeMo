@@ -119,10 +119,20 @@ def dump_output_json(
 ) -> None:
     """Dump inference results to output_processed.json and output_raw.json.
 
-    ``output_processed.json`` uses the canonical S2S processed-output schema
-    (timestamps in pred_text via ``<|t|>`` / ``<$t$>``).
+    ``output_processed.json`` strips pad and BOS/EOS tokens and annotates
+    turn boundaries with timestamp annotations:
 
-    ``output_raw.json`` preserves all tokens including ``<SPECIAL_12>`` (pad tokens).
+    * ``<|t|>`` -- turn start (BOS position, in seconds)
+    * ``<$t$>`` -- turn end   (EOS position, in seconds)
+
+    ``output_raw.json`` preserves the full token stream as-is, including:
+
+    * Pad tokens (e.g. ``<SPECIAL_12>``) for frames with no text output
+    * Agent turn markers: ``<s>`` (BOS) and ``</s>`` (EOS)
+    * User turn markers (e.g. ``^`` for user BOS, ``</s>`` for user EOS,
+      depending on the checkpoint)
+
+    The raw format is useful for debugging token-level model behavior.
     """
     output_processed_path = os.path.join(output_dir, "output_processed.json")
     output_raw_path = os.path.join(output_dir, "output_raw.json")

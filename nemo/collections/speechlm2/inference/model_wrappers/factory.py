@@ -63,9 +63,8 @@ def create_model(
             (NemotronVoiceChat for LLM, DuplexEARTTS for TTS).  Not used
             by vLLM backends, which load their own engine from ``vllm_config``.
         vllm_config: Configuration dict for vLLM engines (required for "vllm*")
-        special_token_ids: Set of special token IDs (pad, eos, bos) that should bypass sampling.
-                          If None (default), will auto-extract from model.tokenizer for tokens:
-                          '<s>' (bos), '</s>' (eos), '<SPECIAL_12>' (pad).
+        special_token_ids: Set of special token IDs (pad, eos, bos) that should bypass
+                          sampling and always use greedy decoding.
         top_p: Top-p (nucleus) sampling threshold. 1.0 disables it (greedy). Default: 1.0
         repetition_penalty: Penalty for repeated tokens. 1.0 disables it. Default: 1.0
         temperature: Temperature for sampling. 1.0 = no change, 0.0 = greedy. Default: 1.0

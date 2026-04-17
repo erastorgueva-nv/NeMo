@@ -13,7 +13,6 @@
 # limitations under the License.
 import copy
 import os
-import re
 import warnings
 from pathlib import Path
 import torch
@@ -36,6 +35,7 @@ from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.utils import get_pad_id
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.label_prep import maybe_prepend_prompt_tokens, prepare_text_and_asr_labels
+from nemo.collections.speechlm2.parts.text_utils import strip_timestamps
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.metrics.bleu import BLEU
 from nemo.collections.speechlm2.parts.metrics.empty_text import EmptyTextMetric
@@ -552,8 +552,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 prompt_token_lens=prompt_token_lens,
             )
 
-            # Strip timestamps for metrics
-            text_clean = [re.sub(r"<[\|$].*?[\|$]>", "", s).strip() for s in results["text"]]
+            text_clean = [strip_timestamps(s) for s in results["text"]]
 
             # Agent text metrics
             self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=text_clean)

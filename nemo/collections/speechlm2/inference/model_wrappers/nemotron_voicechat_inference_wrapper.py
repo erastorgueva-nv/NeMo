@@ -40,7 +40,11 @@ from nemo.collections.speechlm2.inference.model_wrappers.decode_state import (
     StreamingDecodeState,
     TimingSummary,
 )
-from nemo.collections.speechlm2.parts.text_utils import _decode_tokens_with_specials
+from nemo.collections.speechlm2.parts.text_utils import (
+    _decode_tokens_with_specials,
+    get_special_token_ids,
+    get_special_token_strings,
+)
 
 
 # --- Configuration ---
@@ -301,10 +305,13 @@ class NemotronVoicechatInferenceWrapper:
                     os.environ[env_key] = str(float(val))
                     logging.info(f"Set env {env_key}={val} (from {cfg_key})")
 
+        stt = self.model.stt_model
+        special_ids = get_special_token_ids(stt.tokenizer, stt.text_pad_id, model_cfg=stt.cfg)
         self.model_llm_interface = create_model(
             model=self.model_path if self.use_vllm_llm else self.model,
             engine_type="vllm_llm" if self.use_vllm_llm else "native_llm",
             vllm_config=self.vllm_llm_config if self.use_vllm_llm else None,
+            special_token_ids=special_ids,
             top_p=self.top_p,
             repetition_penalty=self.repetition_penalty,
             temperature=self.temperature,
@@ -316,6 +323,7 @@ class NemotronVoicechatInferenceWrapper:
             model=self.model_path if self.use_vllm_eartts else self.model.tts_model,
             engine_type="vllm_eartts" if self.use_vllm_eartts else "native_eartts",
             vllm_config=self.vllm_tts_config if self.use_vllm_eartts else None,
+            special_token_ids=special_ids,
         )
         logging.info(f"TTS backend: {type(self.model_eartts_interface).__name__}")
 
@@ -925,11 +933,20 @@ class NemotronVoicechatInferenceWrapper:
         will show as replacement chars (U+FFFD) because each frame is decoded
         independently.
         """
+        pad_token_str = self.tokenizer.ids_to_tokens([self.model.stt_model.text_pad_id])[0]
         result = []
         for tok_ids_b in token_ids:
             toks = self.tokenizer.ids_to_tokens(tok_ids_b.tolist())
-            result.append(_decode_tokens_with_specials(toks, self.tokenizer, keep_pad=False))
+            result.append(_decode_tokens_with_specials(
+                toks, self.tokenizer, pad_token_str=pad_token_str, keep_pad=False,
+            ))
         return result
+
+    @property
+    def special_token_strings(self) -> set[str]:
+        """Token strings that should be stripped from decoded text for clean output."""
+        stt = self.model.stt_model
+        return get_special_token_strings(stt.tokenizer, stt.text_pad_id, model_cfg=stt.cfg)
 
     def abort_request(self, request_id: str | None) -> bool:
         """
