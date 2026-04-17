@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import copy
-import gc
 import os
 import time
 import torch
@@ -212,29 +211,27 @@ class NemotronVoicechatInferenceWrapper:
         logging.info("Initializing model structure...")
         start_model_init = time.time()
 
+        # Tell from_pretrained to skip loading checkpoint weights for
+        # submodules that vLLM will replace — avoids wasted I/O and memory.
+        skip_prefixes = set()
+        if self.use_vllm_llm:
+            skip_prefixes.add("stt_model.llm.")
+        if self.use_vllm_eartts:
+            skip_prefixes.add("tts_model.tts_model.")
+
         self.model = NemotronVoiceChat.from_pretrained(
             self.model_path,
             local_files_only=True,
+            skip_prefixes=skip_prefixes or None,
         )
         logging.info(f"NemotronVoiceChat initialized in {time.time() - start_model_init:.1f}s")
 
-        # Delete unused native components BEFORE moving to GPU to save memory
+        # Remove skipped submodules (still on meta device / uninitialized)
         if self.use_vllm_llm:
-            logging.info("Deleting native LLM (will use vLLM instead)...")
-            if hasattr(self.model.stt_model, 'llm') and self.model.stt_model.llm is not None:
-                for name, child in list(self.model.stt_model.llm.named_children()):
-                    delattr(self.model.stt_model.llm, name)
-                del self.model.stt_model.llm
-                self.model.stt_model.llm = None
-
+            del self.model.stt_model.llm
+            self.model.stt_model.llm = None
         if self.use_vllm_eartts:
-            logging.info("Deleting native TTS (will use vLLM instead)...")
             del self.model.tts_model.tts_model
-
-        if self.use_vllm_llm or self.use_vllm_eartts:
-            # Free memory from deleted components before GPU transfer and vLLM engine creation
-            gc.collect()
-            torch.cuda.empty_cache()
 
         # Setup model on device and cast to configured dtype
         self.model.to(self.device)

@@ -213,7 +213,20 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
         Load Pytorch pretrained weights and return the loaded model.
         Wrapper over PyTorchModelHubMixin that auto-handles config and uses our
         custom memory-efficient safetensors streaming loader to prevent OOM.
+
+        Extra kwargs (passed via ``from_pretrained(..., key=val)``):
+
+        - ``skip_prefixes`` (set[str] | None): Parameter-name prefixes whose
+          weights should be skipped during checkpoint loading.  The loader
+          will neither materialize meta-device tensors nor read safetensors
+          data for keys matching these prefixes — avoiding wasted memory and
+          I/O for components that the caller will replace (e.g. with vLLM
+          engines).  The caller is responsible for cleaning up or replacing
+          the corresponding submodules after loading.
+          Example: ``{"stt_model.llm.", "tts_model.tts_model."}``
         """
+        skip_prefixes = model_kwargs.pop("skip_prefixes", None)
+
         # Fetch the Config
         resolved_config_file = cached_file(
             model_id,
@@ -279,11 +292,11 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
 
         # Stream the weights from safetensors
         ckpt_dir = os.path.dirname(resolved_weights_file)
-        model.init_from_safetensors_ckpt(ckpt_dir)
+        model.init_from_safetensors_ckpt(ckpt_dir, skip_prefixes=skip_prefixes)
 
         return model
 
-    def init_from_safetensors_ckpt(self, ckpt_path, prefix=""):
+    def init_from_safetensors_ckpt(self, ckpt_path, prefix="", skip_prefixes: set[str] | None = None):
         """
         Memory-efficient streaming safetensors loader with dynamic
         audio_prompt_latents recreation support.
@@ -292,13 +305,30 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
         tensors before streaming weights from the checkpoint.
 
         Safe for large models and distributed training (if called before DDP/FSDP wrap).
+
+        Args:
+            ckpt_path: Directory containing ``model.safetensors``.
+            prefix: Optional prefix prepended to checkpoint keys when
+                matching against model parameter names.
+            skip_prefixes: If provided, parameter-name prefixes to skip.
+                Matching checkpoint keys will not be read from disk, and
+                any matching meta-device parameters will not be
+                materialized to CPU.  Skipped meta-device parameters
+                will not trigger the post-load safety check.  Use this
+                to avoid wasted memory and I/O for submodules the caller
+                intends to replace (e.g. with vLLM engines).
         """
+        skip_prefixes = set(skip_prefixes) if skip_prefixes else set()
+
+        def _should_skip(name: str) -> bool:
+            return any(name.startswith(p) for p in skip_prefixes)
+
         # Materialize meta-device tensors into real (uninitialized) CPU tensors
         # so that the streaming copy_() loop below can use target.data.copy_().
-        # Only targets tensors actually on the meta device — other modules
-        # (e.g. TTS, codec) may already hold properly initialized weights.
+        # Only targets tensors actually on the meta device — modules that
+        # were constructed with real weights are left untouched.
         for name, param in list(self.named_parameters()):
-            if param.is_meta:
+            if param.is_meta and not _should_skip(name):
                 parts = name.split(".")
                 module = self
                 for part in parts[:-1]:
@@ -307,7 +337,7 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
                     torch.empty_like(param, device="cpu"), requires_grad=param.requires_grad
                 )
         for name, buf in list(self.named_buffers()):
-            if buf.is_meta:
+            if buf.is_meta and not _should_skip(name):
                 parts = name.split(".")
                 module = self
                 for part in parts[:-1]:
@@ -315,6 +345,7 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
                 module._buffers[parts[-1]] = torch.empty_like(buf, device="cpu")
 
         loaded_keys = []
+        skipped_keys = []
         missing_keys = []
 
         # Build fast lookup tables once
@@ -328,6 +359,10 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
         ) as f:
 
             for key in f.keys():
+
+                if _should_skip(key):
+                    skipped_keys.append(key)
+                    continue
 
                 try:
                     tensor = f.get_tensor(key)
@@ -368,12 +403,17 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
 
         logging.info(f"Loaded {len(loaded_keys)} tensors from pretrained model")
 
+        if skipped_keys:
+            logging.info(f"Skipped {len(skipped_keys)} tensors matching skip_prefixes {skip_prefixes}")
+
         if missing_keys:
             logging.warning(f"{len(missing_keys)} keys in checkpoint not found in model")
 
         # Fail if any *parameters* are still on meta device — those genuinely
         # need weights from the checkpoint and their absence is an error.
-        meta_params = [n for n, p in self.named_parameters() if p.is_meta]
+        # Parameters covered by skip_prefixes are excluded: the caller
+        # is responsible for replacing or deleting those submodules.
+        meta_params = [n for n, p in self.named_parameters() if p.is_meta and not _should_skip(n)]
         if meta_params:
             raise RuntimeError(
                 f"{len(meta_params)} parameters still on meta device after checkpoint load "
