@@ -236,21 +236,10 @@ class NemotronVoicechatInferenceWrapper:
             gc.collect()
             torch.cuda.empty_cache()
 
-        # Setup model on device
+        # Setup model on device and cast to configured dtype
         self.model.to(self.device)
+        self.model.safe_cast_to(self.dtype)
         self.model.eval()
-
-        # Convert some S2S components to the configured dtype
-        logging.info(f"Converting some S2S components to {self.dtype} (keeping perception & TTS in float32)...")
-        if self.model.stt_model.llm is not None:
-            self.model.stt_model.llm = self.model.stt_model.llm.to(self.dtype)
-        self.model.stt_model.lm_head = self.model.stt_model.lm_head.to(self.dtype)
-        self.model.stt_model.embed_tokens = self.model.stt_model.embed_tokens.to(self.dtype)
-        self.model.stt_model.asr_head = self.model.stt_model.asr_head.to(self.dtype)
-        self.model.stt_model.embed_asr_tokens = self.model.stt_model.embed_asr_tokens.to(self.dtype)
-        if self.model.stt_model.function_head is not None:
-            self.model.stt_model.function_head = self.model.stt_model.function_head.to(self.dtype)
-            logging.info("function_head converted to %s", self.dtype)
 
         self.tokenizer = self.model.stt_model.tokenizer
 

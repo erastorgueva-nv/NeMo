@@ -133,30 +133,49 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
         self._use_fsdp = False
         self._use_tp = False
 
+    _DEFAULT_KEEP_FP32 = frozenset({"stt_model.perception", "tts_model"})
+
+    def safe_cast_to(self, dtype: torch.dtype, keep_fp32: set[str] | None = None) -> "NemotronVoiceChat":
+        """Cast model to dtype, keeping specified submodules in float32.
+
+        Args:
+            dtype: Target dtype for castable modules.
+            keep_fp32: Dotted submodule name prefixes to keep in float32.
+                Defaults to {"stt_model.perception", "tts_model"}.
+        """
+        if keep_fp32 is None:
+            keep_fp32 = self._DEFAULT_KEEP_FP32
+        for name, param in self.named_parameters():
+            if param.is_floating_point() and not any(name == p or name.startswith(p + ".") for p in keep_fp32):
+                param.data = param.data.to(dtype=dtype)
+        for name, buf in self.named_buffers():
+            if buf.is_floating_point() and not any(name == p or name.startswith(p + ".") for p in keep_fp32):
+                buf.data = buf.data.to(dtype=dtype)
+        return self
+
     def save_pretrained(
         self,
         save_directory: str | Path,
         **kwargs,
     ) -> str | None:
-        """Save model and export LLM artifacts (tokenizer + perception config) for offline inference."""
+        """Save model and export LLM artifacts for offline inference.
+
+        Tokenizer is exported by HFHubMixin._save_pretrained.
+        This override adds perception config and pretrained_weights=False to config.json.
+        """
         result = super().save_pretrained(save_directory, **kwargs)
 
-        # Save tokenizer for offline loading
-        try:
-            llm_dir = Path(save_directory) / "llm_artifacts"
-            llm_dir.mkdir(parents=True, exist_ok=True)
-            self.stt_model.tokenizer.tokenizer.save_pretrained(str(llm_dir))
-            logging.info(f"Saved LLM tokenizer to {llm_dir}")
-        except Exception as e:
-            warnings.warn(f"Failed to save LLM tokenizer: {e}. Inference will fall back to downloading from HF.")
-
-        # Save full perception config at the top level of config.json so that
-        # resolve_pretrained_config() can skip pretrained ASR/LLM downloads.
+        # Save full perception config and pretrained_weights=False at the top level
+        # of config.json so that resolve_pretrained_config() can skip pretrained
+        # ASR/LLM downloads.
         try:
             config_path = Path(save_directory) / "config.json"
             if config_path.exists():
                 with open(config_path) as f:
                     config = json.load(f)
+                # Tell from_pretrained not to re-download original child models
+                # (ASR encoder, LLM, codec) — weights come from model.safetensors.
+                config["pretrained_weights"] = False
                 config["perception"] = OmegaConf.to_container(self.stt_model.cfg.perception, resolve=True)
                 with open(config_path, "w") as f:
                     json.dump(config, f, indent=2)
@@ -264,33 +283,36 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
 
         return model
 
-    def _replace_tensor(self, full_key, value):
-        """Replace a parameter or buffer on its parent module.
-
-        Meta-device tensors (from torch.device('meta')) have no storage, so the
-        usual ``target.data.copy_(tensor)`` raises an error.  Instead we walk
-        the module tree to find the parent and swap the entry directly in
-        ``module._parameters`` or ``module._buffers``.
-        """
-        parts = full_key.split(".")
-        module = self
-        for part in parts[:-1]:
-            module = getattr(module, part)
-        name = parts[-1]
-        if name in module._parameters:
-            module._parameters[name] = torch.nn.Parameter(
-                value, requires_grad=module._parameters[name].requires_grad
-            )
-        elif name in module._buffers:
-            module._buffers[name] = value
-
     def init_from_safetensors_ckpt(self, ckpt_path, prefix=""):
         """
         Memory-efficient streaming safetensors loader with dynamic
         audio_prompt_latents recreation support.
 
+        Uses ``torch.nn.Module.to_empty()`` to materialize any meta-device
+        tensors before streaming weights from the checkpoint.
+
         Safe for large models and distributed training (if called before DDP/FSDP wrap).
         """
+        # Materialize meta-device tensors into real (uninitialized) CPU tensors
+        # so that the streaming copy_() loop below can use target.data.copy_().
+        # Only targets tensors actually on the meta device — other modules
+        # (e.g. TTS, codec) may already hold properly initialized weights.
+        for name, param in list(self.named_parameters()):
+            if param.is_meta:
+                parts = name.split(".")
+                module = self
+                for part in parts[:-1]:
+                    module = getattr(module, part)
+                module._parameters[parts[-1]] = torch.nn.Parameter(
+                    torch.empty_like(param, device="cpu"), requires_grad=param.requires_grad
+                )
+        for name, buf in list(self.named_buffers()):
+            if buf.is_meta:
+                parts = name.split(".")
+                module = self
+                for part in parts[:-1]:
+                    module = getattr(module, part)
+                module._buffers[parts[-1]] = torch.empty_like(buf, device="cpu")
 
         loaded_keys = []
         missing_keys = []
@@ -322,28 +344,18 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
 
                 if prefix + key in param_dict:
                     target = param_dict[prefix + key]
-
                     if target.shape != tensor.shape:
-                        logging.warning(f"Shape mismatch for {key}: " f"model {target.shape} vs ckpt {tensor.shape}")
-                    elif target.is_meta:
-                        self._replace_tensor(prefix + key, tensor)
+                        logging.warning(f"Shape mismatch for {key}: model {target.shape} vs ckpt {tensor.shape}")
                     else:
                         target.data.copy_(tensor)
-
                     loaded_keys.append(key)
 
                 elif prefix + key in buffer_dict:
                     target = buffer_dict[prefix + key]
-
                     if target.shape != tensor.shape:
-                        logging.warning(
-                            f"Buffer shape mismatch for {key}: " f"model {target.shape} vs ckpt {tensor.shape}"
-                        )
-                    elif target.is_meta:
-                        self._replace_tensor(prefix + key, tensor)
+                        logging.warning(f"Buffer shape mismatch for {key}: model {target.shape} vs ckpt {tensor.shape}")
                     else:
                         target.data.copy_(tensor)
-
                     loaded_keys.append(key)
 
                 else:
@@ -367,26 +379,6 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
                 f"{len(meta_params)} parameters still on meta device after checkpoint load "
                 f"(missing from checkpoint): {meta_params[:20]}"
             )
-
-        # Buffers on meta device are typically non-persistent computed values
-        # (e.g. rotary_emb.inv_freq registered with persistent=False) that
-        # save_pretrained / safetensors intentionally omit.  Reinitialize
-        # them by moving the owning module to CPU then back, which triggers
-        # the buffer's factory function.
-        meta_buffers = [(n, b) for n, b in self.named_buffers() if b.is_meta]
-        if meta_buffers:
-            logging.info(
-                f"Reinitializing {len(meta_buffers)} non-persistent meta buffer(s): "
-                f"{[n for n, _ in meta_buffers[:10]]}"
-            )
-            for buf_name, buf in meta_buffers:
-                parts = buf_name.split(".")
-                module = self
-                for part in parts[:-1]:
-                    module = getattr(module, part)
-                module.to_empty(device="cpu")
-                module.to(device="cpu")
-            logging.info("Meta buffers reinitialised on CPU")
 
         gc.collect()
 

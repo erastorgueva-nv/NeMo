@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Dict
 
@@ -69,10 +69,8 @@ def load_pretrained_hf(
         )
     else:
         config = AutoConfig.from_pretrained(model_path_or_name, trust_remote_code=trust_remote_code)
-        if use_meta_device:
-            with torch.device('meta'):
-                return AutoModelForCausalLM.from_config(config, torch_dtype=dtype, trust_remote_code=trust_remote_code)
-        return AutoModelForCausalLM.from_config(config, torch_dtype=dtype, trust_remote_code=trust_remote_code)
+        with (torch.device('meta') if use_meta_device else nullcontext()):
+            return AutoModelForCausalLM.from_config(config, torch_dtype=dtype, trust_remote_code=trust_remote_code)
 
 
 def resolve_pretrained_config(cfg):

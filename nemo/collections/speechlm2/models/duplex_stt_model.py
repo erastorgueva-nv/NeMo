@@ -13,7 +13,6 @@
 # limitations under the License.
 import copy
 import os
-import warnings
 from pathlib import Path
 import torch
 from lightning import LightningModule
@@ -133,24 +132,6 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
         # Initialize streaming inference engine
         self.streaming_inference = DuplexSTTStreamingInference(self)
-
-    def save_pretrained(
-        self,
-        save_directory: str | Path,
-        **kwargs,
-    ) -> str | None:
-        """Save model and also export LLM artifacts (config + tokenizer) for offline inference."""
-        result = super().save_pretrained(save_directory, **kwargs)
-
-        try:
-            llm_dir = Path(save_directory) / "llm_artifacts"
-            llm_dir.mkdir(parents=True, exist_ok=True)
-            self.tokenizer.tokenizer.save_pretrained(str(llm_dir))
-            logging.info(f"Saved LLM tokenizer to {llm_dir}")
-        except Exception as e:
-            warnings.warn(f"Failed to save LLM tokenizer: {e}. Inference will fall back to downloading from HF.")
-
-        return result
 
     @property
     def text_vocab_size(self):
