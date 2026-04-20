@@ -262,3 +262,11 @@ class ModelInterface(ABC):
         Override in subclasses to implement engine-specific prefill logic.
         """
         raise NotImplementedError(f"{type(self).__name__} does not implement prefill_prompt")
+
+    def abort_request(self, request_id: str) -> bool:
+        """Abort an in-flight streaming request.
+
+        No-op for backends without request lifecycle management (e.g. native
+        PyTorch).  vLLM backends override this to cancel engine-side requests.
+        """
+        return False

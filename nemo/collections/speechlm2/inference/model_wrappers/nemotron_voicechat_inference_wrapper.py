@@ -431,9 +431,7 @@ class NemotronVoicechatInferenceWrapper:
                 prompt_token_ids=getattr(self, 'tts_prompt_token_ids', None),
                 request_id="tts_warmup",
             )
-            if self.use_vllm_eartts:
-                # Abort warmup request so the engine is clean for actual streaming
-                self.model_eartts_interface.abort_request("tts_warmup")
+            self.model_eartts_interface.abort_request("tts_warmup")
 
             code = init_inputs["code"][:, -1:]
 
@@ -831,40 +829,6 @@ class NemotronVoicechatInferenceWrapper:
         """Token strings that should be stripped from decoded text for clean output."""
         stt = self.model.stt_model
         return get_special_token_strings(stt.tokenizer, stt.text_pad_id, model_cfg=stt.cfg)
-
-    def abort_request(self, request_id: str | None) -> bool:
-        """
-        Abort an in-flight vLLM streaming request if the backend supports it.
-        """
-        if not request_id:
-            return False
-
-        success = False
-
-        # Abort LLM if applicable
-        if self.use_vllm_llm:
-            abort_fn = getattr(self.model_llm_interface, "abort_request", None)
-            if callable(abort_fn):
-                try:
-                    if abort_fn(request_id):
-                        success = True
-                    logging.info(f"Aborted LLM request {request_id} successfully.")
-                except Exception as exc:
-                    logging.warning(f"Failed to abort LLM request {request_id}: {exc}")
-
-        # Abort EarTTS if applicable
-        if self.use_vllm_eartts and self.model_eartts_interface is not None:
-            abort_fn = getattr(self.model_eartts_interface, "abort_request", None)
-            if callable(abort_fn):
-                try:
-                    if abort_fn(request_id):
-                        success = True
-                    logging.info(f"Aborted EarTTS request {request_id} successfully.")
-                except Exception as exc:
-                    logging.warning(f"Failed to abort EarTTS request {request_id}: {exc}")
-
-        return success
-
 
     def _maybe_apply_forced_turn_taking(self, t, gen_text, gen_asr):
         """Apply forced turn-taking rules based on ASR channel tokens."""

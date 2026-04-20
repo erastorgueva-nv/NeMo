@@ -815,9 +815,11 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
     def _abort_stream_request(self, stream_id: int) -> None:
         request_id = self._request_id_for_stream(stream_id)
-        abort_fn = getattr(self.s2s_model, "abort_request", None)
-        if callable(abort_fn):
-            try:
-                abort_fn(request_id)
-            except Exception as exc:
-                logging.warning(f"Failed to abort request {request_id} for stream {stream_id}: {exc}")
+        try:
+            self.s2s_model.model_llm_interface.abort_request(request_id)
+        except Exception as exc:
+            logging.warning(f"Failed to abort LLM request {request_id} for stream {stream_id}: {exc}")
+        try:
+            self.s2s_model.model_eartts_interface.abort_request(request_id)
+        except Exception as exc:
+            logging.warning(f"Failed to abort TTS request {request_id} for stream {stream_id}: {exc}")
