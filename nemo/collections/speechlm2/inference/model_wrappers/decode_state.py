@@ -62,6 +62,12 @@ class TimingSummary(NamedTimer):
     def __init__(self):
         super().__init__(reduction="none", sync_cuda=True)
 
+    def stop(self, name: str = "") -> None:
+        """Stop the named timer and log its duration at DEBUG level."""
+        super().stop(name)
+        dt_ms = self.timers[name]["dt"][-1] * 1000
+        logging.debug(f"[timing] {name}: {dt_ms:.1f}ms")
+
     def log_summary(self, label: str = "Timing", chunk_ms: float | None = None) -> None:
         header = f"{label} timing"
         if chunk_ms is not None:

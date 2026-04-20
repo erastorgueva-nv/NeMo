@@ -77,13 +77,23 @@ s2s:
   force_turn_taking_pad_window: 25
 
   # Inference logit boosts (applied to model logits at inference time)
+  # User (ASR) side
   inference_user_pad_boost: 0.8         # Boost ASR pad logit
   inference_user_bos_boost: null         # Boost ASR BOS logit
   inference_user_eos_boost: null         # Boost ASR EOS logit
+  # Agent (text) side
+  inference_pad_boost: null              # Boost agent text pad logit
+  inference_bos_boost: null              # Boost agent text BOS logit
+  inference_eos_boost: null              # Boost agent text EOS logit
 
   system_prompt: ???
   tts_system_prompt: null              # TTS system prompt - conditions TTS generation style
                                        # Requires a checkpoint trained with individual TTS prompts
+
+  # ========================
+  # Profiling
+  # ========================
+  profile_timing: false                  # Log per-stage wall-clock times for each inference step
 
   # ========================
   # Precision & determinism
