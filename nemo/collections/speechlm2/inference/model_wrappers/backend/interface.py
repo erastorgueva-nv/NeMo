@@ -247,6 +247,15 @@ class ModelInterface(ABC):
         """Enable TTS subword embedding cache. No-op by default; override in subclasses."""
         pass
 
+    def create_cache(self, **kwargs) -> Any:
+        """Create inference cache for this backend. Returns None by default.
+
+        Override in LLM backends that manage their own cache (e.g. PyTorchLLM
+        creates a DynamicCache or HybridMambaAttentionDynamicCache).  vLLM
+        backends manage cache internally and inherit the default.
+        """
+        return None
+
     def prefill_prompt(self, embeddings, **kwargs):
         """Prefill the model with prompt embeddings before streaming begins.
 

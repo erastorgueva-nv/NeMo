@@ -91,11 +91,27 @@ class PyTorchLLM(ModelInterface):
                 "Otherwise, EOS tokens may be randomly sampled and generation may not stop properly!"
             )
 
+    def create_cache(self, use_llm_cache: bool = True):
+        """Create an LLM KV cache appropriate for this model's backbone.
+
+        Returns a ``DynamicCache`` (standard transformer) or
+        ``HybridMambaAttentionDynamicCache`` (Nemotron hybrid), or ``None``
+        if caching is disabled.
+        """
+        if not use_llm_cache:
+            return None
+        pretrained_llm = str(self.model.stt_model.cfg.get("pretrained_llm", ""))
+        if "Nemotron" in pretrained_llm:
+            return self.model.stt_model._create_nemotron_cache(batch_size=1)
+        from transformers import DynamicCache
+        return DynamicCache()
+
     def __call__(
         self,
         input_embeds: torch.Tensor,
         cache: Any | None = None,
         cache_position: torch.Tensor | None = None,
+        cache_position_offset: int | None = None,
         generated_tokens: torch.Tensor | None = None,
         current_step: int = 0,
         return_logits: bool = False,
@@ -108,7 +124,11 @@ class PyTorchLLM(ModelInterface):
         Args:
             input_embeds: Input embeddings [batch, seq_len, hidden_dim]
             cache: Optional DynamicCache or HybridMambaAttentionDynamicCache
-            cache_position: Optional position tensor for Nemotron models
+            cache_position: Optional position tensor for Nemotron models.
+                If not provided, ``cache_position_offset`` is used instead.
+            cache_position_offset: Optional integer offset; when ``cache_position``
+                is None, a single-element tensor ``[cache_position_offset]`` is
+                built on ``input_embeds.device``.
             generated_tokens: Previously generated tokens [batch, num_generated].
                              Required for repetition_penalty. If None, creates empty tensor.
             current_step: Current decoding step. Used for repetition penalty.
@@ -119,6 +139,8 @@ class PyTorchLLM(ModelInterface):
         Returns:
             Dictionary with 'predicted_token', 'asr_predicted_token', and 'cache'
         """
+        if cache_position is None and cache_position_offset is not None:
+            cache_position = torch.tensor([cache_position_offset], device=input_embeds.device)
         result = self.model.stt_model(input_embeds, cache=cache, cache_position=cache_position, **kwargs)
 
         if not isinstance(result, dict):

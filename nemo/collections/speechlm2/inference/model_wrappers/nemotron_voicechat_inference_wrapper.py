@@ -20,12 +20,10 @@ import torchaudio
 from omegaconf import OmegaConf, DictConfig
 
 from nemo.utils import logging, str_to_dtype
-from transformers import DynamicCache
 
 from nemo.collections.speechlm2.models.nemotron_voicechat import NemotronVoiceChat
 from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.audio.parts.utils.transforms import resample
-from nemo.collections.speechlm2.modules.ear_tts_vae_codec import CausalConv1dCache
 from nemo.collections.speechlm2.inference.model_wrappers.factory import create_model
 from nemo.collections.speechlm2.inference.model_wrappers.perception_cache import (
     PerceptionCacheState,
@@ -394,22 +392,6 @@ class NemotronVoicechatInferenceWrapper:
         gen_asr_text = torch.full((1, max_len), stt_model.text_pad_id, device=self.device, dtype=torch.long)
         return gen_text, gen_asr_text
 
-    def _create_llm_cache(self):
-        if not self.use_llm_cache or self.use_vllm_llm:
-            return None
-        pretrained_llm = str(self.model.stt_model.cfg.get("pretrained_llm", ""))
-        if "Nemotron" in pretrained_llm:
-            return self.model.stt_model._create_nemotron_cache(batch_size=1)
-        return DynamicCache()
-
-    def _create_codec_state(self, max_len: int):
-        if not self.decode_audio or not hasattr(self.model, "tts_model"):
-            return None, None
-
-        codec_cache = CausalConv1dCache()
-        subword_mask = torch.ones((1, max_len), device=self.device, dtype=torch.bool)
-        return subword_mask, codec_cache
-
     def _prepare_tts_initial_state(self):
         if not self.decode_audio:
             return
@@ -463,8 +445,11 @@ class NemotronVoicechatInferenceWrapper:
 
     def create_decode_state(self, max_len: int) -> StreamingDecodeState:
         gen_text, gen_asr_text = self._init_token_buffers(max_len)
-        llm_cache = self._create_llm_cache()
-        subword_mask, tts_codec_cache = self._create_codec_state(max_len)
+        llm_cache = self.model_llm_interface.create_cache(use_llm_cache=self.use_llm_cache)
+        if self.decode_audio and hasattr(self.model_eartts_interface, 'create_codec_state'):
+            subword_mask, tts_codec_cache = self.model_eartts_interface.create_codec_state(max_len, self.device)
+        else:
+            subword_mask, tts_codec_cache = None, None
         perception_cache = None
         if self.use_perception_cache and self.perception_cache_mgr is not None:
             perception_cache = self.perception_cache_mgr.get_initial_state(batch_size=1)
@@ -656,13 +641,10 @@ class NemotronVoicechatInferenceWrapper:
                     sampling_params=sampling_params,
                 )
             else:
-                cache_pos = torch.tensor(
-                    [state.llm_cache_position_offset + frame_offset], device=self.device,
-                )
                 ans = self.model_llm_interface(
                     input_emb,
                     cache=state.llm_cache,
-                    cache_position=cache_pos,
+                    cache_position_offset=state.llm_cache_position_offset + frame_offset,
                     generated_tokens=state.gen_text,
                     current_step=current_frame_idx,
                     return_logits=return_debug,
