@@ -45,6 +45,17 @@ class VLLMEarTTS(VLLMModelBase):
         self._speaker_latent_dim = None
         logging.info("VLLMEarTTS initialized with EARTTS-specific settings.")
 
+    def create_codec_state(self, max_len: int, device: torch.device) -> tuple:
+        """Create codec decode state for streaming audio decoding.
+
+        Returns:
+            Tuple of (subword_mask, codec_cache).
+        """
+        from nemo.collections.speechlm2.modules.ear_tts_vae_codec import CausalConv1dCache
+        codec_cache = CausalConv1dCache()
+        subword_mask = torch.ones((1, max_len), device=device, dtype=torch.bool)
+        return subword_mask, codec_cache
+
     def _convert_ckpt(self, save_path: str):
         """Convert EARTTS checkpoint to vLLM format."""
         from nemo.collections.speechlm2.inference.vllm.scripts.convert_eartts_checkpoint import convert

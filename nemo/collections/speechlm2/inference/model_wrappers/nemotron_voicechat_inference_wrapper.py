@@ -446,7 +446,7 @@ class NemotronVoicechatInferenceWrapper:
     def create_decode_state(self, max_len: int) -> StreamingDecodeState:
         gen_text, gen_asr_text = self._init_token_buffers(max_len)
         llm_cache = self.model_llm_interface.create_cache(use_llm_cache=self.use_llm_cache)
-        if self.decode_audio and hasattr(self.model_eartts_interface, 'create_codec_state'):
+        if self.decode_audio:
             subword_mask, tts_codec_cache = self.model_eartts_interface.create_codec_state(max_len, self.device)
         else:
             subword_mask, tts_codec_cache = None, None
