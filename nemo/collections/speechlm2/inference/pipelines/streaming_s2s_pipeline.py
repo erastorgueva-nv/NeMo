@@ -311,7 +311,6 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                     state.finalize_tokens(
                         ctx.gen_text, ctx.gen_asr_text, ctx.frame_idx,
                         tokenizer=tokenizer, pad_id=pad_id,
-                        gen_function_text=ctx.gen_function_text,
                     )
                     timing_by_stream[stream_id] = ctx.timing
 

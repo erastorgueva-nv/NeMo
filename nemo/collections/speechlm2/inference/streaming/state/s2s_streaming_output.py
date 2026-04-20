@@ -88,7 +88,6 @@ class S2SStreamingOutput:
     # -- Finalized fields (populated by finalize_tokens() at end-of-stream) --
     token_text: torch.Tensor | None = None
     token_asr_text: torch.Tensor | None = None
-    token_function_text: torch.Tensor | None = None
     token_length: int | None = None
     text_with_timestamps: str | None = None
     asr_text_with_timestamps: str | None = None
@@ -131,7 +130,6 @@ class S2SStreamingOutput:
         self.debug_data.clear()
         self.token_text = None
         self.token_asr_text = None
-        self.token_function_text = None
         self.token_length = None
         self.text_with_timestamps = None
         self.asr_text_with_timestamps = None
@@ -172,7 +170,6 @@ class S2SStreamingOutput:
         total_frames: int,
         tokenizer,
         pad_id: int,
-        gen_function_text: torch.Tensor | None = None,
     ) -> None:
         """Snapshot token-ID tensors from the decode context and decode them into text fields.
 
@@ -182,10 +179,6 @@ class S2SStreamingOutput:
         self.token_text = gen_text[:, :total_frames].clone().cpu()
         self.token_asr_text = gen_asr_text[:, :total_frames].clone().cpu()
         self.token_length = total_frames
-        self.token_function_text = (
-            gen_function_text[:, :total_frames].clone().cpu()
-            if gen_function_text is not None else None
-        )
 
         lengths = torch.tensor([total_frames], dtype=torch.long)
 
@@ -196,11 +189,6 @@ class S2SStreamingOutput:
         self.asr_text_with_timestamps = _to_str(self.token_asr_text, eval_text_turn_taking=True)
         self.raw_text = _to_str(self.token_text, keep_pad=True)
         self.raw_asr_text = _to_str(self.token_asr_text, keep_pad=True)
-
-        if self.token_function_text is not None:
-            fc_text = _to_str(self.token_function_text, eval_text_turn_taking=False)
-            fc_text_raw = _to_str(self.token_function_text, keep_pad=True)
-            logging.info(f"Function calling channel: {fc_text}, fc_text_raw: {fc_text_raw}")
 
     def clear_audio_buffer(self) -> None:
         """Free in-memory audio chunks.

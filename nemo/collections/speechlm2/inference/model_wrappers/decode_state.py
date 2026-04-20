@@ -109,7 +109,6 @@ class StreamingDecodeState:
     frame_idx: int
     gen_text: torch.Tensor
     gen_asr_text: torch.Tensor
-    gen_function_text: torch.Tensor | None
     input_embeds_history: list[torch.Tensor]
     llm_cache: Any  # DynamicCache or HybridMambaAttentionDynamicCache
     tts_past_key_values: Any
@@ -135,7 +134,6 @@ class InferenceStepResult:
     predicted_text_strs: list[str]
     asr_predicted_text_strs: list[str]
     decoded_audio: torch.Tensor | None = None
-    function_predicted_text_tokens: torch.Tensor | None = None
     debug: dict | None = None
 
 

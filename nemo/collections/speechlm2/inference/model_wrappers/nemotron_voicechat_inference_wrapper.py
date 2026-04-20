@@ -340,18 +340,6 @@ class NemotronVoicechatInferenceWrapper:
                 self.use_perception_cache = False
                 self.perception_cache_mgr = None
 
-    def _get_bos_embedding(self):
-        """Get beginning of sequence embedding."""
-        text_bos = torch.full((1,), fill_value=self.model.stt_model.text_pad_id, device=self.device)
-        input_embeds = self.model.stt_model.embed_tokens(text_bos)
-        return input_embeds.to(dtype=self.dtype)
-
-    def _get_asr_bos_embedding(self) -> torch.Tensor:
-        """Get ASR BOS embedding for AR decoding."""
-        text_bos = torch.full((1,), fill_value=self.model.stt_model.text_pad_id, device=self.device)
-        input_embeds = self.model.stt_model.embed_asr_tokens(text_bos)
-        return input_embeds.to(dtype=self.dtype)
-
     def _prepare_system_prompt_embeddings(
         self,
         system_prompt: str,
@@ -369,19 +357,15 @@ class NemotronVoicechatInferenceWrapper:
         pad_emb = self.model.stt_model.embed_tokens(pad_token).to(dtype=self.dtype)
         pad_asr_emb = self.model.stt_model.embed_asr_tokens(pad_token).to(dtype=self.dtype)
 
-        has_fc = self.model.stt_model.function_head is not None
         if prompt_len > 1:
             prompt_embedded[:, 1:, :] += pad_emb
             prompt_embedded[:, 1:, :] += pad_asr_emb
-            if has_fc:
-                prompt_embedded[:, 1:, :] += pad_emb
 
-        bos_emb = self._get_bos_embedding()
-        asr_bos_emb = self._get_asr_bos_embedding()
+        stt = self.model.stt_model
+        bos_emb = stt._get_bos_embedding().to(dtype=self.dtype)
+        asr_bos_emb = stt._get_asr_bos_embedding().to(dtype=self.dtype)
         prompt_embedded[:, 0, :] += bos_emb.squeeze(0)
         prompt_embedded[:, 0, :] += asr_bos_emb.squeeze(0)
-        if has_fc:
-            prompt_embedded[:, 0, :] += pad_emb.squeeze(0)
 
         return prompt_embedded, prompt_len
 
@@ -408,10 +392,7 @@ class NemotronVoicechatInferenceWrapper:
         stt_model = self.model.stt_model
         gen_text = torch.full((1, max_len), stt_model.text_pad_id, device=self.device, dtype=torch.long)
         gen_asr_text = torch.full((1, max_len), stt_model.text_pad_id, device=self.device, dtype=torch.long)
-        gen_function_text = None
-        if getattr(stt_model, "function_head", None) is not None:
-            gen_function_text = torch.full((1, max_len), stt_model.text_pad_id, device=self.device, dtype=torch.long)
-        return gen_text, gen_asr_text, gen_function_text
+        return gen_text, gen_asr_text
 
     def _create_llm_cache(self):
         if not self.use_llm_cache or self.use_vllm_llm:
@@ -481,7 +462,7 @@ class NemotronVoicechatInferenceWrapper:
         logging.info("TTS warmup state prepared")
 
     def create_decode_state(self, max_len: int) -> StreamingDecodeState:
-        gen_text, gen_asr_text, gen_function_text = self._init_token_buffers(max_len)
+        gen_text, gen_asr_text = self._init_token_buffers(max_len)
         llm_cache = self._create_llm_cache()
         subword_mask, tts_codec_cache = self._create_codec_state(max_len)
         perception_cache = None
@@ -498,7 +479,6 @@ class NemotronVoicechatInferenceWrapper:
             frame_idx=0,
             gen_text=gen_text,
             gen_asr_text=gen_asr_text,
-            gen_function_text=gen_function_text,
             input_embeds_history=[],
             llm_cache=llm_cache,
             tts_past_key_values=tts_past_key_values,
@@ -548,9 +528,6 @@ class NemotronVoicechatInferenceWrapper:
 
         predicted_tokens = torch.empty((B, num_frames_per_chunk), dtype=state.gen_text.dtype, device=state.gen_text.device)
         asr_predicted_tokens = torch.empty((B, num_frames_per_chunk), dtype=state.gen_text.dtype, device=state.gen_text.device)
-        function_predicted_tokens = None
-        if self.model.stt_model.function_head is not None:
-            function_predicted_tokens = torch.empty((B, num_frames_per_chunk), dtype=state.gen_text.dtype, device=state.gen_text.device)
 
         debug_logger = IntermediateResultLogger() if return_debug else NullIntermediateResultLogger()
 
@@ -581,8 +558,8 @@ class NemotronVoicechatInferenceWrapper:
             debug_logger.log_selected_frame_index(current_frame_index)
             frame_embedding = source_encoded[:, current_frame_index:current_frame_index + 1, :]
 
-            input_emb = self._build_input_embedding(
-                frame_embedding, current_frame_idx, state, has_prompt,
+            input_emb = self.model.stt_model.build_input_embedding(
+                frame_embedding, current_frame_idx, state.gen_text, state.gen_asr_text, has_prompt,
             )
             debug_logger.log_input_embeds(input_emb)
 
@@ -602,12 +579,6 @@ class NemotronVoicechatInferenceWrapper:
             predicted_tokens[:, frame_offset] = ans["predicted_token"]
             state.gen_asr_text[:, current_frame_idx] = ans["asr_predicted_token"]
             asr_predicted_tokens[:, frame_offset] = ans["asr_predicted_token"]
-
-            if "function_predicted_token" in ans:
-                if function_predicted_tokens is not None:
-                    function_predicted_tokens[:, frame_offset] = ans["function_predicted_token"]
-                if state.gen_function_text is not None:
-                    state.gen_function_text[:, current_frame_idx] = ans["function_predicted_token"]
 
             self._maybe_apply_forced_turn_taking(current_frame_idx, state.gen_text, state.gen_asr_text)
             predicted_tokens[:, frame_offset] = state.gen_text[:, current_frame_idx]
@@ -649,67 +620,12 @@ class NemotronVoicechatInferenceWrapper:
             predicted_text_strs=predicted_text_strs,
             asr_predicted_text_strs=asr_predicted_text_strs,
             decoded_audio=decoded_audio_new,
-            function_predicted_text_tokens=function_predicted_tokens,
             debug=debug,
         )
 
     # ------------------------------------------------------------------
     # infer_one_step sub-stages
     # ------------------------------------------------------------------
-
-    def _build_input_embedding(
-        self,
-        frame_embedding: torch.Tensor,
-        current_frame_idx: int,
-        state: StreamingDecodeState,
-        has_prompt: bool,
-    ) -> torch.Tensor:
-        """Compose the LLM input embedding for a single frame.
-
-        Combines the perception embedding (user channel) with the text /
-        ASR / function-call channel embeddings from the previous step.
-        At frame 0 this is either BOS (no prompt) or pad (after prompt).
-
-        IMPORTANT: The arithmetic order here must match offline_inference
-        exactly (floating-point addition is not associative).  For t > 0
-        the text and ASR embeddings are summed first, then added to the
-        perception embedding in a single ``+=``.  For t == 0 the sequential
-        ``+=`` pattern matches the offline path.
-        """
-        stt = self.model.stt_model
-        emb = frame_embedding.clone()
-        emb *= stt.cfg.get("duplex_user_channel_weight", 1.0)
-
-        has_fc = state.gen_function_text is not None
-
-        if current_frame_idx == 0 and not has_prompt:
-            emb += self._get_bos_embedding() * stt.cfg.get("duplex_text_channel_weight", 1.0)
-            emb += self._get_asr_bos_embedding() * stt.cfg.get("duplex_asr_text_weight", 1.0)
-            if has_fc:
-                pad_token = torch.full((1,), fill_value=stt.text_pad_id, device=self.device, dtype=torch.long)
-                emb += stt.embed_tokens(pad_token).to(dtype=self.dtype)
-
-        elif current_frame_idx == 0 and has_prompt:
-            pad_token = torch.full((1,), fill_value=stt.text_pad_id, device=self.device, dtype=torch.long)
-            emb += stt.embed_tokens(pad_token).to(dtype=self.dtype)
-            emb += stt.embed_asr_tokens(pad_token).to(dtype=self.dtype)
-            if has_fc:
-                emb += stt.embed_tokens(pad_token).to(dtype=self.dtype)
-
-        else:
-            # Sum text + ASR first, then add once (must match offline operation order)
-            prev = current_frame_idx - 1
-            last_token_emb = stt.embed_tokens(
-                state.gen_text[:, prev]
-            ) * stt.cfg.get("duplex_text_channel_weight", 1.0)
-            last_asr_token_emb = stt.embed_asr_tokens(
-                state.gen_asr_text[:, prev]
-            ) * stt.cfg.get("duplex_asr_text_weight", 1.0)
-            emb += last_token_emb + last_asr_token_emb
-            if has_fc:
-                emb += stt.embed_tokens(state.gen_function_text[:, prev]).to(dtype=self.dtype)
-
-        return emb
 
     def _run_llm_step(
         self,

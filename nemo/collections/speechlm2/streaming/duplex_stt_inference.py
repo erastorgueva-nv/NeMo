@@ -103,9 +103,6 @@ class DuplexSTTStreamingInference:
         else:
             T = T_local
 
-        input_embeds = source_encoded.clone()
-        input_embeds *= self.model.cfg.get("duplex_user_channel_weight", 1.0)
-
         use_cache = True
         if 'Nemotron' in self.model.cfg.pretrained_llm:
             cache = None
@@ -129,11 +126,11 @@ class DuplexSTTStreamingInference:
                     if self.model.predict_user_text:
                         gen_asr[i, :prompt_len] = self.model.text_pad_id
 
-        input_embeds[:, 0] += self.model._get_bos_embedding() * self.model.cfg.get("duplex_text_channel_weight", 1.0)
-        if self.model.predict_user_text:
-            input_embeds[:, 0] += self.model._get_asr_bos_embedding() * self.model.cfg.get(
-                "duplex_asr_text_weight", 1.0
-            )
+        has_prompt = prompt_token_lens is not None and prompt_token_lens.max().item() > 0
+        input_embeds = source_encoded.clone()
+        input_embeds[:, 0:1] = self.model.build_input_embedding(
+            source_encoded[:, 0:1], 0, gen_text, gen_asr, has_prompt=has_prompt,
+        )
 
         start_gen_pos = 0
         if prompt_token_lens is not None:
@@ -154,12 +151,14 @@ class DuplexSTTStreamingInference:
             "B": B,
             "T": T,
             "T_local": T_local,
+            "source_encoded": source_encoded,
             "input_embeds": input_embeds,
             "cache": cache,
             "use_cache": use_cache,
             "gen_text": gen_text,
             "gen_asr": gen_asr,
             "start_gen_pos": start_gen_pos,
+            "has_prompt": has_prompt,
             "is_prompt_position_mask": is_prompt_position_mask,
         }
 
@@ -248,16 +247,13 @@ class DuplexSTTStreamingInference:
 
     def _step_inference(self, t, inference_state, ans):
         """Perform inference for one step t in the autoregressive loop."""
-        last_emb = self.model.embed_tokens(inference_state["gen_text"][:, t - 1]) * self.model.cfg.get(
-            "duplex_text_channel_weight", 1.0
+        inference_state["input_embeds"][:, t:t+1] = self.model.build_input_embedding(
+            inference_state["source_encoded"][:, t:t+1],
+            t,
+            inference_state["gen_text"],
+            inference_state["gen_asr"],
+            has_prompt=inference_state["has_prompt"],
         )
-        if self.model.predict_user_text:
-            last_asr_emb = self.model.embed_asr_tokens(inference_state["gen_asr"][:, t - 1]) * self.model.cfg.get(
-                "duplex_asr_text_weight", 1.0
-            )
-            last_emb += last_asr_emb
-
-        inference_state["input_embeds"][:, t] += last_emb
 
         is_prompt_position = inference_state["is_prompt_position_mask"][:, t]
 

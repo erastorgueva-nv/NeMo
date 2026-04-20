@@ -153,10 +153,6 @@ class PyTorchLLM(ModelInterface):
         if return_logits:
             ans["text_logits"] = result["text_logits"]
             ans["asr_logits"] = result.get("asr_logits")
-            if "function_logits" in result:
-                ans["function_logits"] = result["function_logits"]
-        if "function_logits" in result:
-            ans["function_predicted_token"] = result["function_logits"][:, -1].argmax(dim=-1)
         return ans
 
     def to(self, device_or_dtype: torch.device | torch.dtype) -> 'PyTorchLLM':

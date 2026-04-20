@@ -148,8 +148,6 @@ class VLLMLLM(VLLMModelBase):
             "is_finished": is_finished,
             "request_id": request_id
         }
-        if result and result.custom_outputs and "function_tokens" in result.custom_outputs:
-            ans["function_predicted_token"] = result.custom_outputs["function_tokens"]
         return ans
 
     def prefill_prompt(self, embeddings: torch.Tensor, request_id: str = None, **kwargs) -> bool:

@@ -596,6 +596,55 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         input_embeds = self.embed_asr_tokens(text_bos)
         return input_embeds
 
+    def build_input_embedding(
+        self,
+        frame_embedding: torch.Tensor,
+        current_frame_idx: int,
+        gen_text: torch.Tensor,
+        gen_asr_text: torch.Tensor | None,
+        has_prompt: bool = False,
+    ) -> torch.Tensor:
+        """Compose the LLM input embedding for a single streaming frame.
+
+        Combines the perception embedding (user channel) with the text /
+        ASR channel embeddings from the previous step.  At frame 0 this
+        is either BOS (no prompt) or pad (after prompt).
+
+        The arithmetic order must match offline inference exactly
+        (floating-point addition is not associative).  For t > 0 the text
+        and ASR embeddings are summed first, then added to the perception
+        embedding.  For t == 0 the sequential ``+=`` pattern matches the
+        offline path.
+        """
+        emb = frame_embedding.clone()
+        emb *= self.cfg.get("duplex_user_channel_weight", 1.0)
+
+        if current_frame_idx == 0 and not has_prompt:
+            emb += self._get_bos_embedding() * self.cfg.get("duplex_text_channel_weight", 1.0)
+            if self.predict_user_text:
+                emb += self._get_asr_bos_embedding() * self.cfg.get("duplex_asr_text_weight", 1.0)
+
+        elif current_frame_idx == 0 and has_prompt:
+            pad_token = torch.full((1,), fill_value=self.text_pad_id, device=self.device, dtype=torch.long)
+            emb += self.embed_tokens(pad_token).to(dtype=emb.dtype)
+            if self.predict_user_text:
+                emb += self.embed_asr_tokens(pad_token).to(dtype=emb.dtype)
+
+        else:
+            prev = current_frame_idx - 1
+            last_token_emb = self.embed_tokens(
+                gen_text[:, prev]
+            ) * self.cfg.get("duplex_text_channel_weight", 1.0)
+            if self.predict_user_text:
+                last_asr_token_emb = self.embed_asr_tokens(
+                    gen_asr_text[:, prev]
+                ) * self.cfg.get("duplex_asr_text_weight", 1.0)
+                emb += last_token_emb + last_asr_token_emb
+            else:
+                emb += last_token_emb
+
+        return emb
+
     def backward(self, *args, **kwargs):
         with loss_parallel():
             super().backward(*args, **kwargs)
