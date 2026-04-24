@@ -28,10 +28,8 @@ class S2SRequestOptions:
     accidentally modified after the stream is initialised.
 
     All fields default to ``None``, which means "use the pipeline-level
-    default".  Call :meth:`augment_with_defaults` to fill ``None`` fields
-    with pipeline-level values — this mirrors the
-    ``ASRRequestOptions.augment_with_defaults()`` pattern used by the
-    ASR streaming pipelines.
+    default".  Call :meth:`fill_defaults` to fill ``None`` fields with
+    pipeline-level values.
     """
 
     system_prompt: str | None = None
@@ -53,17 +51,14 @@ class S2SRequestOptions:
         """Return *value* when it is not ``None``, otherwise *default*."""
         return default if value is None else value
 
-    def augment_with_defaults(
+    def fill_defaults(
         self,
         default_system_prompt: str | None = None,
         default_top_p: float | None = None,
         default_temperature: float | None = None,
         default_repetition_penalty: float | None = None,
     ) -> S2SRequestOptions:
-        """Return a new options instance with ``None`` fields filled from defaults.
-
-        This is the S2S equivalent of ``ASRRequestOptions.augment_with_defaults``.
-        """
+        """Return a new options instance with ``None`` fields filled from defaults."""
         return S2SRequestOptions(
             system_prompt=self._with_default(self.system_prompt, default_system_prompt),
             top_p=self._with_default(self.top_p, default_top_p),

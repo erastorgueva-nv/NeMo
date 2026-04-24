@@ -212,8 +212,13 @@ class PerceptionCacheManager:
             state.static_cache_channel_len_in = cache_last_channel_len.clone()
 
         logging.info(f"   Warming up encoder for CUDA graph capture...")
-        for _ in range(3):
-            with torch.no_grad():
+        # PyTorch recommends a few eager warmup iterations before CUDA graph
+        # capture on a side stream; its example uses three iterations:
+        # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graphs
+        warmup_stream = torch.cuda.Stream(device=self.device)
+        warmup_stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(warmup_stream), torch.no_grad():
+            for _ in range(3):
                 _ = encoder.cache_aware_stream_step(
                     processed_signal=state.static_mel_first,
                     processed_signal_length=state.static_mel_len_first,
@@ -232,7 +237,7 @@ class PerceptionCacheManager:
                     keep_all_outputs=True,
                     drop_extra_pre_encoded=streaming_cfg.drop_extra_pre_encoded,
                 )
-        torch.cuda.synchronize()
+        torch.cuda.current_stream(self.device).wait_stream(warmup_stream)
 
         # Capture graph for FIRST chunk
         logging.info(f"   Capturing CUDA graph for first chunk (mel_len={mel_len_first})...")

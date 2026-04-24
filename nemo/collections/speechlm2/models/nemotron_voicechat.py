@@ -417,7 +417,7 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
         if meta_params:
             raise RuntimeError(
                 f"{len(meta_params)} parameters still on meta device after checkpoint load "
-                f"(missing from checkpoint): {meta_params[:20]}"
+                f"(missing from checkpoint; showing first 20): {meta_params[:20]}"
             )
 
         gc.collect()

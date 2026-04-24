@@ -208,7 +208,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                 temperature=raw_opts.temperature,
                 repetition_penalty=raw_opts.repetition_penalty,
             )
-        opts = raw_opts.augment_with_defaults(
+        opts = raw_opts.fill_defaults(
             default_system_prompt=self.system_prompt,
             default_top_p=self._default_top_p,
             default_temperature=self._default_temperature,
@@ -267,7 +267,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
             audio_buffer = audio_buffer.unsqueeze(0)
         audio_buffer = audio_buffer.to(self.s2s_model.device, dtype=self.s2s_model.dtype)
 
-        # Sampling overrides were resolved by _init_state via augment_with_defaults
+        # Sampling overrides were resolved by _init_state via fill_defaults
         # and stored on state.options.  Build the dict for infer_one_step.
         pipeline_state = self.get_state(stream_ids[0])
         if pipeline_state is None:

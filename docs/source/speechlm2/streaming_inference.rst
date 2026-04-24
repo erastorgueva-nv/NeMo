@@ -214,7 +214,7 @@ by this step — no need to diff against accumulated state:
 Per-stream options (``system_prompt``, ``top_p``, ``temperature``,
 ``repetition_penalty``) are attached to the ``is_first`` frame via
 ``S2SRequestOptions``.  Any field left as ``None`` falls back to the
-pipeline-level YAML default through ``augment_with_defaults()``.
+pipeline-level YAML default through ``fill_defaults()``.
 
 .. _init-and-latency:
 
@@ -300,7 +300,7 @@ What Happens Inside One Step
         ├─ for each frame where is_first=True:
         │      │
         │      └─ _init_state(stream_id, options)
-        │             1. augment_with_defaults()   ← fill None fields from YAML
+        │             1. fill_defaults()           ← fill None fields from YAML
         │             2. create_state(options)      ← pipeline-level state
         │             3. reset context_manager       ← fresh decode-state storage
         │             4. prefill system prompt      ← populate LLM KV cache
@@ -322,7 +322,7 @@ Each call to ``generate_step(frames)`` performs:
 
 1. **Stream init on** ``is_first`` -- If a frame has ``is_first=True``, the
    private ``_init_state()`` method runs: per-stream options are merged with
-   pipeline defaults (via ``S2SRequestOptions.augment_with_defaults()``),
+   pipeline defaults (via ``S2SRequestOptions.fill_defaults()``),
    a fresh ``S2SStreamingOutput`` is created, the context manager is
    allocated, and the LLM KV cache is prefilled with the system prompt and
    TTS speaker embedding.  This mirrors ASR's ``init_state()`` called inside
