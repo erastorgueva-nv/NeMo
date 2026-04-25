@@ -292,6 +292,7 @@ class CustomInputAsyncVLLMEngine:
                 input_dtype = "float32"  # Default dtype
             if spec.dim is not None and spec.dim != input_tensors[i].shape[-1]:
                 raise ValueError(f"Input tensor dimension mismatch for {spec.name}: expected {spec.dim}, got {input_tensors[i].shape[-1]}")
+            # vLLM serializes custom_inputs across client/core processes, so keep them on CPU; GPU tensors can cause incorrect behavior.
             custom_inputs[spec.name] = input_tensors[i].to(dtype=getattr(torch, input_dtype)).cpu()
             max_length = max(max_length, input_tensors[i].shape[0])
 
