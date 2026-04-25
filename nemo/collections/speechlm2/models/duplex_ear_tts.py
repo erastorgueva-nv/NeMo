@@ -111,8 +111,11 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         # compute samples per frame
         self.source_samples_per_frame = int(self.source_sample_rate * cfg.data.frame_length)
 
-        # get codec silence tokens (skip when codec has random weights — the
-        # buffer will be overwritten from the checkpoint)
+        # Get codec silence tokens (skip when codec has random weights — the
+        # buffer will be overwritten from the checkpoint. We skip to save time:
+        # self.get_codec_silence_frame() is relatively slow as it works by running the codec
+        # encoder on a silence waveform and then picking the most common frame
+        # from the output).
         if self.cfg.get('pretrained_codec_model', None) is not None:
             codec_silence_tokens = self.get_codec_silence_frame()
         else:
