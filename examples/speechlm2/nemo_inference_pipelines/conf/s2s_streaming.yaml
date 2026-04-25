@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Runtime args (overridden via CLI)
-# audio_file: "/path/to/your/audio_or_directory"
+# Runtime args (set in this file or overridden with Hydra command-line arguments)
+# audio_file accepts a single .wav file, a directory of .wav files, or a
+# line-delimited JSON/JSONL manifest with "audio_filepath" and optional
+# "system_prompt"/"text" fields. For this streaming inference script, "text" is
+# an optional reference transcript used only for WER.
 audio_file: ???
 output_dir: ./generated
 
-# Input audio padding (set at most one; null = disabled)
+# Input audio padding (set at most one; null = disabled). This appends silence
+# after the real input so the agent is more likely to finish speaking before the stream ends.
 pad_audio_to_sec: null       # Pad each audio to this fixed duration (seconds)
 pad_silence_ratio: null      # Append silence = ratio * original duration (e.g. 0.2 = 20%)
 pad_audio_by_sec: null       # Append this fixed number of extra seconds of silence
@@ -110,8 +114,10 @@ s2s:
   deterministic: false
 
 streaming:
-  input_sample_rate: 16000                          # Audio sample rate in Hz
-  output_sample_rate: 22050                          # Audio sample rate in Hz
+  # File inputs are converted to mono and resampled to this rate before chunking.
+  input_sample_rate: 16000
+  # Generated agent audio is saved at this rate.
+  output_sample_rate: 22050
   batch_size: 1                               # Number of audio frames per batch
   att_context_size: [70,0]                    # Attention context size: [70,13],[70,6],[70,2],[70,0]
   chunk_size_in_secs: ???                    # Needs to be multiple of 80ms

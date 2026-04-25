@@ -13,7 +13,12 @@
 # limitations under the License.
 
 """
-S2S Streaming Inference Client
+S2S file/manifest streaming inference driver.
+
+This script loads complete audio files, directories of ``.wav`` files, or
+line-delimited JSON/JSONL manifests and streams each input through the
+SpeechLM2 ``StreamingS2SPipeline`` chunk by chunk.  Live audio integrations
+should call ``pipeline.generate_step()`` directly with ``Frame`` objects.
 
 Usage:
     python s2s_streaming_infer.py \

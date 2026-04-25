@@ -258,7 +258,7 @@ above), use the Streaming S2S Pipeline:
     from nemo.collections.speechlm2.inference import S2SPipelineBuilder
 
     pipeline = S2SPipelineBuilder.build_pipeline(cfg)
-    output = pipeline.run(audio_filepaths, options=options)
+    outputs = pipeline.run(audio_filepaths, options=options)
 
 Or from the command line:
 

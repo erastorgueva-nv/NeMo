@@ -2,22 +2,56 @@ Streaming Inference
 ===================
 
 The speechlm2 collection provides a streaming inference pipeline for
-NemotronVoiceChat that processes audio in real time, chunk by chunk, and
-produces both text and speech output incrementally.  The pipeline follows the
-same methodology as the NeMo ASR Inference Pipelines (see
-``nemo.collections.asr.inference``).
+NemotronVoiceChat that processes audio chunk by chunk, producing text and speech
+output incrementally.  The pipeline follows a similar API to the NeMo ASR Inference Pipelines
+(see ``nemo.collections.asr.inference``).
 
-Overview
---------
+There are two ways to use the pipeline:
 
-The streaming inference stack has four layers:
+* ``StreamingS2SPipeline.run()`` processes complete audio files.  It is used by
+  ``s2s_streaming_infer.py`` for a single ``.wav`` file, a directory of ``.wav``
+  files, or a manifest.
+* ``StreamingS2SPipeline.generate_step()`` processes one batch of ``Frame``
+  objects and returns incremental outputs for that step.  Use it for servers,
+  microphone connectors, or other live audio sources.
 
 .. code-block:: text
 
-    Entry Script          s2s_streaming_infer.py (Hydra)
+    File inputs: one or more .wav files
+    (single path, directory, or manifest)
+                    │
+                    ▼
+              run(audio_filepaths)
+                    │  creates Frame chunks
+                    ▼
+              generate_step(frames)
+                    │
+                    ├─ incremental agent audio + text
+                    └─ incremental user ASR text
+
+Each audio file passed to ``run()`` is treated as one continuous audio stream. ``run()``
+accumulates the per-step outputs for each stream and writes final audio/text
+artifacts when the stream ends.
+
+The script can append trailing silence so the agent is more likely to finish
+speaking before the stream ends.  When a manifest contains reference ``text``
+fields, it also reports WER for the recognized user speech.
+
+.. note::
+
+   The current implementation supports one stream at a time (``batch_size=1``).
+
+Script Call Path
+----------------
+
+The ``s2s_streaming_infer.py`` script follows this call path:
+
+.. code-block:: text
+
+    Entry Script          s2s_streaming_infer.py
          │
          ▼
-    Pipeline              StreamingS2SPipeline
+    Pipeline              StreamingS2SPipeline.run()
          │                  - audio buffering
          │                  - state management
          │                  - file I/O
@@ -32,13 +66,16 @@ The streaming inference stack has four layers:
     Model                 NemotronVoiceChat
                             - DuplexSTTModel + DuplexEARTTS
 
+(With ``s2s.decode_audio=false``, the model still predicts text/ASR tokens but
+skips EarTTS generation and codec decoding.)
+
 Quick Start
 -----------
 
-Batch Inference from a Script
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+File-Based Inference from a Script
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-The simplest way to run streaming inference is with the provided Hydra script:
+Call the Python script and pass configuration values as command-line overrides:
 
 .. code-block:: bash
 
@@ -58,8 +95,9 @@ This will:
 
 1. Load the NemotronVoiceChat checkpoint.
 2. Stream each audio file through the pipeline in chunks.
-3. Save generated ``.wav``, stereo (input+output), and ``.txt`` files under
-   ``output_dir``.
+3. Save per-stream output files under ``output_dir``: generated ``.wav``,
+   stereo input+output ``.wav``, ``.txt``, and per-token ``.ctm``.
+4. Write ``output_processed.json`` and ``output_raw.json`` summarising the run.
 
 Programmatic Usage
 ^^^^^^^^^^^^^^^^^^
@@ -73,6 +111,36 @@ Programmatic Usage
 
     # returns list[S2SStreamingOutput], one per input file
     # each element has: .output_text_str, .output_asr_text_str, .audio_filepath, ...
+
+File Inputs and Manifests
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The ``audio_file`` argument accepted by
+``examples/speechlm2/nemo_inference_pipelines/s2s_streaming_infer.py`` may be:
+
+* A single ``.wav`` file.
+* A directory, in which case all ``.wav`` files in that directory are streamed.
+* A line-delimited ``.json`` or ``.jsonl`` manifest listing audio files.
+
+Manifest entries must provide ``audio_filepath`` and may also provide
+``system_prompt`` and ``text``:
+
+.. code-block:: json
+
+    {"audio_filepath": "audio/example.wav", "system_prompt": "You are helpful.", "text": "reference user transcript"}
+
+The JSON/JSONL manifest accepted by ``s2s_streaming_infer.py`` has this schema.
+Its ``text`` field is read only as an optional reference transcript for WER on
+the ASR/user side.  Generated agent text is produced by the model and written to
+``pred_text`` in the output JSON.
+
+This lightweight streaming inference manifest is distinct from the dataset
+manifests used for SpeechLM2 training and offline evaluation.  For those dataset
+formats, see :doc:`SpeechLM2 datasets <datasets>`.
+
+File paths in streaming inference manifests are resolved relative to the
+manifest file.  Audio from file inputs is converted to mono and
+resampled to ``streaming.input_sample_rate`` before it is chunked.
 
 
 Configuration
@@ -181,16 +249,22 @@ At most one of these may be set:
 Server Integration
 ------------------
 
-The same ``generate_step()`` method used by ``run()`` can be called directly
-from a custom server.  It returns a list of ``GenerateStepOutput`` objects
-(one per input frame) carrying the **incremental** audio and text produced
-by this step — no need to diff against accumulated state:
+Use ``generate_step()`` directly when audio does not come from complete files:
+for example, from a microphone, socket, Triton server, or browser UI.  The
+caller owns the input connector: capture audio, convert it to mono
+``streaming.input_sample_rate`` samples, split it into chunks, and pass those
+chunks as ``Frame`` objects.
+
+``generate_step()`` returns one ``GenerateStepOutput`` for each input frame,
+containing the audio, agent text, and user ASR text produced by that step.
 
 .. code-block:: python
 
-    from nemo.collections.speechlm2.inference import GenerateStepOutput
+    from nemo.collections.asr.inference.streaming.framing.request import Frame
+    from nemo.collections.speechlm2.inference import S2SRequestOptions
 
-    # 1. Init stream (empty audio so prefill completes before recording)
+    # 1. Initialize the stream before recording starts.
+    #    Send empty audio because prefill will likely take longer than chunk_size_in_secs.
     init_frame = Frame(
         samples=torch.empty(0),
         stream_id=stream_id,
@@ -198,14 +272,14 @@ by this step — no need to diff against accumulated state:
         options=S2SRequestOptions(system_prompt=prompt, top_p=0.9),
     )
     pipeline.generate_step([init_frame])
-    # -> client can now start recording
+    # -> the input connector can now start sending audio
 
-    # 2. Stream audio chunks and consume incremental outputs
-    for i, chunk in enumerate(audio_source):
+    # 2. For each input audio chunk, run one streaming step.
+    for chunk, is_last in audio_source:
         frame = Frame(
             samples=chunk,
             stream_id=stream_id,
-            is_first=False, is_last=(i == last),
+            is_first=False, is_last=is_last,
         )
         outputs = pipeline.generate_step([frame])
         for out in outputs:
@@ -225,14 +299,13 @@ When ``generate_step`` sees ``is_first``, it always runs stream
 initialization (context creation, KV-cache prefill).  If the frame also
 carries audio, inference runs immediately after init in the same call.
 
-For **latency-sensitive** server deployments (real-time voice chat),
-prefill can take hundreds of milliseconds or even multiple seconds.
-Clients should send ``is_first`` with **empty audio**, wait for the
-response confirming init is done, and only then start recording the
-user's microphone.  This prevents audio from queuing up during the
-expensive prefill phase.
+For **latency-sensitive** integrations, prefill can take hundreds of
+milliseconds or even multiple seconds.  Send ``is_first`` with **empty audio**,
+wait for the response confirming init is done, and only then start sending real
+audio.  This prevents input audio from queuing up during the expensive prefill
+phase.
 
-For **batch/offline** usage (CLI ``run()``), there is no real-time
+For **batch/offline** usage (``run()``), there is no real-time
 constraint.  The first frame carries both ``is_first`` and real audio,
 so init and first-chunk processing happen in one call with no extra
 round-trip.
@@ -242,52 +315,65 @@ on ``is_first`` and processes whatever audio is present.  The latency
 trade-off is entirely the caller's choice.
 
 
-Batch Size
-----------
-
-The pipeline currently supports ``batch_size=1`` (one stream at a time).
-
-
 Architecture
 ------------
 
-The Core Loop
-^^^^^^^^^^^^^
+File Chunking in ``run()``
+^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Like the ASR pipeline's ``BasePipeline.run()``, the S2S pipeline iterates
-over chunks and calls a single step method:
+For file inputs, ``StreamingS2SPipeline.run()`` uses
+``SilencePaddedContinuousBatchedFrameStreamer`` to load the audio paths,
+convert them to mono ``streaming.input_sample_rate`` audio, and emit ``Frame``
+chunks.  The streamer uses the configured chunk size, batch size, and optional
+silence-padding settings.  ``run()`` then passes each emitted frame batch to
+``generate_step``.  Live integrations do not need this helper; they can
+construct ``Frame`` objects directly and call ``generate_step``.
+
+The Core Streaming Loop
+^^^^^^^^^^^^^^^^^^^^^^^
+
+``StreamingS2SPipeline.run()`` orchestrates the streaming loop, delegating
+per-chunk inference to ``generate_step()`` and saving outputs as streams
+finish.  In simplified pseudocode:
 
 .. code-block:: python
 
-    pipeline.open_session()
+    # Inside StreamingS2SPipeline.run() (simplified):
+    self.open_session()
     for frames in streamer:
-        # Each call returns partial results for this chunk only
-        step_outputs = pipeline.generate_step(frames)
-        for out in step_outputs:
-            # out.text / out.asr_text: new tokens from this step
-            # out.audio: newly decoded audio for this step
-            print(f"[stream {out.stream_id}] agent: {out.text}  user: {out.asr_text}")
-    pipeline.close_session()
-    # returns list[S2SStreamingOutput], one per input file (finalized)
+        # step_outputs[i] carries GenerateStepOutput.audio / .text / .asr_text
+        # — the new agent audio and text produced by this chunk.
+        step_outputs = self.generate_step(frames)
+        self._finalize_and_save_finished_streams(frames, ...)
+    self.close_session()
+    # run() then returns list[S2SStreamingOutput], one per input file
 
-Each ``generate_step()`` call returns a list of ``GenerateStepOutput`` carrying
-the partial text, ASR text, and audio produced by that single chunk.  The
-``run()`` method returns a list of finalized ``S2SStreamingOutput`` objects (one
-per input audio file) with the accumulated texts, token tensors, and audio
+``run()`` returns a list of finalized ``S2SStreamingOutput`` objects (one per
+input audio file) with the accumulated texts, token tensors, and audio
 filepaths.
 
-Output files (wav, txt, CTM) are written as each stream finishes, so
-results are available on disk before the full run completes.  In-memory
-audio chunks are freed after writing.  Accessing ``output.audio_buffer``
-after ``run()`` reloads from the saved ``.wav`` file.
-Two token-level CTM files are produced per stream:
-``<stem>.ctm`` for agent output tokens and ``<stem>_asr.ctm`` for user
-(ASR) tokens.  Timestamps in both files reflect when the text token was
-*generated* by the model, which is not necessarily when the corresponding
-speech was spoken.
+``run()`` writes outputs as each stream finishes, so results appear on disk
+before the full run completes.  For each stream:
 
-``generate_step()`` is the unified entry point used by **both** the batch
-``run()`` method and server deployments.
+* ``<stem>.txt`` - agent transcript.
+* ``<stem>.ctm`` & ``<stem>_asr.ctm`` - per-token timing for agent text and ASR text.
+  Timestamps reflect when the text token was generated by the model.
+* ``<stem>.wav`` & ``<stem>_input_output.wav`` - generated agent audio, plus a
+  stereo file with input on one channel and output on the other.
+
+  * In the stereo file, the generated-output channel is offset by one chunk so
+    playback reflects the minimum delay from waiting for a full input chunk
+    before generating output (Note: actual inference time would add to this in
+    a real deployment).
+  * Both audio files are skipped when ``s2s.decode_audio=false``.
+
+After all streams finish, ``s2s_streaming_infer.py`` also writes two JSON
+summaries of the run: ``output_raw.json`` (full token stream including padding
+tokens) and ``output_processed.json`` (padding tokens removed for legibility).
+
+``run()`` loops over chunks of existing audio files, calling ``generate_step()``
+on each; ``generate_step()`` can also be called directly when audio comes from
+a non-file source.
 
 
 What Happens Inside One Step
@@ -309,14 +395,16 @@ What Happens Inside One Step
                │
               NO → return empty outputs  (server prefill-only request)
                │
-             YES → generate_step_for_frames()
-                      1. audio buffering
-                      2. perception encoder
-                      3. per-frame LLM loop
-                      4. per-frame TTS
-                      5. codec decode
-                      6. state updates + output accumulation
-                      7. return list[GenerateStepOutput]
+             YES → update per-stream sliding audio buffer
+                      │
+                      ▼
+                   generate_step_for_frames()
+                      1. perception encoder
+                      2. per-frame LLM loop
+                      3. per-frame TTS (when decode_audio=true)
+                      4. codec decode  (when decode_audio=true)
+                      5. state updates + output accumulation
+                      6. return list[GenerateStepOutput]
 
 Each call to ``generate_step(frames)`` performs:
 
@@ -328,11 +416,12 @@ Each call to ``generate_step(frames)`` performs:
    TTS speaker embedding.  This mirrors ASR's ``init_state()`` called inside
    ``transcribe_step()``.  If the frame carries no audio (zero-length
    samples), the method returns after init — this is the recommended
-   pattern for latency-sensitive server deployments (see
+   pattern for latency-sensitive deployments (see
    :ref:`init-and-latency` above).
 
-2. **Audio buffering** -- ``BatchedAudioBufferer`` (reused from ASR
-   infrastructure) maintains a sliding window of ``buffer_size_in_secs``.
+2. **Audio buffer update** -- ``generate_step`` updates each stream's rolling
+   audio buffer so the model receives the current ``buffer_size_in_secs``-size
+   window of audio.
 
 3. **Model inference** via ``infer_one_step(audio_buffer, state)``:
 
@@ -342,12 +431,13 @@ Each call to ``generate_step(frames)`` performs:
       frames, the pipeline builds an input embedding (user audio +
       previous-step text/ASR tokens), runs it through the LLM, and obtains
       predicted text and ASR tokens.
-   c. **Per-frame TTS** -- Each predicted text token is fed into the EarTTS
-      model to produce audio codec codes.
-   d. **Codec decode** -- The accumulated codes are decoded into a waveform.
+   c. **TTS code generation** -- When ``s2s.decode_audio=true``, predicted text
+      tokens are fed into the EarTTS model to produce audio codec codes.
+   d. **Codec decode** -- When ``s2s.decode_audio=true``, the accumulated codes
+      are decoded into a waveform.
 
-4. **State updates** -- The context manager advances ``frame_idx`` and
-   updates the subword mask.
+4. **State updates** -- The per-stream ``StreamingDecodeState`` is updated
+   with model-side decode state such as generated-token history and caches.
 
 5. **Output accumulation** -- Decoded audio and text are appended to the
    per-stream ``S2SStreamingOutput``.

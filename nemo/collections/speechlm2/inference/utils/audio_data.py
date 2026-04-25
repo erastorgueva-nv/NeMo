@@ -31,11 +31,16 @@ def prepare_audio_data(
 ) -> tuple[list[str], list[S2SRequestOptions], list[str | None]]:
     """Load audio filepaths and per-stream options from a folder, single file, or manifest.
 
-    When the input is a JSON manifest, each line may contain::
+    ``audio_file`` may point to a single ``.wav`` file, a directory of ``.wav``
+    files, or a line-delimited ``.json``/``.jsonl`` inference manifest.  Each
+    manifest line must contain ``audio_filepath`` and may also contain
+    ``system_prompt`` and ``text``::
 
         {"audio_filepath": "clip.wav", "text": "...", "system_prompt": "..."}
 
     If ``system_prompt`` is absent on a line, *default_system_prompt* is used.
+    The ``text`` field is returned as optional reference transcript for WER on
+    the ASR/user side.
 
     Returns:
         ``(filepaths, options, ground_truths)`` -- parallel lists of audio paths,
