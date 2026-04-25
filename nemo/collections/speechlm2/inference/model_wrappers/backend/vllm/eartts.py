@@ -58,11 +58,13 @@ class VLLMEarTTS(VLLMModelBase):
 
     def _convert_ckpt(self, save_path: str):
         """Convert EARTTS checkpoint to vLLM format."""
-        from nemo.collections.speechlm2.inference.vllm.scripts.convert_eartts_checkpoint import convert
+        from nemo.collections.speechlm2.inference.vllm.scripts.convert_duplex_eartts_checkpoint import (
+            convert_to_vllm_format,
+        )
         ckpt_dir = os.path.normpath(self.model_path)
         config_file = os.path.join(ckpt_dir, "config.json")
         model_ckpt = os.path.join(ckpt_dir, "model.safetensors")
-        convert(save_path, config_file, model_ckpt)
+        convert_to_vllm_format(save_path, config_file, model_ckpt)
 
     def __call__(
         self,

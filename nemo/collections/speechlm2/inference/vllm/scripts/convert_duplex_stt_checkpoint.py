@@ -13,16 +13,17 @@
 # limitations under the License.
 
 """
-Convert NeMo STT checkpoint to HuggingFace format compatible with vLLM.
+Convert the DuplexSTT component of a NemotronVoiceChat checkpoint to vLLM format.
 
-This script extracts weights from a NeMo checkpoint that has the structure:
+This script extracts weights from a HuggingFace-format NemotronVoiceChat
+checkpoint with tensors such as:
 - stt_model.llm.layers.*
 - stt_model.lm_head.*
 - stt_model.asr_head.*
 - stt_model.embed_asr_tokens.*
 - stt_model.embed_tokens.*
 
-And converts them to HuggingFace format that can be loaded by vLLM with the
+And converts them to a HuggingFace layout that can be loaded by vLLM with the
 custom WeightsMapper defined in nemotron_h.py.
 """
 
@@ -38,11 +39,11 @@ from nemo.utils import logging
 
 def load_checkpoint(checkpoint_path: str) -> dict[str, torch.Tensor]:
     """
-    Load checkpoint from safetensors or PyTorch format.
-    
+    Load a NemotronVoiceChat checkpoint state dict.
+
     Args:
-        checkpoint_path: Path to the checkpoint file (.safetensors or .pt/.pth)
-    
+        checkpoint_path: Path to a checkpoint directory, safetensors file, or PyTorch checkpoint file.
+
     Returns:
         Dictionary of tensor names to tensors
     """
@@ -70,11 +71,11 @@ def filter_tensors(
 ) -> dict[str, torch.Tensor]:
     """
     Filter tensors to keep only those with specified prefixes.
-    
+
     Args:
         state_dict: Full state dictionary
         prefixes_to_keep: List of prefixes to keep (e.g., ["stt_model.llm", "stt_model.asr_head"])
-    
+
     Returns:
         Filtered state dictionary
     """
@@ -85,12 +86,12 @@ def filter_tensors(
             logging.debug(f"Keeping: {name} with shape {tensor.shape}")
         else:
             logging.debug(f"Skipping: {name}")
-    
+
     logging.info(f"Total tensors kept: {len(filtered_dict)}")
     return filtered_dict
 
 
-def convert_nemo_to_hf_format(
+def convert_to_vllm_format(
     checkpoint_path: str,
     output_dir: str,
     config_path: str | None = None,
@@ -99,8 +100,8 @@ def convert_nemo_to_hf_format(
     dtype: str = "float32",
 ) -> None:
     """
-    Convert NeMo STT checkpoint to HuggingFace format.
-    
+    Convert the DuplexSTT component to vLLM-compatible HuggingFace format.
+
     Args:
         checkpoint_path: Path to the NeMo checkpoint (.safetensors or .pt)
         output_dir: Directory to save the converted checkpoint
@@ -118,17 +119,17 @@ def convert_nemo_to_hf_format(
             "stt_model.embed_asr_tokens",
             "stt_model.embed_tokens",
         ]
-    
+
     # Load config to get pretrained_llm if not provided
     if config_path is None:
         ckpt_dir = checkpoint_path if os.path.isdir(checkpoint_path) else os.path.dirname(checkpoint_path)
         config_path = os.path.join(ckpt_dir, "config.json")
-    
+
     if os.path.exists(config_path):
         logging.info(f"Loading config from {config_path}")
         with open(config_path, "r") as f:
             config = json.load(f)
-        
+
         try:
             pretrained_llm = config["model"]["stt"]["model"]["pretrained_llm"]
             logging.info(f"Found pretrained_llm in config: {pretrained_llm}")
@@ -142,15 +143,15 @@ def convert_nemo_to_hf_format(
             raise ValueError(
                 f"Config file not found at {config_path} and pretrained_llm not provided"
             )
-    
+
     # Create output directory
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    
+
     # Load base config from pretrained model
     logging.info(f"Loading base config from {pretrained_llm}")
     base_config = AutoConfig.from_pretrained(pretrained_llm, trust_remote_code=True)
-    
+
     # Modify config for custom inputs/outputs
     custom_config = {
         "custom_input_specs": [
@@ -168,35 +169,35 @@ def convert_nemo_to_hf_format(
     # Load tokenizer from pretrained model
     logging.info(f"Loading tokenizer from {pretrained_llm}")
     tokenizer = AutoTokenizer.from_pretrained(pretrained_llm, trust_remote_code=True)
-    
+
     # Load checkpoint
     logging.info(f"Loading checkpoint from {checkpoint_path}")
     state_dict = load_checkpoint(checkpoint_path)
-    
+
     # Filter tensors
     logging.info(f"Filtering tensors to keep prefixes: {tensors_to_keep}")
     filtered_state_dict = filter_tensors(state_dict, tensors_to_keep)
-    
+
     if len(filtered_state_dict) == 0:
         raise ValueError(
             f"No tensors found with prefixes {tensors_to_keep}. "
             f"Available prefixes: {set(k.split('.')[0] for k in state_dict.keys())}"
         )
-    
+
     # Save tensors
     output_model_path = output_path / "model.safetensors"
     logging.info(f"Saving tensors to {output_model_path}")
     save_file(filtered_state_dict, str(output_model_path))
-    
+
     # Save config
     output_config_path = output_path / "config.json"
     logging.info(f"Saving config to {output_config_path}")
     base_config.save_pretrained(str(output_path))
-    
+
     # Save tokenizer
     logging.info(f"Saving tokenizer to {output_path}")
     tokenizer.save_pretrained(str(output_path))
-    
+
     logging.info(f"Conversion completed successfully! Output saved to: {output_path}")
 
 
@@ -242,10 +243,10 @@ def main():
         choices=["float32", "float16", "bfloat16", "fp32", "fp16", "bf16"],
         help="Target dtype for tensors (default: float32)",
     )
-    
+
     args = parser.parse_args()
-    
-    convert_nemo_to_hf_format(
+
+    convert_to_vllm_format(
         checkpoint_path=args.checkpoint,
         output_dir=args.output_dir,
         config_path=args.config,

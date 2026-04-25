@@ -41,9 +41,11 @@ class VLLMLLM(VLLMModelBase):
 
     def _convert_ckpt(self, save_path: str):
         """Convert existing DuplexSTT checkpoint to vLLM-compatible HF format."""
-        from nemo.collections.speechlm2.inference.vllm.scripts.convert_nemotronllm_checkpoint import convert_nemo_to_hf_format
+        from nemo.collections.speechlm2.inference.vllm.scripts.convert_duplex_stt_checkpoint import (
+            convert_to_vllm_format,
+        )
 
-        convert_nemo_to_hf_format(
+        convert_to_vllm_format(
             checkpoint_path=self.model_path,
             output_dir=save_path,
             pretrained_llm=self.pretrained_llm,

@@ -12,17 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import json
+"""Convert the DuplexEARTTS component of a NemotronVoiceChat checkpoint to vLLM format.
+
+The converter expects the HuggingFace-format NemotronVoiceChat checkpoint layout:
+``config.json`` contains ``model.speech_generation`` and ``model.stt`` entries,
+and ``model.safetensors`` contains nested ``tts_model.tts_model.*`` weights.
+"""
+
 import argparse
+import json
+import os
 
 import torch
-from omegaconf import OmegaConf, DictConfig
-from safetensors.torch import save_file, load_file
+from omegaconf import DictConfig, OmegaConf
+from safetensors.torch import load_file, save_file
 from transformers import AutoConfig
-from nemo.utils import logging
 
 from nemo.collections.speechlm2.models.duplex_ear_tts import DuplexEARTTS
+from nemo.utils import logging
 
 
 def parse_args():
@@ -33,7 +40,14 @@ def parse_args():
     return parser.parse_args()
 
 
-def convert(outdir, config, model_path):
+def convert_to_vllm_format(outdir: str, config: str, model_path: str) -> None:
+    """Convert DuplexEARTTS weights from a NemotronVoiceChat HF checkpoint for vLLM.
+
+    Args:
+        outdir: Directory where the vLLM-compatible checkpoint will be written.
+        config: Path to the NemotronVoiceChat ``config.json`` file.
+        model_path: Path to the NemotronVoiceChat ``model.safetensors`` file.
+    """
     os.makedirs(outdir, exist_ok=True)
 
     # load config
@@ -74,7 +88,7 @@ def convert(outdir, config, model_path):
     max_char_len = max(len(char_ids) for char_ids in subword_id_to_char_ids.values())
     hidden_size = cfg.model.tts_config.backbone_config.hidden_size
 
-    # load checkpoint (support both safetensors and pytorch formats)
+    # Load the HuggingFace-format NemotronVoiceChat safetensors checkpoint.
     weights = load_file(model_path)
     # select tts model weights, strip off one nested layer
     weights = {k[len("tts_model."):]: v for k, v in weights.items() if "tts_model." in k}
@@ -175,13 +189,13 @@ def convert(outdir, config, model_path):
     backbone_config_dict = OmegaConf.to_container(
         cfg.model.tts_config.backbone_config, resolve=True
     ) if cfg.model.tts_config.get("backbone_config") else {}
-    
+
     # Create AutoConfig the same way NeMo does - this fills in all defaults
     parsed_backbone_config = AutoConfig.for_model(backbone_type, **backbone_config_dict)
-    
+
     # Store the backbone type for vllm to use
     flat_config["backbone_type"] = backbone_type
-    
+
     # Forward all backbone configs from the parsed AutoConfig (includes defaults)
     for key in [
         "hidden_size",
@@ -275,4 +289,4 @@ def convert(outdir, config, model_path):
 
 if __name__ == "__main__":
     args = parse_args()
-    convert(args.outdir, args.config, args.model)
+    convert_to_vllm_format(args.outdir, args.config, args.model)
