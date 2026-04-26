@@ -27,11 +27,11 @@ and is skipped unless ``PARITY_CHECKPOINT_PATH`` is set::
 Run from the NeMo repo root (use ``-s`` to see live progress)::
 
     # unit tests only
-    CUDA_VISIBLE_DEVICES=0 pytest tests/collections/speechlm2/test_nemotron_voicechat_pipeline_parity.py -v -s
+    CUDA_VISIBLE_DEVICES=0 pytest tests/collections/speechlm2/voicechat/test_nemotron_voicechat_pipeline_parity.py -v -s
 
     # include integration test
     PARITY_CHECKPOINT_PATH=... \\
-        CUDA_VISIBLE_DEVICES=0 pytest tests/collections/speechlm2/test_nemotron_voicechat_pipeline_parity.py -v -s
+        CUDA_VISIBLE_DEVICES=0 pytest tests/collections/speechlm2/voicechat/test_nemotron_voicechat_pipeline_parity.py -v -s
 """
 
 from __future__ import annotations
@@ -56,14 +56,19 @@ from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_infe
 from nemo.collections.speechlm2.inference.pipelines.streaming_s2s_pipeline import StreamingS2SPipeline
 from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
 
-_CONF_YAML = os.path.join(
-    os.path.dirname(__file__),
-    "../../../examples/speechlm2/nemo_inference_pipelines/conf/s2s_streaming.yaml",
+_CONF_YAML = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "../../../../examples/speechlm2/nemo_inference_pipelines/conf/s2s_streaming.yaml",
+    )
 )
-_FORCE_ALIGN_AUDIO = os.path.join(
-    os.path.dirname(__file__),
-    "test_data",
-    "force_align_test.mp3",
+_FORCE_ALIGN_AUDIO = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "test_data",
+        "force_align_test.mp3",
+    )
 )
 _MOCK_SYSTEM_PROMPT = "This is a mock prompt for the test"
 

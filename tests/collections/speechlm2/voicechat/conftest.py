@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared fixtures for speechlm2 tests."""
+"""Shared fixtures for Nemotron VoiceChat tests."""
 
 from __future__ import annotations
 

@@ -20,7 +20,7 @@ pipeline completes without raising — no output quality checks.
 
 Run from the NeMo repo root::
 
-    CUDA_VISIBLE_DEVICES=0 pytest tests/collections/speechlm2/test_nemotron_voicechat_pipeline_nocrash.py -v -s
+    CUDA_VISIBLE_DEVICES=0 pytest tests/collections/speechlm2/voicechat/test_nemotron_voicechat_pipeline_nocrash.py -v -s
 """
 
 from __future__ import annotations
@@ -37,9 +37,11 @@ from nemo.collections.speechlm2.inference.factory.s2s_pipeline_builder import S2
 from nemo.collections.speechlm2.inference.pipelines.streaming_s2s_pipeline import StreamingS2SPipeline
 from nemo.collections.speechlm2.inference.utils.stepprogressbar import StepProgressBar
 
-_CONF_YAML = os.path.join(
-    os.path.dirname(__file__),
-    "../../../examples/speechlm2/nemo_inference_pipelines/conf/s2s_streaming.yaml",
+_CONF_YAML = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "../../../../examples/speechlm2/nemo_inference_pipelines/conf/s2s_streaming.yaml",
+    )
 )
 _MOCK_SYSTEM_PROMPT = "This is a mock prompt for the test"
 
