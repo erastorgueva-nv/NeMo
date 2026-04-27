@@ -13,10 +13,10 @@
 # limitations under the License.
 
 from nemo.collections.speechlm2.inference.factory.s2s_pipeline_builder import S2SPipelineBuilder
-from nemo.collections.speechlm2.inference.model_wrappers.decode_state import (
-    InferenceStepResult,
-    StreamingDecodeState,
+from nemo.collections.speechlm2.inference.model_wrappers.decode_state import InferenceStepResult, StreamingDecodeState
+from nemo.collections.speechlm2.inference.pipelines.streaming_s2s_pipeline import (
+    GenerateStepOutput,
+    StreamingS2SPipeline,
 )
-from nemo.collections.speechlm2.inference.pipelines.streaming_s2s_pipeline import GenerateStepOutput, StreamingS2SPipeline
 from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
 from nemo.collections.speechlm2.inference.streaming.state.s2s_streaming_output import S2SStreamingOutput

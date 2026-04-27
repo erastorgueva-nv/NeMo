@@ -49,9 +49,7 @@ class SilencePaddedStream(Stream):
         self.inner.load_audio(audio, options)
         audio_secs = self.inner.n_samples / self.inner.rate
         remaining = self._padding_secs(audio_secs)
-        self._silence_frames_remaining = (
-            max(1, round(remaining / self.chunk_size_in_secs)) if remaining > 0 else 0
-        )
+        self._silence_frames_remaining = max(1, round(remaining / self.chunk_size_in_secs)) if remaining > 0 else 0
 
     def _padding_secs(self, elapsed: float) -> float:
         if self.pad_to_sec is not None:
@@ -86,12 +84,14 @@ class SilencePaddedStream(Stream):
 
         if self._silence_frames_remaining > 0:
             self._silence_frames_remaining -= 1
-            return [Frame(
-                samples=torch.zeros(self.inner.frame_size),
-                stream_id=self.stream_id,
-                is_first=False,
-                is_last=(self._silence_frames_remaining == 0),
-                length=self.inner.frame_size,
-            )]
+            return [
+                Frame(
+                    samples=torch.zeros(self.inner.frame_size),
+                    stream_id=self.stream_id,
+                    is_first=False,
+                    is_last=(self._silence_frames_remaining == 0),
+                    length=self.inner.frame_size,
+                )
+            ]
 
         raise StopIteration

@@ -69,7 +69,7 @@ def load_pretrained_hf(
         )
     else:
         config = AutoConfig.from_pretrained(model_path_or_name, trust_remote_code=trust_remote_code)
-        with (torch.device('meta') if use_meta_device else nullcontext()):
+        with torch.device('meta') if use_meta_device else nullcontext():
             return AutoModelForCausalLM.from_config(config, torch_dtype=dtype, trust_remote_code=trust_remote_code)
 
 

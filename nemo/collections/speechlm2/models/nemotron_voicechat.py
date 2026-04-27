@@ -388,7 +388,9 @@ class NemotronVoiceChat(LightningModule, HFHubMixin):
                 elif prefix + key in buffer_dict:
                     target = buffer_dict[prefix + key]
                     if target.shape != tensor.shape:
-                        logging.warning(f"Buffer shape mismatch for {key}: model {target.shape} vs ckpt {tensor.shape}")
+                        logging.warning(
+                            f"Buffer shape mismatch for {key}: model {target.shape} vs ckpt {tensor.shape}"
+                        )
                     else:
                         target.data.copy_(tensor)
                     loaded_keys.append(key)

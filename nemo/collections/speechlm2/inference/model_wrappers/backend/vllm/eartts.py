@@ -23,13 +23,14 @@ CustomInputAsyncVLLMEngine for accelerated inference.
 Used as ``model_eartts_interface`` in the inference wrapper.
 """
 
-from typing import Any
 import os
+from typing import Any
+
 import torch
 
-from nemo.utils import logging
-from nemo.collections.speechlm2.inference.model_wrappers.backend.vllm.base import VLLMModelBase
 from nemo.collections.speechlm2.inference.model_wrappers.backend.pytorch.eartts import TTSGenerationResult
+from nemo.collections.speechlm2.inference.model_wrappers.backend.vllm.base import VLLMModelBase
+from nemo.utils import logging
 
 
 class VLLMEarTTS(VLLMModelBase):
@@ -52,6 +53,7 @@ class VLLMEarTTS(VLLMModelBase):
             Tuple of (subword_mask, codec_cache).
         """
         from nemo.collections.speechlm2.modules.ear_tts_vae_codec import CausalConv1dCache
+
         codec_cache = CausalConv1dCache()
         subword_mask = torch.ones((1, max_len), device=device, dtype=torch.bool)
         return subword_mask, codec_cache
@@ -61,6 +63,7 @@ class VLLMEarTTS(VLLMModelBase):
         from nemo.collections.speechlm2.inference.vllm.scripts.convert_duplex_eartts_checkpoint import (
             convert_to_vllm_format,
         )
+
         ckpt_dir = os.path.normpath(self.model_path)
         config_file = os.path.join(ckpt_dir, "config.json")
         model_ckpt = os.path.join(ckpt_dir, "model.safetensors")
@@ -71,7 +74,7 @@ class VLLMEarTTS(VLLMModelBase):
         inputs: dict[str, torch.Tensor] | None = None,
         request_id: str | None = None,
         prompt_token_ids: list | None = None,
-        **kwargs
+        **kwargs,
     ) -> TTSGenerationResult:
         """
         Perform TTS inference using vLLM streaming engine.
@@ -166,6 +169,7 @@ class VLLMEarTTS(VLLMModelBase):
         else:
             if self._speaker_latent_dim is None:
                 import json as _json
+
                 dir_name = os.path.basename(os.path.normpath(self.model_path))
                 converted_config_path = os.path.join("/tmp", dir_name + "_vllm_converted_eartts", "config.json")
                 if os.path.exists(converted_config_path):
@@ -180,12 +184,14 @@ class VLLMEarTTS(VLLMModelBase):
             speaker_latent = torch.zeros(num_tokens, self._speaker_latent_dim, dtype=getattr(torch, self._dtype))
             input_tensors.append(speaker_latent)
 
-        result = await self.engine.generate_next_token(input_tensors, prompt_token_ids=prompt_token_ids, request_id=request_id)
+        result = await self.engine.generate_next_token(
+            input_tensors, prompt_token_ids=prompt_token_ids, request_id=request_id
+        )
         acoustic_tokens = result.custom_outputs["acoustic_tokens"]  # T x 31
         step_acoustic_tokens = acoustic_tokens[-1:]  # 1 x 31
         return TTSGenerationResult(
             codes=step_acoustic_tokens.unsqueeze(0).cuda(),  # Add batch dim back: 1 x 1 x 31
-            past_key_values=None  # vLLM manages cache internally
+            past_key_values=None,  # vLLM manages cache internally
         )
 
     def prefill_prompt(self, init_inputs, prompt_token_ids=None, request_id=None, **kwargs):
@@ -200,5 +206,6 @@ class VLLMEarTTS(VLLMModelBase):
             TTSGenerationResult with codes from the prefill step, or None.
         """
         import copy
+
         inputs_copy = copy.deepcopy(init_inputs)
         return self(inputs_copy, request_id=request_id, prompt_token_ids=prompt_token_ids)

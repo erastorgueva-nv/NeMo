@@ -28,9 +28,10 @@ implement, with shared sampling utilities (top-p, repetition penalty,
 temperature).
 """
 
+import math
 from abc import ABC, abstractmethod
 from typing import Any
-import math
+
 import torch
 
 from nemo.utils import logging
@@ -81,8 +82,7 @@ class ModelInterface(ABC):
         # Pre-built tensor for special-token filtering in repetition penalty.
         # Lazily moved to the right device on first use (see _sample_text_token).
         self._special_ids_tensor: torch.Tensor | None = (
-            torch.tensor(sorted(self.special_token_ids), dtype=torch.long)
-            if self.special_token_ids else None
+            torch.tensor(sorted(self.special_token_ids), dtype=torch.long) if self.special_token_ids else None
         )
 
     def _sample_text_token(
@@ -109,7 +109,11 @@ class ModelInterface(ABC):
         """
         top_p = sampling_params.get("top_p", self.top_p) if sampling_params else self.top_p
         temperature = sampling_params.get("temperature", self.temperature) if sampling_params else self.temperature
-        rep_penalty = sampling_params.get("repetition_penalty", self.repetition_penalty) if sampling_params else self.repetition_penalty
+        rep_penalty = (
+            sampling_params.get("repetition_penalty", self.repetition_penalty)
+            if sampling_params
+            else self.repetition_penalty
+        )
 
         B, V = logits.shape
         device = logits.device
@@ -201,12 +205,7 @@ class ModelInterface(ABC):
         return sampled_tokens
 
     @abstractmethod
-    def __call__(
-        self,
-        input_embeds: torch.Tensor,
-        cache: Any | None = None,
-        **kwargs
-    ) -> dict[str, Any]:
+    def __call__(self, input_embeds: torch.Tensor, cache: Any | None = None, **kwargs) -> dict[str, Any]:
         """
         Perform model inference.
 

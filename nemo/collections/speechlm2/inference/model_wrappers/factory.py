@@ -44,7 +44,7 @@ def create_model(
     top_p: float = 1.0,
     repetition_penalty: float = 1.0,
     temperature: float = 1.0,
-    **kwargs
+    **kwargs,
 ) -> ModelInterface:
     """
     Factory function to create a single inference backend for one component.
@@ -120,7 +120,7 @@ def create_model(
             top_p=top_p,
             repetition_penalty=repetition_penalty,
             temperature=temperature,
-            **kwargs
+            **kwargs,
         )
 
     elif engine_type == "vllm_llm":
@@ -135,7 +135,7 @@ def create_model(
             top_p=top_p,
             repetition_penalty=repetition_penalty,
             temperature=temperature,
-            **kwargs
+            **kwargs,
         )
 
     else:

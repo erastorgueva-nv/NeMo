@@ -15,20 +15,12 @@
 import copy
 import os
 import time
+
 import torch
 import torchaudio
-from omegaconf import OmegaConf, DictConfig
+from omegaconf import DictConfig, OmegaConf
 
-from nemo.utils import logging, str_to_dtype
-
-from nemo.collections.speechlm2.models.nemotron_voicechat import NemotronVoiceChat
-from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.audio.parts.utils.transforms import resample
-from nemo.collections.speechlm2.inference.model_wrappers.factory import create_model
-from nemo.collections.speechlm2.inference.model_wrappers.perception_cache import (
-    PerceptionCacheState,
-    PerceptionCacheManager,
-)
 from nemo.collections.speechlm2.inference.model_wrappers.decode_state import (
     InferenceStepResult,
     IntermediateResultLogger,
@@ -37,12 +29,19 @@ from nemo.collections.speechlm2.inference.model_wrappers.decode_state import (
     StreamingDecodeState,
     TimingSummary,
 )
+from nemo.collections.speechlm2.inference.model_wrappers.factory import create_model
+from nemo.collections.speechlm2.inference.model_wrappers.perception_cache import (
+    PerceptionCacheManager,
+    PerceptionCacheState,
+)
+from nemo.collections.speechlm2.models.nemotron_voicechat import NemotronVoiceChat
+from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.speechlm2.parts.text_utils import (
     _decode_tokens_with_specials,
     get_special_token_ids,
     get_special_token_strings,
 )
-
+from nemo.utils import logging, str_to_dtype
 
 # --- Configuration ---
 DEFAULT_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -117,7 +116,9 @@ class NemotronVoicechatInferenceWrapper:
         self.speaker_reference = model_cfg.get("speaker_reference")
         self.speaker_name = model_cfg.get("speaker_name", None)
         if self.decode_audio and not self.speaker_reference and not self.speaker_name:
-            raise ValueError("`model_cfg.speaker_reference` or `model_cfg.speaker_name` must be provided when decode_audio is enabled.")
+            raise ValueError(
+                "`model_cfg.speaker_reference` or `model_cfg.speaker_name` must be provided when decode_audio is enabled."
+            )
 
         self.tts_system_prompt = model_cfg.get("tts_system_prompt", None)
         logging.info(f"TTS system prompt: {self.tts_system_prompt}")
@@ -142,9 +143,15 @@ class NemotronVoicechatInferenceWrapper:
         logging.info(f"Compute dtype: {self.dtype}")
         logging.info(f"Decode audio: {self.decode_audio}")
         logging.info(f"Engine type: {model_cfg.get('engine_type', 'native')}")
-        logging.info(f"Sampling - top_p: {model_cfg.get('top_p', 1.0)}, repetition_penalty: {model_cfg.get('repetition_penalty', 1.0)}, temperature: {model_cfg.get('temperature', 1.0)}")
-        logging.info(f"Precision (configured): matmul_precision={matmul_precision}, allow_tf32={allow_tf32}, deterministic={self._deterministic}")
-        logging.info(f"Precision (effective): float32_matmul_precision={torch.get_float32_matmul_precision()}, cudnn.allow_tf32={torch.backends.cudnn.allow_tf32}, cuda.matmul.allow_tf32={torch.backends.cuda.matmul.allow_tf32}")
+        logging.info(
+            f"Sampling - top_p: {model_cfg.get('top_p', 1.0)}, repetition_penalty: {model_cfg.get('repetition_penalty', 1.0)}, temperature: {model_cfg.get('temperature', 1.0)}"
+        )
+        logging.info(
+            f"Precision (configured): matmul_precision={matmul_precision}, allow_tf32={allow_tf32}, deterministic={self._deterministic}"
+        )
+        logging.info(
+            f"Precision (effective): float32_matmul_precision={torch.get_float32_matmul_precision()}, cudnn.allow_tf32={torch.backends.cudnn.allow_tf32}, cuda.matmul.allow_tf32={torch.backends.cuda.matmul.allow_tf32}"
+        )
         logging.info("=" * 70)
 
         # Profiling: when True, a TimingSummary (extending NamedTimer with
@@ -516,19 +523,30 @@ class NemotronVoicechatInferenceWrapper:
         use_llm_cache = state.llm_cache is not None
         B = state.gen_text.shape[0]
 
-        predicted_tokens = torch.empty((B, num_frames_per_chunk), dtype=state.gen_text.dtype, device=state.gen_text.device)
-        asr_predicted_tokens = torch.empty((B, num_frames_per_chunk), dtype=state.gen_text.dtype, device=state.gen_text.device)
+        predicted_tokens = torch.empty(
+            (B, num_frames_per_chunk), dtype=state.gen_text.dtype, device=state.gen_text.device
+        )
+        asr_predicted_tokens = torch.empty(
+            (B, num_frames_per_chunk), dtype=state.gen_text.dtype, device=state.gen_text.device
+        )
 
         debug_logger = IntermediateResultLogger() if return_debug else NullIntermediateResultLogger()
 
         # --- Stage 1: Perception ---
         state.timing.start("perception")
         source_encoded, state.perception_cache = self._run_perception(
-            audio_input, frame_idx, num_frames_per_chunk, state.perception_cache,
+            audio_input,
+            frame_idx,
+            num_frames_per_chunk,
+            state.perception_cache,
         )
         state.timing.stop("perception")
         total_encoded_frames = source_encoded.shape[1]
-        if self.use_perception_cache and state.perception_cache is not None and state.perception_cache.is_initialized():
+        if (
+            self.use_perception_cache
+            and state.perception_cache is not None
+            and state.perception_cache.is_initialized()
+        ):
             # With cache: we get exactly num_frames_per_chunk output frames
             base_frame_index = 0
         else:
@@ -546,16 +564,26 @@ class NemotronVoicechatInferenceWrapper:
             current_frame_idx = frame_idx + frame_offset
             current_frame_index = min(base_frame_index + frame_offset, source_encoded.shape[1] - 1)
             debug_logger.log_selected_frame_index(current_frame_index)
-            frame_embedding = source_encoded[:, current_frame_index:current_frame_index + 1, :]
+            frame_embedding = source_encoded[:, current_frame_index : current_frame_index + 1, :]
 
             input_emb = self.model.stt_model.build_input_embedding(
-                frame_embedding, current_frame_idx, state.gen_text, state.gen_asr_text, has_prompt,
+                frame_embedding,
+                current_frame_idx,
+                state.gen_text,
+                state.gen_asr_text,
+                has_prompt,
             )
             debug_logger.log_input_embeds(input_emb)
 
             ans = self._run_llm_step(
-                input_emb, state, frame_offset, effective_request_id,
-                current_frame_idx, use_llm_cache, return_debug, new_input_embeds,
+                input_emb,
+                state,
+                frame_offset,
+                effective_request_id,
+                current_frame_idx,
+                use_llm_cache,
+                return_debug,
+                new_input_embeds,
                 sampling_params=sampling_params,
             )
 
@@ -577,7 +605,9 @@ class NemotronVoicechatInferenceWrapper:
 
             if self.decode_audio:
                 new_code = self._run_tts_step(
-                    state, current_frame_idx, effective_request_id,
+                    state,
+                    current_frame_idx,
+                    effective_request_id,
                 )
                 new_codes_for_decode.append(new_code)
 
@@ -763,16 +793,21 @@ class NemotronVoicechatInferenceWrapper:
             new_codes_tensor = torch.cat(new_codes_for_decode, dim=1)
             if hasattr(self.model.tts_model, '_control_codes'):
                 from nemo.collections.speechlm2.models.duplex_ear_tts import replace_control_speech_codes
+
                 new_codes_tensor = replace_control_speech_codes(
                     new_codes_tensor,
                     self.model.tts_model._control_codes,
                     getattr(self.model.tts_model, 'codec_silence_tokens', None),
                 )
             new_code_len = torch.tensor(
-                [new_codes_tensor.shape[1]], dtype=torch.long, device=self.device,
+                [new_codes_tensor.shape[1]],
+                dtype=torch.long,
+                device=self.device,
             )
             decoded_audio, _ = self.model.tts_model.audio_codec.decode(
-                new_codes_tensor, new_code_len, cache=state.tts_codec_cache,
+                new_codes_tensor,
+                new_code_len,
+                cache=state.tts_codec_cache,
             )
 
         state.timing.stop("audio_codec")
@@ -828,9 +863,14 @@ class NemotronVoicechatInferenceWrapper:
         result = []
         for tok_ids_b in token_ids:
             toks = self.tokenizer.ids_to_tokens(tok_ids_b.tolist())
-            result.append(_decode_tokens_with_specials(
-                toks, self.tokenizer, pad_token_str=pad_token_str, keep_pad=False,
-            ))
+            result.append(
+                _decode_tokens_with_specials(
+                    toks,
+                    self.tokenizer,
+                    pad_token_str=pad_token_str,
+                    keep_pad=False,
+                )
+            )
         return result
 
     @property
@@ -838,4 +878,3 @@ class NemotronVoicechatInferenceWrapper:
         """Token strings that should be stripped from decoded text for clean output."""
         stt = self.model.stt_model
         return get_special_token_strings(stt.tokenizer, stt.text_pad_id, model_cfg=stt.cfg)
-

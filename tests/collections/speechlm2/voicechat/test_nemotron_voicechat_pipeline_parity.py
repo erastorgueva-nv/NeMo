@@ -46,8 +46,6 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from nemo.utils import logging
-
 from nemo.collections.speechlm2.inference.factory.s2s_pipeline_builder import S2SPipelineBuilder
 from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_inference_wrapper import (
     FRAME_SIZE_SAMPLES,
@@ -55,6 +53,7 @@ from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_infe
 )
 from nemo.collections.speechlm2.inference.pipelines.streaming_s2s_pipeline import StreamingS2SPipeline
 from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
+from nemo.utils import logging
 
 _CONF_YAML = os.path.abspath(
     os.path.join(

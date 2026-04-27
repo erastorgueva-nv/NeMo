@@ -24,12 +24,8 @@ from nemo.collections.common.data.lhotse.text_adapters import Formattable
 from nemo.collections.common.tokenizers import TokenizerSpec
 from nemo.collections.speechlm2.data.force_align import ForceAligner
 from nemo.collections.speechlm2.data.utils import get_pad_id
-from nemo.collections.speechlm2.parts.text_utils import (
-    SECONDS_PER_FRAME,
-    TRAINING_TIMESTAMP_RE,
-    strip_timestamps,
-)
 from nemo.collections.speechlm2.parts.augmentation import AudioAugmenter
+from nemo.collections.speechlm2.parts.text_utils import SECONDS_PER_FRAME, TRAINING_TIMESTAMP_RE, strip_timestamps
 from nemo.utils import logging
 
 MCQ_VAL_PROMPT = "Answer the following multiple choice question with an explanation for the answer."

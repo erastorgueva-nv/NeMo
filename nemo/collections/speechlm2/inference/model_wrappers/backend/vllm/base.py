@@ -21,13 +21,14 @@ token prediction) and the TTS backend (``VLLMEarTTS`` -- EarTTS audio
 codec generation).
 """
 
+import os
 from abc import abstractmethod
 from typing import Any
-import os
+
 import torch
 
-from nemo.utils import logging
 from nemo.collections.speechlm2.inference.model_wrappers.backend.interface import ModelInterface
+from nemo.utils import logging
 
 
 class VLLMModelBase(ModelInterface):
@@ -69,7 +70,7 @@ class VLLMModelBase(ModelInterface):
         repetition_penalty: float = 1.0,
         temperature: float = 1.0,
         model_type: str = "llm",
-        **sampling_kwargs
+        **sampling_kwargs,
     ):
         """
         Initialize vLLM model with engine creation, event loop setup, and warm-up.
@@ -106,6 +107,7 @@ class VLLMModelBase(ModelInterface):
         )
 
         import asyncio
+
         from nemo.collections.speechlm2.inference.vllm.streaming_llm_engine import create_engine
 
         self.model_path = model_path
@@ -133,7 +135,7 @@ class VLLMModelBase(ModelInterface):
             gpu_memory_utilization=gpu_memory_utilization,
             trust_remote_code=trust_remote_code,
             dtype=dtype,
-            **sampling_kwargs
+            **sampling_kwargs,
         )
         self._request_counter = 0
 
@@ -167,10 +169,7 @@ class VLLMModelBase(ModelInterface):
         return f"vllm_request_{self._request_counter}"
 
     async def _async_inference(
-        self,
-        inputs: torch.Tensor | list[torch.Tensor] | dict,
-        request_id: str,
-        **kwargs
+        self, inputs: torch.Tensor | list[torch.Tensor] | dict, request_id: str, **kwargs
     ) -> dict[str, Any]:
         """
         Async inference using the streaming engine.
@@ -244,9 +243,7 @@ class VLLMModelBase(ModelInterface):
         Returns:
             bool: True if abort was successful
         """
-        return self._loop.run_until_complete(
-            self.engine.abort_generation(request_id)
-        )
+        return self._loop.run_until_complete(self.engine.abort_generation(request_id))
 
     def restart_request(self, request_id: str) -> bool:
         """
@@ -261,9 +258,7 @@ class VLLMModelBase(ModelInterface):
         if request_id in self.engine.requests:
             self.abort_request(request_id)
 
-        return self._loop.run_until_complete(
-            self.engine.start_generation(request_id=request_id)
-        )
+        return self._loop.run_until_complete(self.engine.start_generation(request_id=request_id))
 
     def get_request_status(self, request_id: str | None = None) -> dict[str, Any]:
         """

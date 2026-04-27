@@ -935,8 +935,6 @@ def build_token_channel(
     return tokens
 
 
-
-
 def sample_audio_segments_repeat(
     prompt_audio: torch.Tensor,
     prompt_audio_lens: torch.Tensor,

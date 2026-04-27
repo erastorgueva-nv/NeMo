@@ -14,10 +14,7 @@
 
 import torch
 
-from nemo.collections.speechlm2.inference.model_wrappers.decode_state import (
-    InferenceStepResult,
-    StreamingDecodeState,
-)
+from nemo.collections.speechlm2.inference.model_wrappers.decode_state import InferenceStepResult, StreamingDecodeState
 
 
 class S2SContextManager:

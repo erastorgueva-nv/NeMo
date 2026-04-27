@@ -32,7 +32,7 @@ pipeline import from here.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -163,7 +163,9 @@ class IntermediateResultLogger:
     def log_selected_frame_index(self, idx: int):
         self.selected_frame_indices.append(idx)
 
-    def build_debug_dict(self, source_encoded: torch.Tensor, gen_text: torch.Tensor, gen_asr_text: torch.Tensor | None) -> dict:
+    def build_debug_dict(
+        self, source_encoded: torch.Tensor, gen_text: torch.Tensor, gen_asr_text: torch.Tensor | None
+    ) -> dict:
         return {
             "source_encoded": source_encoded.detach().cpu(),
             "selected_frame_indices": self.selected_frame_indices,

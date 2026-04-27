@@ -108,7 +108,7 @@ def calculate_durations_incl_padding(
         if pad_audio_to_sec is not None:
             dur = max(dur, pad_audio_to_sec)
         elif pad_silence_ratio is not None:
-            dur *= (1 + pad_silence_ratio)
+            dur *= 1 + pad_silence_ratio
         elif pad_audio_by_sec is not None:
             dur += pad_audio_by_sec
         durations.append(dur)

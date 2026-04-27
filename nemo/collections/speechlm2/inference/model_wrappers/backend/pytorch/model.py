@@ -23,11 +23,12 @@ Used as ``model_llm_interface`` in the inference wrapper when
 """
 
 from typing import Any
+
 import torch
 
-from nemo.utils import logging
 from nemo.collections.speechlm2.inference.model_wrappers.backend.interface import ModelInterface
 from nemo.collections.speechlm2.parts.text_utils import get_special_token_ids
+from nemo.utils import logging
 
 
 class PyTorchLLM(ModelInterface):
@@ -84,6 +85,7 @@ class PyTorchLLM(ModelInterface):
         sampling_active = top_p < 1.0 or repetition_penalty != 1.0 or (temperature != 1.0 and temperature != 0.0)
         if sampling_active and not self.special_token_ids:
             import warnings
+
             warnings.warn(
                 "Sampling is enabled but special_token_ids is empty. "
                 "Could not auto-extract from model.tokenizer. "
@@ -104,6 +106,7 @@ class PyTorchLLM(ModelInterface):
         if "Nemotron" in pretrained_llm:
             return self.model.stt_model._create_nemotron_cache(batch_size=1)
         from transformers import DynamicCache
+
         return DynamicCache()
 
     def __call__(
@@ -116,7 +119,7 @@ class PyTorchLLM(ModelInterface):
         current_step: int = 0,
         return_logits: bool = False,
         sampling_params: dict[str, float] | None = None,
-        **kwargs
+        **kwargs,
     ) -> dict[str, Any]:
         """
         Perform inference using the native model.

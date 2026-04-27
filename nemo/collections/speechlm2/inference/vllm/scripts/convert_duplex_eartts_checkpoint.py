@@ -91,28 +91,24 @@ def convert_to_vllm_format(outdir: str, config: str, model_path: str) -> None:
     # Load the HuggingFace-format NemotronVoiceChat safetensors checkpoint.
     weights = load_file(model_path)
     # select tts model weights, strip off one nested layer
-    weights = {k[len("tts_model."):]: v for k, v in weights.items() if "tts_model." in k}
+    weights = {k[len("tts_model.") :]: v for k, v in weights.items() if "tts_model." in k}
 
     # duplicate weights for rvq embeddings and embed code
     rvq_embs_weight = weights["tts_model.rvq_embs"].clone()  # 31 x codebook_size x latent_size
-    rvq_embs_weight_pad = torch.nn.functional.pad(rvq_embs_weight, [0, 0, 0, 1])  # 31 x (codebook_size + 1) x latent_size
+    rvq_embs_weight_pad = torch.nn.functional.pad(
+        rvq_embs_weight, [0, 0, 0, 1]
+    )  # 31 x (codebook_size + 1) x latent_size
     embed_code_weight = weights["tts_model.embed_code.weight"].clone()  # latent_size x hidden_size
 
     # ======================
     # embedding module weights
     bos_emb = weights["tts_model.bos_emb"]
     null_emb = weights["tts_model.null_emb"]
-    embed_subwords_weight = torch.zeros(
-        (vocab_size, max_char_len), dtype=bos_emb.dtype, device=bos_emb.device
-    )
-    embed_subwords_mask_weight = torch.zeros(
-        (vocab_size, max_char_len), dtype=bos_emb.dtype, device=bos_emb.device
-    )
+    embed_subwords_weight = torch.zeros((vocab_size, max_char_len), dtype=bos_emb.dtype, device=bos_emb.device)
+    embed_subwords_mask_weight = torch.zeros((vocab_size, max_char_len), dtype=bos_emb.dtype, device=bos_emb.device)
     for subword_id_str, char_ids_lst in subword_id_to_char_ids.items():
         subword_id = int(subword_id_str)
-        char_ids = torch.tensor(
-            char_ids_lst, dtype=bos_emb.dtype, device=bos_emb.device
-        )
+        char_ids = torch.tensor(char_ids_lst, dtype=bos_emb.dtype, device=bos_emb.device)
         embed_subwords_weight[subword_id, : len(char_ids)] = char_ids
         embed_subwords_mask_weight[subword_id, : len(char_ids)] = 1
 
@@ -127,7 +123,7 @@ def convert_to_vllm_format(outdir: str, config: str, model_path: str) -> None:
             key = key[len("tts_model.") :]
             # bos_eos_emb and subword_flag_emb are moved outside embed_subword
             if key.startswith("embed_subword.bos_eos_emb.") or key.startswith("embed_subword.subword_flag_emb."):
-                key = key[len("embed_subword."):]
+                key = key[len("embed_subword.") :]
             embedding_module_weights[key] = weight
     for key, weight in weights.items():
         if "tts_model.gated_fusion_audio_text" in key:
@@ -135,28 +131,30 @@ def convert_to_vllm_format(outdir: str, config: str, model_path: str) -> None:
             embedding_module_weights[key] = weight
     if "tts_model.audio_prompt_projection_W" in weights:
         embedding_module_weights["audio_prompt_projection_W"] = weights["tts_model.audio_prompt_projection_W"]
-    embedding_module_weights["embed_subword.embed_subwords.weight"] = (
-        embed_subwords_weight
-    )
-    embedding_module_weights["embed_subword.embed_subwords_mask.weight"] = (
-        embed_subwords_mask_weight
-    )
+    embedding_module_weights["embed_subword.embed_subwords.weight"] = embed_subwords_weight
+    embedding_module_weights["embed_subword.embed_subwords_mask.weight"] = embed_subwords_mask_weight
     for i in range(rvq_embs_weight_pad.shape[0]):
         embedding_module_weights[f"rvq_embs.{i}.weight"] = rvq_embs_weight_pad[i]
     embedding_module_weights["embed_code.weight"] = embed_code_weight
-    embedding_module_weights = {
-        f"total_emb.{k}": v for k, v in embedding_module_weights.items()
-    }
+    embedding_module_weights = {f"total_emb.{k}": v for k, v in embedding_module_weights.items()}
 
     # ======================
     # gemma backbone weights
-    backbone_module_weights = {k[len("tts_model."):]: v for k, v in weights.items() if k.startswith("tts_model.backbone.")}
-    backbone_module_weights["backbone.embed_tokens.weight"] = torch.randn(1, hidden_size, dtype=bos_emb.dtype, device=bos_emb.device)
+    backbone_module_weights = {
+        k[len("tts_model.") :]: v for k, v in weights.items() if k.startswith("tts_model.backbone.")
+    }
+    backbone_module_weights["backbone.embed_tokens.weight"] = torch.randn(
+        1, hidden_size, dtype=bos_emb.dtype, device=bos_emb.device
+    )
 
     # ======================
     # sampler weights
     used_keys = ["rvq_embs", "embed_code", "mog_head"]
-    sampler_weights = {k[len("tts_model."):]: v for k, v in weights.items() if any(k.startswith(f"tts_model.{key}") for key in used_keys)}
+    sampler_weights = {
+        k[len("tts_model.") :]: v
+        for k, v in weights.items()
+        if any(k.startswith(f"tts_model.{key}") for key in used_keys)
+    }
     sampler_weights = {"sampler." + k: v for k, v in sampler_weights.items()}
 
     # combine embedding module and backbone module weights
@@ -169,9 +167,7 @@ def convert_to_vllm_format(outdir: str, config: str, model_path: str) -> None:
     logging.info("Saved weights for vllm model")
     weight_map = {name: "model.safetensors" for name in weights.keys()}
     index = {
-        "metadata": {
-            "total_size": sum(w.numel() * w.element_size() for w in weights.values())
-        },
+        "metadata": {"total_size": sum(w.numel() * w.element_size() for w in weights.values())},
         "weight_map": weight_map,
     }
     index_path = os.path.join(outdir, "model.safetensors.index.json")
@@ -186,9 +182,11 @@ def convert_to_vllm_format(outdir: str, config: str, model_path: str) -> None:
 
     # Parse backbone config exactly as NeMo does to get all defaults from transformers
     backbone_type = cfg.model.tts_config.get("backbone_type", None)
-    backbone_config_dict = OmegaConf.to_container(
-        cfg.model.tts_config.backbone_config, resolve=True
-    ) if cfg.model.tts_config.get("backbone_config") else {}
+    backbone_config_dict = (
+        OmegaConf.to_container(cfg.model.tts_config.backbone_config, resolve=True)
+        if cfg.model.tts_config.get("backbone_config")
+        else {}
+    )
 
     # Create AutoConfig the same way NeMo does - this fills in all defaults
     parsed_backbone_config = AutoConfig.for_model(backbone_type, **backbone_config_dict)
@@ -282,8 +280,7 @@ def convert_to_vllm_format(outdir: str, config: str, model_path: str) -> None:
             found_latents = True
     if not found_latents:
         logging.warning(
-            "No audio_prompt_latents found in checkpoint. "
-            "speaker_name will not work unless latents are added."
+            "No audio_prompt_latents found in checkpoint. " "speaker_name will not work unless latents are added."
         )
 
 

@@ -21,8 +21,6 @@ import numpy as np
 import torch
 from lhotse import CutSet
 
-from nemo.collections.speechlm2.parts.text_utils import strip_timestamps
-
 # Use NeMo's force alignment utilities instead of torchaudio
 from nemo.collections.asr.models.asr_model import ASRModel
 from nemo.collections.asr.parts.utils.aligner_utils import (
@@ -30,6 +28,7 @@ from nemo.collections.asr.parts.utils.aligner_utils import (
     get_batch_variables,
     viterbi_decoding,
 )
+from nemo.collections.speechlm2.parts.text_utils import strip_timestamps
 
 
 class ForceAligner:
@@ -328,4 +327,3 @@ class ForceAligner:
             timestamped_words.append(f"<|{start_frame}|> {word} <|{end_frame}|>")
 
         return " ".join(timestamped_words)
-

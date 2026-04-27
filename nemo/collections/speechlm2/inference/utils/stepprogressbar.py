@@ -62,11 +62,12 @@ class StepProgressBar:
         pad_audio_by_sec: float | None = None,
     ) -> StepProgressBar:
         durations = calculate_durations_incl_padding(
-            audio_filepaths, pad_audio_to_sec, pad_silence_ratio, pad_audio_by_sec,
+            audio_filepaths,
+            pad_audio_to_sec,
+            pad_silence_ratio,
+            pad_audio_by_sec,
         )
-        steps_per_stream = {
-            idx: math.ceil(dur / chunk_size_in_secs) for idx, dur in enumerate(durations)
-        }
+        steps_per_stream = {idx: math.ceil(dur / chunk_size_in_secs) for idx, dur in enumerate(durations)}
         return cls(
             total_steps=sum(steps_per_stream.values()),
             steps_per_stream=steps_per_stream,

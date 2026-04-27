@@ -24,10 +24,11 @@ Used as ``model_llm_interface`` in the inference wrapper.
 """
 
 from typing import Any
+
 import torch
 
-from nemo.utils import logging
 from nemo.collections.speechlm2.inference.model_wrappers.backend.vllm.base import VLLMModelBase
+from nemo.utils import logging
 
 
 class VLLMLLM(VLLMModelBase):
@@ -49,15 +50,12 @@ class VLLMLLM(VLLMModelBase):
             checkpoint_path=self.model_path,
             output_dir=save_path,
             pretrained_llm=self.pretrained_llm,
-            dtype=self._dtype
+            dtype=self._dtype,
         )
         logging.info(f"Converted model saved to {save_path}")
 
     def __call__(
-        self,
-        input_embeds: torch.Tensor,
-        request_id: str | None = "request_id_1",
-        **kwargs
+        self, input_embeds: torch.Tensor, request_id: str | None = "request_id_1", **kwargs
     ) -> dict[str, Any]:
         """
         Perform inference using vLLM streaming engine.
@@ -71,9 +69,7 @@ class VLLMLLM(VLLMModelBase):
             Dictionary containing predicted_token, asr_predicted_token, cache,
             is_finished, and request_id.
         """
-        result = self._loop.run_until_complete(
-            self._async_inference(input_embeds, request_id, **kwargs)
-        )
+        result = self._loop.run_until_complete(self._async_inference(input_embeds, request_id, **kwargs))
         return result
 
     async def _process_inputs_to_outputs(
@@ -102,16 +98,14 @@ class VLLMLLM(VLLMModelBase):
 
         if decode_steps == 0:
             input_embeds = input_embeds.flatten(0, 1)  # [seq_len, hidden_dim]
-            result = await self.engine.generate_next_token([input_embeds],
-                                                            prompt_token_ids,
-                                                            request_id=request_id)
+            result = await self.engine.generate_next_token([input_embeds], prompt_token_ids, request_id=request_id)
             return True if result is not None else False
 
         text_token_ids = []
         asr_token_ids = []
         result = None
         for i in range(decode_steps):
-            single_embed = input_embeds[:, i:i+1, :].squeeze(1)  # [batch, hidden_dim]
+            single_embed = input_embeds[:, i : i + 1, :].squeeze(1)  # [batch, hidden_dim]
 
             result = await self.engine.generate_next_token([single_embed], request_id=request_id)
             if result is None:
@@ -148,7 +142,7 @@ class VLLMLLM(VLLMModelBase):
             "asr_predicted_token": asr_token_ids[-1],
             "cache": None,  # vLLM manages cache internally
             "is_finished": is_finished,
-            "request_id": request_id
+            "request_id": request_id,
         }
         return ans
 
@@ -162,6 +156,4 @@ class VLLMLLM(VLLMModelBase):
         Returns:
             True if prefill succeeded.
         """
-        return self._loop.run_until_complete(
-            self._async_inference(embeddings, request_id, decode_steps=0)
-        )
+        return self._loop.run_until_complete(self._async_inference(embeddings, request_id, decode_steps=0))

@@ -34,8 +34,8 @@ class S2SRequestOptions:
 
     system_prompt: str | None = None
 
-    top_p: float | None = None          # (0, 1]
-    temperature: float | None = None    # >= 0
+    top_p: float | None = None  # (0, 1]
+    temperature: float | None = None  # >= 0
     repetition_penalty: float | None = None  # > 0
 
     def __post_init__(self) -> None:

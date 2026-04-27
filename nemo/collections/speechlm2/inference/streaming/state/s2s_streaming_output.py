@@ -107,6 +107,7 @@ class S2SStreamingOutput:
             return torch.cat(self._audio_chunks, dim=-1)
         if self.audio_filepath is not None:
             import soundfile as sf
+
             audio_np, _ = sf.read(self.audio_filepath, dtype="float32")
             return torch.tensor(audio_np, dtype=torch.float32).unsqueeze(0)
         return torch.empty((1, 0), device=self.device, dtype=self.dtype)

@@ -129,7 +129,11 @@ class DuplexSTTStreamingInference:
         has_prompt = prompt_token_lens is not None and prompt_token_lens.max().item() > 0
         input_embeds = source_encoded.clone()
         input_embeds[:, 0:1] = self.model.build_input_embedding(
-            source_encoded[:, 0:1], 0, gen_text, gen_asr, has_prompt=has_prompt,
+            source_encoded[:, 0:1],
+            0,
+            gen_text,
+            gen_asr,
+            has_prompt=has_prompt,
         )
 
         start_gen_pos = 0
@@ -306,14 +310,13 @@ class DuplexSTTStreamingInference:
                 if not (agent_text_window == self.model.text_eos_id).any():
                     gen_text[batch_idx, t] = self.model.text_eos_id
                     logging.debug(
-                        f"Forced turn-taking at frame {t}, batch {batch_idx}: "
-                        "inserted agent EOS (reason: user BOS)"
+                        f"Forced turn-taking at frame {t}, batch {batch_idx}: " "inserted agent EOS (reason: user BOS)"
                     )
 
     def _step_inference(self, t, inference_state, ans):
         """Perform inference for one step t in the autoregressive loop."""
-        inference_state["input_embeds"][:, t:t+1] = self.model.build_input_embedding(
-            inference_state["source_encoded"][:, t:t+1],
+        inference_state["input_embeds"][:, t : t + 1] = self.model.build_input_embedding(
+            inference_state["source_encoded"][:, t : t + 1],
             t,
             inference_state["gen_text"],
             inference_state["gen_asr"],

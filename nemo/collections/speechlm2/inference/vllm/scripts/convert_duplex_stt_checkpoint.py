@@ -65,10 +65,7 @@ def load_checkpoint(checkpoint_path: str) -> dict[str, torch.Tensor]:
             return ckpt
 
 
-def filter_tensors(
-    state_dict: dict[str, torch.Tensor],
-    prefixes_to_keep: list[str]
-) -> dict[str, torch.Tensor]:
+def filter_tensors(state_dict: dict[str, torch.Tensor], prefixes_to_keep: list[str]) -> dict[str, torch.Tensor]:
     """
     Filter tensors to keep only those with specified prefixes.
 
@@ -135,14 +132,10 @@ def convert_to_vllm_format(
             logging.info(f"Found pretrained_llm in config: {pretrained_llm}")
         except KeyError:
             if pretrained_llm is None:
-                raise ValueError(
-                    "Could not find pretrained_llm in config and none provided via argument"
-                )
+                raise ValueError("Could not find pretrained_llm in config and none provided via argument")
     else:
         if pretrained_llm is None:
-            raise ValueError(
-                f"Config file not found at {config_path} and pretrained_llm not provided"
-            )
+            raise ValueError(f"Config file not found at {config_path} and pretrained_llm not provided")
 
     # Create output directory
     output_path = Path(output_dir)
@@ -154,17 +147,10 @@ def convert_to_vllm_format(
 
     # Modify config for custom inputs/outputs
     custom_config = {
-        "custom_input_specs": [
-            {
-              "name": "combined_embeds",
-              "dtype": dtype,
-              "dim": base_config.hidden_size
-            }
-        ],
-        "custom_outputs": ["text_logits", "asr_tokens", "asr_logits"]
+        "custom_input_specs": [{"name": "combined_embeds", "dtype": dtype, "dim": base_config.hidden_size}],
+        "custom_outputs": ["text_logits", "asr_tokens", "asr_logits"],
     }
     base_config.update(custom_config)
-
 
     # Load tokenizer from pretrained model
     logging.info(f"Loading tokenizer from {pretrained_llm}")
@@ -202,9 +188,7 @@ def convert_to_vllm_format(
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Convert NeMo STT checkpoint to HuggingFace format for vLLM"
-    )
+    parser = argparse.ArgumentParser(description="Convert NeMo STT checkpoint to HuggingFace format for vLLM")
     parser.add_argument(
         "--checkpoint",
         type=str,

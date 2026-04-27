@@ -14,19 +14,18 @@
 
 from omegaconf.dictconfig import DictConfig
 
-from nemo.utils import logging as logger
+from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_inference_wrapper import (
+    NemotronVoicechatInferenceWrapper,
+)
 from nemo.collections.speechlm2.inference.pipelines.streaming_s2s_pipeline import StreamingS2SPipeline
-from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_inference_wrapper import NemotronVoicechatInferenceWrapper
+from nemo.utils import logging as logger
 
 
 class S2SPipelineBuilder:
     """Factory that builds a streaming S2S pipeline."""
 
     @classmethod
-    def build_pipeline(
-            cls,
-            cfg: DictConfig
-    ) -> StreamingS2SPipeline:
+    def build_pipeline(cls, cfg: DictConfig) -> StreamingS2SPipeline:
         """
         Build the streaming S2S pipeline based on the config.
         Args:
@@ -44,4 +43,3 @@ class S2SPipelineBuilder:
         )
         logger.info(f"`{type(pipeline).__name__}` pipeline loaded")
         return pipeline
-

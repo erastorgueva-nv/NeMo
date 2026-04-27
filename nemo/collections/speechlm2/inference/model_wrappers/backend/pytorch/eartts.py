@@ -23,17 +23,19 @@ Used as ``model_eartts_interface`` in the inference wrapper when
 ``engine_type="native_eartts"``.
 """
 
-from typing import Any
 from dataclasses import dataclass, fields
+from typing import Any
+
 import torch
 
-from nemo.utils import logging
 from nemo.collections.speechlm2.inference.model_wrappers.backend.interface import ModelInterface
+from nemo.utils import logging
 
 
 @dataclass
 class TTSGenerationResult:
     """Result from a single TTS generation step (shared by PyTorch and vLLM backends)."""
+
     codes: torch.Tensor  # Generated acoustic tokens
     past_key_values: Any  # Updated cache (if applicable)
 
@@ -108,6 +110,7 @@ class PyTorchEarTTS(ModelInterface):
             Tuple of (subword_mask, codec_cache).
         """
         from nemo.collections.speechlm2.modules.ear_tts_vae_codec import CausalConv1dCache
+
         codec_cache = CausalConv1dCache()
         subword_mask = torch.ones((1, max_len), device=device, dtype=torch.bool)
         return subword_mask, codec_cache

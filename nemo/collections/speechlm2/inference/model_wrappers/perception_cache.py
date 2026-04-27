@@ -36,6 +36,7 @@ class PerceptionCacheState:
     Holds the cache tensors for the ASR encoder used in the perception module.
     This enables cache-aware streaming inference without needing the full audio buffer.
     """
+
     cache_last_channel: torch.Tensor | None = None
     cache_last_time: torch.Tensor | None = None
     cache_last_channel_len: torch.Tensor | None = None
@@ -52,6 +53,7 @@ class PerceptionCUDAGraphState:
     Holds separate graphs for first chunk (different size) and subsequent chunks.
     Also holds static buffers for inputs/outputs to enable graph replay.
     """
+
     # CUDA graphs
     graph_first: torch.cuda.CUDAGraph | None = None
     graph_subsequent: torch.cuda.CUDAGraph | None = None
@@ -145,8 +147,10 @@ class PerceptionCacheManager:
             self.sampling_frames = None
 
         logging.info(f"Perception cache setup complete:")
-        logging.info(f"   Streaming config: chunk_size={self.streaming_cfg.chunk_size}, "
-                     f"shift_size={self.streaming_cfg.shift_size}")
+        logging.info(
+            f"   Streaming config: chunk_size={self.streaming_cfg.chunk_size}, "
+            f"shift_size={self.streaming_cfg.shift_size}"
+        )
         logging.info(f"   Pre-encode cache size: {self.streaming_cfg.pre_encode_cache_size}")
         logging.info(f"   Subsampling factor: {self.subsampling_factor}")
 
@@ -187,19 +191,15 @@ class PerceptionCacheManager:
 
         logging.info(f"   CUDA graph mel lengths: first={mel_len_first}, subsequent={mel_len_subsequent}")
 
-        cache_last_channel, cache_last_time, cache_last_channel_len = encoder.get_initial_cache_state(
-            batch_size=1
-        )
+        cache_last_channel, cache_last_time, cache_last_channel_len = encoder.get_initial_cache_state(batch_size=1)
 
         state = PerceptionCUDAGraphState()
 
         state.static_mel_first = torch.zeros(
-            (1, self.input_features, mel_len_first),
-            dtype=torch.float32, device=self.device
+            (1, self.input_features, mel_len_first), dtype=torch.float32, device=self.device
         )
         state.static_mel_subsequent = torch.zeros(
-            (1, self.input_features, mel_len_subsequent),
-            dtype=torch.float32, device=self.device
+            (1, self.input_features, mel_len_subsequent), dtype=torch.float32, device=self.device
         )
         state.static_mel_len_first = torch.tensor([mel_len_first], dtype=torch.long, device=self.device)
         state.static_mel_len_subsequent = torch.tensor([mel_len_subsequent], dtype=torch.long, device=self.device)
@@ -222,18 +222,34 @@ class PerceptionCacheManager:
                 _ = encoder.cache_aware_stream_step(
                     processed_signal=state.static_mel_first,
                     processed_signal_length=state.static_mel_len_first,
-                    cache_last_channel=state.static_cache_channel_in.clone() if state.static_cache_channel_in is not None else None,
-                    cache_last_time=state.static_cache_time_in.clone() if state.static_cache_time_in is not None else None,
-                    cache_last_channel_len=state.static_cache_channel_len_in.clone() if state.static_cache_channel_len_in is not None else None,
+                    cache_last_channel=(
+                        state.static_cache_channel_in.clone() if state.static_cache_channel_in is not None else None
+                    ),
+                    cache_last_time=(
+                        state.static_cache_time_in.clone() if state.static_cache_time_in is not None else None
+                    ),
+                    cache_last_channel_len=(
+                        state.static_cache_channel_len_in.clone()
+                        if state.static_cache_channel_len_in is not None
+                        else None
+                    ),
                     keep_all_outputs=True,
                     drop_extra_pre_encoded=0,
                 )
                 _ = encoder.cache_aware_stream_step(
                     processed_signal=state.static_mel_subsequent,
                     processed_signal_length=state.static_mel_len_subsequent,
-                    cache_last_channel=state.static_cache_channel_in.clone() if state.static_cache_channel_in is not None else None,
-                    cache_last_time=state.static_cache_time_in.clone() if state.static_cache_time_in is not None else None,
-                    cache_last_channel_len=state.static_cache_channel_len_in.clone() if state.static_cache_channel_len_in is not None else None,
+                    cache_last_channel=(
+                        state.static_cache_channel_in.clone() if state.static_cache_channel_in is not None else None
+                    ),
+                    cache_last_time=(
+                        state.static_cache_time_in.clone() if state.static_cache_time_in is not None else None
+                    ),
+                    cache_last_channel_len=(
+                        state.static_cache_channel_len_in.clone()
+                        if state.static_cache_channel_len_in is not None
+                        else None
+                    ),
                     keep_all_outputs=True,
                     drop_extra_pre_encoded=streaming_cfg.drop_extra_pre_encoded,
                 )
@@ -266,7 +282,9 @@ class PerceptionCacheManager:
                 keep_all_outputs=True,
                 drop_extra_pre_encoded=0,
             )
-            encoded_adapted_first, _ = perception.modality_adapter(audio_signal=encoded_first, length=encoded_len_first)
+            encoded_adapted_first, _ = perception.modality_adapter(
+                audio_signal=encoded_first, length=encoded_len_first
+            )
             encoded_chunk_first = perception.proj(encoded_adapted_first.transpose(1, 2))
 
         state.static_encoded_first = encoded_chunk_first
@@ -302,7 +320,9 @@ class PerceptionCacheManager:
                 keep_all_outputs=True,
                 drop_extra_pre_encoded=streaming_cfg.drop_extra_pre_encoded,
             )
-            encoded_adapted_subsequent, _ = perception.modality_adapter(audio_signal=encoded_subsequent, length=encoded_len_subsequent)
+            encoded_adapted_subsequent, _ = perception.modality_adapter(
+                audio_signal=encoded_subsequent, length=encoded_len_subsequent
+            )
             encoded_chunk_subsequent = perception.proj(encoded_adapted_subsequent.transpose(1, 2))
 
         state.static_encoded_subsequent = encoded_chunk_subsequent
@@ -413,7 +433,7 @@ class PerceptionCacheManager:
 
         for sub_step in range(num_sub_steps):
             sub_frame_idx = frame_idx + (sub_step * base_step_size)
-            is_first_sub_step = (sub_frame_idx == 0)
+            is_first_sub_step = sub_frame_idx == 0
 
             if is_first_sub_step:
                 cur_chunk_size = chunk_size_first
@@ -481,15 +501,39 @@ class PerceptionCacheManager:
                 if is_first_sub_step:
                     graph_state.graph_first.replay()
                     encoded_chunk = graph_state.static_encoded_first.clone()
-                    cache_last_channel = graph_state.static_cache_channel_out_first.clone() if graph_state.static_cache_channel_out_first is not None else None
-                    cache_last_time = graph_state.static_cache_time_out_first.clone() if graph_state.static_cache_time_out_first is not None else None
-                    cache_last_channel_len = graph_state.static_cache_channel_len_out_first.clone() if graph_state.static_cache_channel_len_out_first is not None else None
+                    cache_last_channel = (
+                        graph_state.static_cache_channel_out_first.clone()
+                        if graph_state.static_cache_channel_out_first is not None
+                        else None
+                    )
+                    cache_last_time = (
+                        graph_state.static_cache_time_out_first.clone()
+                        if graph_state.static_cache_time_out_first is not None
+                        else None
+                    )
+                    cache_last_channel_len = (
+                        graph_state.static_cache_channel_len_out_first.clone()
+                        if graph_state.static_cache_channel_len_out_first is not None
+                        else None
+                    )
                 else:
                     graph_state.graph_subsequent.replay()
                     encoded_chunk = graph_state.static_encoded_subsequent.clone()
-                    cache_last_channel = graph_state.static_cache_channel_out_subsequent.clone() if graph_state.static_cache_channel_out_subsequent is not None else None
-                    cache_last_time = graph_state.static_cache_time_out_subsequent.clone() if graph_state.static_cache_time_out_subsequent is not None else None
-                    cache_last_channel_len = graph_state.static_cache_channel_len_out_subsequent.clone() if graph_state.static_cache_channel_len_out_subsequent is not None else None
+                    cache_last_channel = (
+                        graph_state.static_cache_channel_out_subsequent.clone()
+                        if graph_state.static_cache_channel_out_subsequent is not None
+                        else None
+                    )
+                    cache_last_time = (
+                        graph_state.static_cache_time_out_subsequent.clone()
+                        if graph_state.static_cache_time_out_subsequent is not None
+                        else None
+                    )
+                    cache_last_channel_len = (
+                        graph_state.static_cache_channel_len_out_subsequent.clone()
+                        if graph_state.static_cache_channel_len_out_subsequent is not None
+                        else None
+                    )
 
             else:
                 (

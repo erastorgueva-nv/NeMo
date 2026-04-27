@@ -187,5 +187,3 @@ def build_token_channel(
                 tokens[eospos] = tokenizer.eos
 
     return tokens
-
-

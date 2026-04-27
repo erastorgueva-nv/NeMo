@@ -44,8 +44,8 @@ SECONDS_PER_FRAME = 0.08
 TRAINING_TIMESTAMP_RE = re.compile(r"<\|(\d+)\|>")
 
 # Inference-output format: float seconds marking turn boundaries
-TIMESTAMP_BOS_RE = re.compile(r"<\|[\d.]+\|>")   # turn start
-TIMESTAMP_EOS_RE = re.compile(r"<\$[\d.]+\$>")   # turn end
+TIMESTAMP_BOS_RE = re.compile(r"<\|[\d.]+\|>")  # turn start
+TIMESTAMP_EOS_RE = re.compile(r"<\$[\d.]+\$>")  # turn end
 
 _MULTI_SPACE_RE = re.compile(r"\s+")
 
@@ -324,7 +324,5 @@ def tokens_to_str(
         else:
             hyp_ids = hyp_ids[:hyp_len]
             toks = tokenizer.ids_to_tokens(hyp_ids.tolist())
-            ans.append(
-                _decode_tokens_with_specials(toks, tokenizer, pad_token_str=pad_token_str, keep_pad=keep_pad)
-            )
+            ans.append(_decode_tokens_with_specials(toks, tokenizer, pad_token_str=pad_token_str, keep_pad=keep_pad))
     return ans

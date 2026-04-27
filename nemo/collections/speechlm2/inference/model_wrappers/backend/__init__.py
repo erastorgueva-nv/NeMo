@@ -13,11 +13,14 @@
 # limitations under the License.
 
 from nemo.collections.speechlm2.inference.model_wrappers.backend.interface import ModelInterface
+from nemo.collections.speechlm2.inference.model_wrappers.backend.pytorch.eartts import (
+    PyTorchEarTTS,
+    TTSGenerationResult,
+)
 from nemo.collections.speechlm2.inference.model_wrappers.backend.pytorch.model import PyTorchLLM
-from nemo.collections.speechlm2.inference.model_wrappers.backend.pytorch.eartts import PyTorchEarTTS, TTSGenerationResult
 
 try:
-    from nemo.collections.speechlm2.inference.model_wrappers.backend.vllm.llm import VLLMLLM
     from nemo.collections.speechlm2.inference.model_wrappers.backend.vllm.eartts import VLLMEarTTS
+    from nemo.collections.speechlm2.inference.model_wrappers.backend.vllm.llm import VLLMLLM
 except ImportError:
     pass  # vLLM is an optional dependency

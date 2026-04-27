@@ -21,19 +21,20 @@ Wraps vLLM's ``AsyncLLM`` for streaming step-by-step inference with
 backend env); it does not imply an inheritance relationship between TTS and LLM.
 """
 
-import os
 import json
-import torch
-from typing import Any, AsyncGenerator, Literal
+import os
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any, AsyncGenerator, Literal
 
-from vllm.v1.engine.async_llm import AsyncLLM
+import torch
 from vllm import SamplingParams
-from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.attention.selector import _cached_get_attn_backend
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.v1.engine.async_llm import AsyncLLM
 
 from nemo.utils import logging
+
 
 class StreamStatus(Enum):
     IDLE = "idle"
@@ -54,6 +55,7 @@ class GenerationResult:
 @dataclass
 class RequestState:
     """State for a single generation request."""
+
     request_id: str
     status: StreamStatus
     generated_tokens: list
@@ -85,7 +87,7 @@ class CustomInputAsyncVLLMEngine:
         dtype: str = "bfloat16",
         skip_tokenizer_init: bool = False,
         engine_kind: Literal["llm", "eartts"] = "llm",
-        **sampling_kwargs
+        **sampling_kwargs,
     ):
         """
         Initialize the async vLLM engine wrapper.
@@ -129,7 +131,7 @@ class CustomInputAsyncVLLMEngine:
         # For EarTTS: acoustic tokens are produced by the model's own forward
         # pass (RVQ codebook prediction), not by vLLM's sampler.
         default_sampling = {
-            "max_tokens": 100000, # Set very high to prevent stopping - use abort to stop explicitly
+            "max_tokens": 100000,  # Set very high to prevent stopping - use abort to stop explicitly
             "skip_sampling": True,
             "ignore_eos": True,
         }
@@ -144,9 +146,7 @@ class CustomInputAsyncVLLMEngine:
                 f"guidance_scale={guidance_scale}, model={model_path})"
             )
         else:
-            logging.info(
-                f"CustomInputAsyncVLLMEngine initialized (engine_kind=llm, model={model_path})"
-            )
+            logging.info(f"CustomInputAsyncVLLMEngine initialized (engine_kind=llm, model={model_path})")
 
     def _read_guidance_scale_from_config(self) -> float:
         """Read guidance_scale from the converted vLLM model's config.json."""
@@ -158,9 +158,7 @@ class CustomInputAsyncVLLMEngine:
             if value is not None:
                 logging.info(f"Read guidance_scale={value} from {config_path}")
                 return float(value)
-        logging.warning(
-            f"guidance_scale not found in {config_path}, using default 0.5."
-        )
+        logging.warning(f"guidance_scale not found in {config_path}, using default 0.5.")
         return 0.5
 
     async def initialize(self):
@@ -192,7 +190,7 @@ class CustomInputAsyncVLLMEngine:
                 mamba_ssm_cache_dtype="float32",
                 dtype=self.dtype,
                 skip_tokenizer_init=self.skip_tokenizer_init,
-                enable_prefix_caching=False
+                enable_prefix_caching=False,
             )
 
             # Custom input/output specs are defined in the model's config file
@@ -222,10 +220,7 @@ class CustomInputAsyncVLLMEngine:
         safe_tokens = [bos_id] + list(range(50, 59))  # tokens 50-58 are usually safe
         return (safe_tokens * ((length // len(safe_tokens)) + 1))[:length]
 
-    async def start_generation(
-        self,
-        request_id: str = "speech_stream"
-    ) -> bool:
+    async def start_generation(self, request_id: str = "speech_stream") -> bool:
         """
         Start a new streaming generation session.
 
@@ -252,13 +247,16 @@ class CustomInputAsyncVLLMEngine:
             request_id=request_id,
             status=StreamStatus.ACTIVE,
             generated_tokens=[],
-            generation_iterator=None  # Will be created on first generate_next_token call
+            generation_iterator=None,  # Will be created on first generate_next_token call
         )
         return True
 
-    async def generate_next_token(self, input_tensors: list[torch.Tensor],
-                                        prompt_token_ids: list[int] | None = None,
-                                        request_id: str = "speech_stream") -> GenerationResult | None:
+    async def generate_next_token(
+        self,
+        input_tensors: list[torch.Tensor],
+        prompt_token_ids: list[int] | None = None,
+        request_id: str = "speech_stream",
+    ) -> GenerationResult | None:
         """
         Generate the next token using the provided input embedding.
 
@@ -279,7 +277,9 @@ class CustomInputAsyncVLLMEngine:
             logging.warning(f"Generation not active for request {request_id} (status: {request_state.status})")
             return None
 
-        assert len(input_tensors) == len(self.custom_input_specs), f"Expected {len(self.custom_input_specs)} input tensors, got {len(input_tensors)}"
+        assert len(input_tensors) == len(
+            self.custom_input_specs
+        ), f"Expected {len(self.custom_input_specs)} input tensors, got {len(input_tensors)}"
 
         if self.engine is None:
             raise RuntimeError("Engine not initialized")
@@ -291,7 +291,9 @@ class CustomInputAsyncVLLMEngine:
             if input_dtype is None:
                 input_dtype = "float32"  # Default dtype
             if spec.dim is not None and spec.dim != input_tensors[i].shape[-1]:
-                raise ValueError(f"Input tensor dimension mismatch for {spec.name}: expected {spec.dim}, got {input_tensors[i].shape[-1]}")
+                raise ValueError(
+                    f"Input tensor dimension mismatch for {spec.name}: expected {spec.dim}, got {input_tensors[i].shape[-1]}"
+                )
             # vLLM serializes custom_inputs across client/core processes, so keep them on CPU; GPU tensors can cause incorrect behavior.
             custom_inputs[spec.name] = input_tensors[i].to(dtype=getattr(torch, input_dtype)).cpu()
             max_length = max(max_length, input_tensors[i].shape[0])
@@ -301,29 +303,25 @@ class CustomInputAsyncVLLMEngine:
             if request_state.generation_iterator is None:
                 # Create initial inputs with a single safe prompt token
                 # this will not be used for generation, just to initialize the model state
-                prompt_tokens = prompt_token_ids if prompt_token_ids is not None else self._get_safe_prompt_tokens(max_length)
-                assert len(prompt_tokens) == max_length, f"Prompt tokens length {len(prompt_tokens)} does not match input length {max_length}"
-                inputs = {
-                    "prompt_token_ids": prompt_tokens,
-                        "custom_inputs": custom_inputs
-                }
+                prompt_tokens = (
+                    prompt_token_ids if prompt_token_ids is not None else self._get_safe_prompt_tokens(max_length)
+                )
+                assert (
+                    len(prompt_tokens) == max_length
+                ), f"Prompt tokens length {len(prompt_tokens)} does not match input length {max_length}"
+                inputs = {"prompt_token_ids": prompt_tokens, "custom_inputs": custom_inputs}
 
                 logging.info(f"Initializing generation for request {request_id} with first embedding")
 
                 # Start generation
                 request_state.generation_iterator = self.engine.generate(
-                    inputs,
-                    self.sampling_params,
-                    request_id=request_id
+                    inputs, self.sampling_params, request_id=request_id
                 )
 
             # If this is not the first call, append the current embedding for processing
             elif request_state.generation_iterator is not None and len(request_state.generated_tokens) > 0:
                 try:
-                    await self.engine.append_request(
-                        request_id=request_id,
-                        custom_inputs=custom_inputs
-                    )
+                    await self.engine.append_request(request_id=request_id, custom_inputs=custom_inputs)
                 except ValueError as e:
                     if "not found" in str(e):
                         logging.warning(f"Request {request_id} was removed from vLLM engine. Marking as finished.")
@@ -338,7 +336,7 @@ class CustomInputAsyncVLLMEngine:
             # Extract new tokens
             current_tokens = output.outputs[0].token_ids
             if len(current_tokens) > len(request_state.generated_tokens):
-                new_tokens = current_tokens[len(request_state.generated_tokens):]
+                new_tokens = current_tokens[len(request_state.generated_tokens) :]
                 assert len(new_tokens) == 1, f"Expected exactly one new token, got {len(new_tokens)}"
                 new_tokens = current_tokens[-1:]
                 request_state.generated_tokens.extend(new_tokens)
@@ -350,20 +348,26 @@ class CustomInputAsyncVLLMEngine:
                 if output.finished:
                     request_state.status = StreamStatus.FINISHED
                     finish_reason = output.outputs[0].finish_reason
-                    logging.warning(f"Request {request_id} finished after {len(request_state.generated_tokens)} tokens. Reason: {finish_reason}")
+                    logging.warning(
+                        f"Request {request_id} finished after {len(request_state.generated_tokens)} tokens. Reason: {finish_reason}"
+                    )
                     return GenerationResult(
                         token_id=latest_token,
-                        custom_outputs=output.outputs[0].custom_outputs if hasattr(output.outputs[0], 'custom_outputs') else None,
+                        custom_outputs=(
+                            output.outputs[0].custom_outputs if hasattr(output.outputs[0], 'custom_outputs') else None
+                        ),
                         is_finished=True,
                         finish_reason=finish_reason,
-                        total_tokens=len(request_state.generated_tokens)
+                        total_tokens=len(request_state.generated_tokens),
                     )
                 else:
                     return GenerationResult(
                         token_id=latest_token,
-                        custom_outputs=output.outputs[0].custom_outputs if hasattr(output.outputs[0], 'custom_outputs') else None,
+                        custom_outputs=(
+                            output.outputs[0].custom_outputs if hasattr(output.outputs[0], 'custom_outputs') else None
+                        ),
                         is_finished=False,
-                        total_tokens=len(request_state.generated_tokens)
+                        total_tokens=len(request_state.generated_tokens),
                     )
             else:
                 # No new tokens generated
@@ -449,19 +453,16 @@ class CustomInputAsyncVLLMEngine:
                 "request_id": request_id,
                 "status": request_state.status.value,
                 "tokens_generated": len(request_state.generated_tokens),
-                "latest_tokens": request_state.generated_tokens[-5:] if request_state.generated_tokens else []
+                "latest_tokens": request_state.generated_tokens[-5:] if request_state.generated_tokens else [],
             }
         else:
             # Return summary of all requests
             return {
                 "total_requests": len(self.requests),
                 "requests": {
-                    rid: {
-                        "status": state.status.value,
-                        "tokens_generated": len(state.generated_tokens)
-                    }
+                    rid: {"status": state.status.value, "tokens_generated": len(state.generated_tokens)}
                     for rid, state in self.requests.items()
-                }
+                },
             }
 
     async def __aenter__(self):
@@ -491,4 +492,3 @@ def create_engine(engine_type: str = "llm", **kwargs) -> CustomInputAsyncVLLMEng
         return CustomInputAsyncVLLMEngine(engine_kind="llm", **kwargs)
     else:
         raise ValueError(f"Unsupported engine_type: {engine_type}")
-

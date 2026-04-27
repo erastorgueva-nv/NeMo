@@ -14,6 +14,7 @@
 import copy
 import os
 from pathlib import Path
+
 import torch
 from lightning import LightningModule
 from omegaconf import DictConfig
@@ -34,7 +35,6 @@ from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.utils import get_pad_id
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.label_prep import maybe_prepend_prompt_tokens, prepare_text_and_asr_labels
-from nemo.collections.speechlm2.parts.text_utils import strip_timestamps
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.metrics.bleu import BLEU
 from nemo.collections.speechlm2.parts.metrics.empty_text import EmptyTextMetric
@@ -49,6 +49,7 @@ from nemo.collections.speechlm2.parts.pretrained import (
     set_model_dict_for_partial_init,
     setup_speech_encoder,
 )
+from nemo.collections.speechlm2.parts.text_utils import strip_timestamps
 from nemo.collections.speechlm2.streaming.duplex_stt_inference import DuplexSTTStreamingInference
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
@@ -632,13 +633,11 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
         else:
             prev = current_frame_idx - 1
-            last_token_emb = self.embed_tokens(
-                gen_text[:, prev]
-            ) * self.cfg.get("duplex_text_channel_weight", 1.0)
+            last_token_emb = self.embed_tokens(gen_text[:, prev]) * self.cfg.get("duplex_text_channel_weight", 1.0)
             if self.predict_user_text:
-                last_asr_token_emb = self.embed_asr_tokens(
-                    gen_asr_text[:, prev]
-                ) * self.cfg.get("duplex_asr_text_weight", 1.0)
+                last_asr_token_emb = self.embed_asr_tokens(gen_asr_text[:, prev]) * self.cfg.get(
+                    "duplex_asr_text_weight", 1.0
+                )
                 emb += last_token_emb + last_asr_token_emb
             else:
                 emb += last_token_emb
@@ -807,6 +806,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
     def _create_nemotron_cache(self, batch_size: int = 1):
         """Create a HybridMambaAttentionDynamicCache for Nemotron hybrid Mamba2/Attention models."""
         import importlib
+
         cache_cls = None
         llm = self.llm
         if hasattr(llm, '_orig_mod'):
@@ -831,10 +831,14 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             for attr in ('key_cache', 'value_cache')
         )
         if needs_patch:
-            patched = type(cache_cls.__name__, (cache_cls,), {
-                'key_cache': None,
-                'value_cache': None,
-            })
+            patched = type(
+                cache_cls.__name__,
+                (cache_cls,),
+                {
+                    'key_cache': None,
+                    'value_cache': None,
+                },
+            )
         else:
             patched = cache_cls
 
@@ -856,7 +860,11 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             for i, pattern in enumerate(config.hybrid_override_pattern):
                 if pattern == "M" and i < len(cache.conv_states):
                     cache.conv_states[i] = torch.zeros(
-                        batch_size, conv_dim, conv_kernel, device=self.device, dtype=dtype,
+                        batch_size,
+                        conv_dim,
+                        conv_kernel,
+                        device=self.device,
+                        dtype=dtype,
                     )
 
         self._patch_nemotron_cache_bugs(cache)
@@ -894,9 +902,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                     residual = residual.to(torch.float32)
 
                 if self.block_type == "mamba":
-                    hidden_states = self.mixer(
-                        hidden_states, cache_params=cache_params, cache_position=cache_position
-                    )
+                    hidden_states = self.mixer(hidden_states, cache_params=cache_params, cache_position=cache_position)
                 elif self.block_type == "attention":
                     hidden_states = self.mixer(
                         hidden_states,
@@ -937,9 +943,7 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
                 self.conv_states[layer_idx] = new_conv_state.to(self.conv_states[layer_idx].device)
             else:
                 self.conv_states[layer_idx] = self.conv_states[layer_idx].roll(shifts=-1, dims=-1)
-                self.conv_states[layer_idx][:, :, -1] = new_conv_state[:, 0, :].to(
-                    self.conv_states[layer_idx].device
-                )
+                self.conv_states[layer_idx][:, :, -1] = new_conv_state[:, 0, :].to(self.conv_states[layer_idx].device)
             return self.conv_states[layer_idx]
 
         def update_ssm_state(self, layer_idx, new_ssm_state):

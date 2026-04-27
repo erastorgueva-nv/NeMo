@@ -34,12 +34,12 @@ from omegaconf import DictConfig
 
 from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.collections.speechlm2.inference.factory.s2s_pipeline_builder import S2SPipelineBuilder
-from nemo.collections.speechlm2.inference.utils.stepprogressbar import StepProgressBar
 from nemo.collections.speechlm2.inference.utils.audio_data import (
     calculate_durations_incl_padding,
     dump_output_json,
     prepare_audio_data,
 )
+from nemo.collections.speechlm2.inference.utils.stepprogressbar import StepProgressBar
 from nemo.collections.speechlm2.parts.text_utils import clean_pred_text
 from nemo.utils import logging
 from nemo.utils.timers import SimpleTimer

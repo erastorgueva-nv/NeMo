@@ -17,24 +17,28 @@ import os
 import time
 from dataclasses import dataclass
 
+import librosa
 import soundfile as sf
 import torch
-import librosa
-from torch import Tensor
 from omegaconf import DictConfig
+from torch import Tensor
 
+from nemo.collections.asr.inference.streaming.buffering.audio_bufferer import BatchedAudioBufferer
 from nemo.collections.asr.inference.streaming.framing.request import Frame
 from nemo.collections.asr.inference.utils.enums import RequestType
-from nemo.collections.asr.inference.streaming.buffering.audio_bufferer import BatchedAudioBufferer
-from nemo.collections.speechlm2.inference.utils.stepprogressbar import StepProgressBar
-from nemo.collections.speechlm2.inference.pipelines.s2s_pipeline_interface import S2SPipelineInterface
-from nemo.collections.speechlm2.inference.streaming.state.s2s_streaming_output import S2SStreamingOutput
 from nemo.collections.speechlm2.inference.model_wrappers.decode_state import NullTimingSummary
-from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_inference_wrapper import NemotronVoicechatInferenceWrapper
-from nemo.collections.speechlm2.parts.text_utils import _decode_tokens_with_specials
-from nemo.collections.speechlm2.inference.streaming.state.s2s_context_manager import S2SContextManager
+from nemo.collections.speechlm2.inference.model_wrappers.nemotron_voicechat_inference_wrapper import (
+    NemotronVoicechatInferenceWrapper,
+)
+from nemo.collections.speechlm2.inference.pipelines.s2s_pipeline_interface import S2SPipelineInterface
 from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
-from nemo.collections.speechlm2.inference.streaming.framing.silence_padded_frame_streamer import SilencePaddedContinuousBatchedFrameStreamer
+from nemo.collections.speechlm2.inference.streaming.framing.silence_padded_frame_streamer import (
+    SilencePaddedContinuousBatchedFrameStreamer,
+)
+from nemo.collections.speechlm2.inference.streaming.state.s2s_context_manager import S2SContextManager
+from nemo.collections.speechlm2.inference.streaming.state.s2s_streaming_output import S2SStreamingOutput
+from nemo.collections.speechlm2.inference.utils.stepprogressbar import StepProgressBar
+from nemo.collections.speechlm2.parts.text_utils import _decode_tokens_with_specials
 from nemo.utils import logging
 
 
@@ -105,7 +109,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         # i.e. att_context_size[0] + att_context_size[1] + 1 frames = 70+0+1 = 71 frames = 5.68 seconds
         self.buffer_size_in_secs = getattr(self.streaming_cfg, "buffer_size_in_secs", 71 * 0.08)
 
-        self.att_context_size = getattr(self.streaming_cfg, "att_context_size", [70,0])
+        self.att_context_size = getattr(self.streaming_cfg, "att_context_size", [70, 0])
 
         # ------------------------------------------------------------------
         # bufferer – reused from ASR utilities
@@ -121,7 +125,9 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         s2s_cfg = cfg.get("s2s", {})
         self.system_prompt: str | None = getattr(s2s_cfg, "system_prompt", None)
         if self.system_prompt:
-            logging.info(f"System prompt configured: {self.system_prompt[:100]}{'...' if len(self.system_prompt) > 100 else ''}")
+            logging.info(
+                f"System prompt configured: {self.system_prompt[:100]}{'...' if len(self.system_prompt) > 100 else ''}"
+            )
 
         self._default_top_p: float | None = getattr(s2s_cfg, "top_p", None)
         self._default_temperature: float | None = getattr(s2s_cfg, "temperature", None)
@@ -231,7 +237,6 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         # cleared on the first audio frame.
         self._stream_has_prompt = bool(prompt)
 
-
     def generate_step_for_frames(self, frames: list[Frame], buffers: list[Tensor]) -> list[GenerateStepOutput]:
         """Generate speech for audio Frames using a shared ContextManager.
 
@@ -309,13 +314,16 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                 if ctx is not None:
                     state = self.get_or_create_state(stream_id)
                     state.finalize_tokens(
-                        ctx.gen_text, ctx.gen_asr_text, ctx.frame_idx,
-                        tokenizer=tokenizer, pad_id=pad_id,
+                        ctx.gen_text,
+                        ctx.gen_asr_text,
+                        ctx.frame_idx,
+                        tokenizer=tokenizer,
+                        pad_id=pad_id,
                     )
                     timing_by_stream[stream_id] = ctx.timing
 
         self.context_manager.reset_streams(stream_ids, eos_flags)
-        
+
         # Log summary and clean up finished streams
         pad_str = tokenizer.ids_to_tokens([pad_id])[0]
         for stream_id, eos_flag in zip(stream_ids, eos_flags):
@@ -342,7 +350,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
                 self.bufferer.rm_bufferer(stream_id)
                 self._abort_stream_request(stream_id)
-        
+
         # Split the batch-level InferenceStepResult into per-frame outputs.
         # Each frame's incremental audio/text is:
         #  1. Appended to the per-stream S2SStreamingOutput accumulator
@@ -354,18 +362,20 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         outputs: list[GenerateStepOutput] = []
         for idx, frame in enumerate(frames):
             state = self.get_state(frame.stream_id)
-            audio = result.decoded_audio[idx:idx+1] if result.decoded_audio is not None else None
+            audio = result.decoded_audio[idx : idx + 1] if result.decoded_audio is not None else None
             text = result.predicted_text_strs[idx] if result.predicted_text_strs else ""
             asr_text = result.asr_predicted_text_strs[idx] if result.asr_predicted_text_strs else ""
 
             state.append_step_output(audio, text=text, asr_text=asr_text)
 
-            outputs.append(GenerateStepOutput(
-                stream_id=frame.stream_id,
-                audio=audio if audio is not None else torch.empty(1, 0),
-                text=text,
-                asr_text=asr_text,
-            ))
+            outputs.append(
+                GenerateStepOutput(
+                    stream_id=frame.stream_id,
+                    audio=audio if audio is not None else torch.empty(1, 0),
+                    text=text,
+                    asr_text=asr_text,
+                )
+            )
         return outputs
 
     _WARMUP_FALLBACK_PROMPT = "Mock system prompt for warmup."
@@ -451,10 +461,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         non_empty_frames = [f for f in frames if f.samples.numel() > 0]
         if not non_empty_frames:
             # All frames are prefill-only — nothing to decode.
-            return [
-                GenerateStepOutput(stream_id=f.stream_id, audio=torch.empty(1, 0))
-                for f in frames
-            ]
+            return [GenerateStepOutput(stream_id=f.stream_id, audio=torch.empty(1, 0)) for f in frames]
 
         buffers, left_paddings = self.bufferer.update(non_empty_frames)
         # This is a workaround for the fact that the audio buffer does left
@@ -477,7 +484,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
             )
             for f in frames
         ]
-        
+
     # ------------------------------------------------------------------
     # Finalization helpers
     # ------------------------------------------------------------------
@@ -589,12 +596,21 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         total_frames = state.token_length
         total_samples = state._total_audio_samples
         self._write_ctm(
-            base, state.token_text[0, :total_frames],
-            total_frames, total_samples, tokenizer, pad_id,
+            base,
+            state.token_text[0, :total_frames],
+            total_frames,
+            total_samples,
+            tokenizer,
+            pad_id,
         )
         self._write_ctm(
-            base, state.token_asr_text[0, :total_frames],
-            total_frames, total_samples, tokenizer, pad_id, suffix="_asr",
+            base,
+            state.token_asr_text[0, :total_frames],
+            total_frames,
+            total_samples,
+            tokenizer,
+            pad_id,
+            suffix="_asr",
         )
 
     def _write_ctm(
@@ -630,8 +646,10 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                     if tid == pad_id:
                         continue
                     tok_str = _decode_tokens_with_specials(
-                        tokenizer.ids_to_tokens([tid]), tokenizer,
-                        pad_token_str=pad_token_str, keep_pad=False,
+                        tokenizer.ids_to_tokens([tid]),
+                        tokenizer,
+                        pad_token_str=pad_token_str,
+                        keep_pad=False,
                     )
                     if not tok_str:
                         continue
@@ -639,7 +657,6 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                     f.write(f"{base} A {start:.3f} {frame_duration:.3f} {tok_str}\n")
         except OSError:
             logging.warning(f"Failed to write CTM for {base}")
-
 
     # ------------------------------------------------------------------
     # Session helpers (extend S2SPipelineInterface)
@@ -652,7 +669,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         self.bufferer.reset()
         self.context_manager.reset()
 
-        super().reset_session() # clears state pool
+        super().reset_session()  # clears state pool
 
     # ------------------------------------------------------------------
     # Orchestrator – mirrors recognizers' *run* method
@@ -709,20 +726,17 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         if progress_bar is not None:
             progress_bar.finish()
 
-        outputs = [
-            per_stream_results.get(idx, self.create_state())
-            for idx in range(len(audio_filepaths))
-        ]
+        outputs = [per_stream_results.get(idx, self.create_state()) for idx in range(len(audio_filepaths))]
         self.close_session()
         return outputs
 
     def _prefill_system_prompt(self, stream_id: int, system_prompt: str | None = None) -> torch.Tensor | None:
         """Prefill the system prompt for a new stream.
-        
+
         This prepares the system prompt embeddings and processes them through
         the LLM to update the KV cache before audio streaming begins.
         Also prefills the TTS model with speaker embeddings when using vLLM EarTTS.
-        
+
         Args:
             stream_id: The stream identifier.
             system_prompt: The system prompt text for this stream. If *None*,
@@ -734,7 +748,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
             to initialize context.tts_code for inference. The batch approach uses
             first_tts_code_input (INPUT codes from speaker reference) instead.
             Using prefill OUTPUT codes causes audio quality issues (mumbling).
-        
+
         Returns:
             torch.Tensor | None: The TTS prefill output codes if vLLM EarTTS prefill
             happened, None otherwise. These are returned for logging/debugging but
@@ -743,7 +757,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
         request_id = self._request_id_for_stream(stream_id)
         engine_type = getattr(self.s2s_model, "engine_type", "native")
         tts_output_code = None
-        
+
         # Prefill TTS with speaker embedding via model_eartts_interface
         use_vllm_eartts = "vllm_eartts" in engine_type.lower()
         if use_vllm_eartts:
@@ -805,7 +819,7 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                 logging.info(f"System prompt processed, cache updated ({prompt_len} tokens, offset={prompt_len})")
             else:
                 for t in range(prompt_len):
-                    context.input_embeds_history.append(prompt_embedded[:, t:t+1, :])
+                    context.input_embeds_history.append(prompt_embedded[:, t : t + 1, :])
                 logging.info(f"Added {prompt_len} prompt embeddings to input_embeds_history")
 
         return tts_output_code
