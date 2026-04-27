@@ -238,7 +238,7 @@ class NemotronVoicechatInferenceWrapper:
 
         self.tokenizer = self.model.stt_model.tokenizer
 
-        # Allow overrides from wrapper config into the model config (e.g. logit boosts).
+        # Allow runtime wrapper overrides into the STT config used by shared inference helpers.
         _BOOST_KEYS = (
             "inference_pad_boost",
             "inference_bos_boost",
@@ -247,12 +247,19 @@ class NemotronVoicechatInferenceWrapper:
             "inference_user_bos_boost",
             "inference_user_eos_boost",
         )
-        for key in _BOOST_KEYS:
+        _FORCE_TURN_TAKING_KEYS = (
+            "force_turn_taking",
+            "force_turn_taking_threshold",
+            "force_turn_taking_pad_window",
+        )
+        for key in _BOOST_KEYS + _FORCE_TURN_TAKING_KEYS:
             val = self.model_cfg.get(key, None)
             if val is not None:
-                OmegaConf.update(self.model.stt_model.cfg, key, val)
+                OmegaConf.update(self.model.stt_model.cfg, key, val, force_add=True)
         boost_values = {k: self.model.stt_model.cfg.get(k, None) for k in _BOOST_KEYS}
         logging.info(f"Inference logit boosts: {boost_values}")
+        force_turn_taking_values = {k: self.model.stt_model.cfg.get(k, None) for k in _FORCE_TURN_TAKING_KEYS}
+        logging.info(f"Forced turn-taking config: {force_turn_taking_values}")
 
         # Create LLM backend
         if self.use_vllm_llm:
@@ -563,7 +570,9 @@ class NemotronVoicechatInferenceWrapper:
             state.gen_asr_text[:, current_frame_idx] = ans["asr_predicted_token"]
             asr_predicted_tokens[:, frame_offset] = ans["asr_predicted_token"]
 
-            self._maybe_apply_forced_turn_taking(current_frame_idx, state.gen_text, state.gen_asr_text)
+            self.model.stt_model.streaming_inference._maybe_apply_forced_turn_taking(
+                current_frame_idx, state.gen_text, state.gen_asr_text
+            )
             predicted_tokens[:, frame_offset] = state.gen_text[:, current_frame_idx]
 
             if self.decode_audio:
@@ -829,47 +838,4 @@ class NemotronVoicechatInferenceWrapper:
         """Token strings that should be stripped from decoded text for clean output."""
         stt = self.model.stt_model
         return get_special_token_strings(stt.tokenizer, stt.text_pad_id, model_cfg=stt.cfg)
-
-    def _maybe_apply_forced_turn_taking(self, t, gen_text, gen_asr):
-        """Apply forced turn-taking rules based on ASR channel tokens."""
-        if not self.model_cfg.get("force_turn_taking", False):
-            return
-
-        threshold = self.model_cfg.get("force_turn_taking_threshold", 40)
-        pad_window_steps = self.model_cfg.get("force_turn_taking_pad_window", 25)
-
-        B = gen_text.size(0)
-
-        for batch_idx in range(B):
-            lookback_start = max(0, t - threshold)
-            agent_text_window = gen_text[batch_idx, lookback_start:t]
-            current_asr_token = gen_asr[batch_idx, t]
-
-            # ASR EOS or ~1 sec of pad tokens → insert agent BOS if not present in window
-            # Skip if we don't have enough tokens at the beginning
-            if t < pad_window_steps:
-                continue
-
-            pad_lookback_start = t - pad_window_steps
-            asr_recent_tokens = gen_asr[batch_idx, pad_lookback_start:t]
-            has_pad_window = (asr_recent_tokens == self.model.stt_model.text_pad_id).all() if len(asr_recent_tokens) > 0 else False
-
-            # Require that the pad window starts after a non-pad token
-            if has_pad_window and pad_lookback_start > 0:
-                token_before_window = gen_asr[batch_idx, pad_lookback_start - 1]
-                has_pad_window = (token_before_window != self.model.stt_model.text_pad_id) and (token_before_window != self.model.stt_model.text_bos_id)
-            elif has_pad_window and pad_lookback_start == 0:
-                # If the pad window starts at position 0, it doesn't meet the requirement
-                has_pad_window = False
-
-            if has_pad_window:
-                if not (agent_text_window == self.model.stt_model.text_bos_id).any():
-                    gen_text[batch_idx, t] = self.model.stt_model.text_bos_id
-                    logging.info(f"Forced turn-taking at frame {t}: inserted agent BOS (reason: pad window)")
-
-            # ASR BOS → insert agent EOS if not present in window
-            elif current_asr_token == self.model.stt_model.text_bos_id:
-                if not (agent_text_window == self.model.stt_model.text_eos_id).any():
-                    gen_text[batch_idx, t] = self.model.stt_model.text_eos_id
-                    logging.info(f"Forced turn-taking at frame {t}: inserted agent EOS (reason: user started speaking)")
 
